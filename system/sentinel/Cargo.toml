@@ -15,3 +15,20 @@ serde_json.workspace = true
 thiserror.workspace = true
 logos = "0.16.1"
 nom = "8.0.0"
+
+[dev-dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+futures = "0.3"
+rmcp = { workspace = true, features = ["transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+robonix-atlas = { path = "../atlas" }
+robonix-scribe.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+robonix-codegen.workspace = true
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true

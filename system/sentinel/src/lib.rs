@@ -9,6 +9,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(test)]
+mod executor;
+#[cfg(test)]
 mod srdl;
 
 /// Effect applied when a rule matches.

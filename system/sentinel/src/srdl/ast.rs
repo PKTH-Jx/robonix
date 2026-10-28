@@ -27,16 +27,23 @@ pub struct Identifier(
     pub String,
 );
 
-/// One static input declaration; source binding and response type checking are deferred.
+/// One capability acquisition shared by a group of selected fields.
 #[derive(Debug)]
 pub struct InputClause {
+    /// The source capability contract ID resolved by the input Adapter.
+    pub capability: String,
+    /// Fields extracted from one response and sharing its acquisition time.
+    pub fields: Vec<InputField>,
+}
+
+/// One named value extracted from a shared capability response.
+#[derive(Debug)]
+pub struct InputField {
     /// The expected basic type of the selected response value.
     pub data_type: InputType,
     /// The name referenced by expressions in this rule.
     pub name: Identifier,
-    /// The source capability contract ID; provider binding is not yet implemented.
-    pub capability: String,
-    /// Field traversal and array selection relative to the logical response.
+    /// Response-relative traversal; an empty path selects the complete response.
     pub select: Vec<SelectStep>,
     /// Maximum elapsed time from response acquisition to requirement evaluation, in seconds.
     pub maxage: f64,
@@ -58,7 +65,7 @@ pub enum InputType {
 pub enum SelectStep {
     /// Access a field of the current message.
     Field(Identifier),
-    /// Select array elements whose field equals the literal; execution is deferred.
+    /// Select the unique array element whose field equals the literal.
     Filter {
         /// The element field to compare.
         field: Identifier,
@@ -67,7 +74,7 @@ pub enum SelectStep {
     },
 }
 
-/// One alternative for checking a rule before capability dispatch; matching is deferred.
+/// One alternative for checking a rule before capability dispatch.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TriggerClause {
     /// Apply before every capability call, without scheduling background checks.

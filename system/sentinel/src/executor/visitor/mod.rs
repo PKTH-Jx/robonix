@@ -1,60 +1,62 @@
-//! Read-only AST traversal with fallible hooks and an analysis-specific expression result.
+//! Read-only AST traversal with fallible hooks.
 
-use super::ast::*;
+use crate::srdl::ast::*;
 
+pub mod trigger_match;
 pub mod type_check;
 
 /// Override individual hooks and use walk functions to visit their children.
-pub trait Visitor {
+pub trait Visitor<'ast> {
     type Error;
-    type ExpressionOutput;
 
-    fn visit_program(&mut self, program: &Program) -> Result<(), Self::Error> {
+    fn visit_program(&mut self, program: &'ast Program) -> Result<(), Self::Error> {
         walk_program(self, program)
     }
 
-    fn visit_rule(&mut self, rule: &Rule) -> Result<(), Self::Error> {
+    fn visit_rule(&mut self, rule: &'ast Rule) -> Result<(), Self::Error> {
         walk_rule(self, rule)
     }
 
-    fn visit_input(&mut self, input: &InputClause) -> Result<(), Self::Error> {
+    fn visit_input(&mut self, input: &'ast InputClause) -> Result<(), Self::Error> {
         walk_input(self, input)
     }
 
-    fn visit_select_step(&mut self, step: &SelectStep) -> Result<(), Self::Error> {
+    fn visit_input_field(&mut self, field: &'ast InputField) -> Result<(), Self::Error> {
+        walk_input_field(self, field)
+    }
+
+    fn visit_select_step(&mut self, step: &'ast SelectStep) -> Result<(), Self::Error> {
         walk_select_step(self, step)
     }
 
-    fn visit_trigger(&mut self, _trigger: &TriggerClause) -> Result<(), Self::Error> {
+    fn visit_trigger(&mut self, _trigger: &'ast TriggerClause) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    fn visit_require(&mut self, require: &RequireClause) -> Result<(), Self::Error> {
+    fn visit_require(&mut self, require: &'ast RequireClause) -> Result<(), Self::Error> {
         walk_require(self, require)
     }
 
-    fn visit_enforce(&mut self, _enforce: &EnforceClause) -> Result<(), Self::Error> {
+    fn visit_enforce(&mut self, _enforce: &'ast EnforceClause) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    // A required hook lets type inference return a type without a side-channel result stack.
-    fn visit_expression(
-        &mut self,
-        expression: &Expression,
-    ) -> Result<Self::ExpressionOutput, Self::Error>;
+    fn visit_expression(&mut self, expression: &'ast Expression) -> Result<(), Self::Error> {
+        walk_expression(self, expression)
+    }
 
-    fn visit_identifier(&mut self, _identifier: &Identifier) -> Result<(), Self::Error> {
+    fn visit_identifier(&mut self, _identifier: &'ast Identifier) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    fn visit_literal(&mut self, _literal: &Literal) -> Result<(), Self::Error> {
+    fn visit_literal(&mut self, _literal: &'ast Literal) -> Result<(), Self::Error> {
         Ok(())
     }
 }
 
-pub fn walk_program<V: Visitor + ?Sized>(
+pub fn walk_program<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    program: &Program,
+    program: &'ast Program,
 ) -> Result<(), V::Error> {
     for rule in &program.rules {
         visitor.visit_rule(rule)?;
@@ -62,7 +64,10 @@ pub fn walk_program<V: Visitor + ?Sized>(
     Ok(())
 }
 
-pub fn walk_rule<V: Visitor + ?Sized>(visitor: &mut V, rule: &Rule) -> Result<(), V::Error> {
+pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
+    visitor: &mut V,
+    rule: &'ast Rule,
+) -> Result<(), V::Error> {
     visitor.visit_identifier(&rule.name)?;
     for trigger in &rule.triggers {
         visitor.visit_trigger(trigger)?;
@@ -77,20 +82,30 @@ pub fn walk_rule<V: Visitor + ?Sized>(visitor: &mut V, rule: &Rule) -> Result<()
     visitor.visit_enforce(&rule.enforce)
 }
 
-pub fn walk_input<V: Visitor + ?Sized>(
+pub fn walk_input<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    input: &InputClause,
+    input: &'ast InputClause,
 ) -> Result<(), V::Error> {
-    visitor.visit_identifier(&input.name)?;
-    for step in &input.select {
+    for field in &input.fields {
+        visitor.visit_input_field(field)?;
+    }
+    Ok(())
+}
+
+pub fn walk_input_field<'ast, V: Visitor<'ast> + ?Sized>(
+    visitor: &mut V,
+    field: &'ast InputField,
+) -> Result<(), V::Error> {
+    visitor.visit_identifier(&field.name)?;
+    for step in &field.select {
         visitor.visit_select_step(step)?;
     }
     Ok(())
 }
 
-pub fn walk_select_step<V: Visitor + ?Sized>(
+pub fn walk_select_step<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    step: &SelectStep,
+    step: &'ast SelectStep,
 ) -> Result<(), V::Error> {
     match step {
         SelectStep::Field(field) => visitor.visit_identifier(field),
@@ -101,18 +116,17 @@ pub fn walk_select_step<V: Visitor + ?Sized>(
     }
 }
 
-pub fn walk_require<V: Visitor + ?Sized>(
+pub fn walk_require<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    require: &RequireClause,
+    require: &'ast RequireClause,
 ) -> Result<(), V::Error> {
     visitor.visit_expression(&require.expression)?;
     Ok(())
 }
 
-/// Walk children while discarding their expression results, for structural analyses.
-pub fn walk_expression<V: Visitor + ?Sized>(
+pub fn walk_expression<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    expression: &Expression,
+    expression: &'ast Expression,
 ) -> Result<(), V::Error> {
     match expression {
         Expression::Literal(literal) => visitor.visit_literal(literal)?,
@@ -150,13 +164,8 @@ mod tests {
         events: Vec<String>,
     }
 
-    impl Visitor for Recorder {
+    impl<'ast> Visitor<'ast> for Recorder {
         type Error = &'static str;
-        type ExpressionOutput = ();
-
-        fn visit_expression(&mut self, expression: &Expression) -> Result<(), Self::Error> {
-            walk_expression(self, expression)
-        }
 
         fn visit_identifier(&mut self, identifier: &Identifier) -> Result<(), Self::Error> {
             self.events.push(format!("id:{}", identifier.0));
@@ -189,7 +198,8 @@ mod tests {
             rule r {
                 require !ready && f(reading + 1, target.value);
                 enforce deny;
-                input number reading from "source" select items[id = "sensor"].value maxage 1;
+                input from "source" select number reading = items[id = "sensor"].value maxage 1,
+                    boolean ready maxage 2;
                 trigger always;
             }
         "#,
@@ -198,23 +208,8 @@ mod tests {
         let mut visitor = Recorder::default();
         visitor.visit_program(&program).unwrap();
         assert_eq!(
-            visitor.events,
-            [
-                "id:r",
-                "trigger",
-                "id:reading",
-                "id:items",
-                "id:id",
-                "literal",
-                "id:value",
-                "id:ready",
-                "id:f",
-                "id:reading",
-                "literal",
-                "id:target",
-                "id:value",
-                "enforce",
-            ]
+            visitor.events.join(" "),
+            "id:r trigger id:reading id:items id:id literal id:value id:ready id:ready id:f id:reading literal id:target id:value enforce"
         );
     }
 

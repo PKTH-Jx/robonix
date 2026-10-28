@@ -78,11 +78,13 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             Some(TokenKind::Input) => {
                 let declaration = input.clone();
                 let (rest, clause) = input_clause(input)?;
-                if !input_names.insert(clause.name.0.clone()) {
-                    return Err(Err::Error(at(
-                        &declaration,
-                        ErrorKind::DuplicateInput(clause.name.0),
-                    )));
+                for field in &clause.fields {
+                    if !input_names.insert(field.name.0.clone()) {
+                        return Err(Err::Error(at(
+                            &declaration,
+                            ErrorKind::DuplicateInput(field.name.0.clone()),
+                        )));
+                    }
                 }
                 inputs.push(clause);
                 input = rest;
@@ -148,19 +150,29 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     ))
 }
 
-// Grammar: input TYPE NAME from "CONTRACT" select PATH maxage NUMBER.
-// Only basic input types are accepted; capability contracts remain unresolved.
+// One acquisition owns a nonempty list of TYPE NAME [= PATH] maxage NUMBER fields.
+// Commas separate fields; a comma inside a filter is not valid select syntax.
 fn input_clause(input: Tokens<'_>) -> IResult<'_, InputClause> {
-    let (input, (_, data_type, name, _, capability, _)) = (
+    let (input, (_, _, capability, _)) = (
         match_token(TokenKind::Input),
-        input_type,
-        identifier,
         match_token(TokenKind::From),
         string_literal,
         match_token(TokenKind::Select),
     )
         .parse(input)?;
-    let (input, select) = select_path(input)?;
+    let (input, fields) =
+        separated_list1(match_token(TokenKind::Comma), cut(input_field)).parse(input)?;
+    Ok((input, InputClause { capability, fields }))
+}
+
+// Omitting '= PATH' selects the root response, including scalar-valued interfaces.
+fn input_field(input: Tokens<'_>) -> IResult<'_, InputField> {
+    let (input, (data_type, name)) = (input_type, identifier).parse(input)?;
+    let (input, select) = if input.tok.first().map(|t| t.kind) == Some(TokenKind::Eq) {
+        select_path(input.take_from(1))?
+    } else {
+        (input, Vec::new())
+    };
     let (input, _) = match_token(TokenKind::Maxage)(input)?;
     // Bare positive finite values use the default time unit (seconds); no suffix is consumed.
     let time = input.clone();
@@ -170,10 +182,9 @@ fn input_clause(input: Tokens<'_>) -> IResult<'_, InputClause> {
     }
     Ok((
         input,
-        InputClause {
+        InputField {
             data_type,
             name,
-            capability,
             select,
             maxage,
         },

@@ -228,6 +228,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -236,6 +238,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -3185,12 +3188,16 @@ checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "futures",
  "http",
+ "http-body",
+ "http-body-util",
  "pastey",
  "pin-project-lite",
  "process-wrap",
+ "rand 0.10.2",
  "reqwest 0.13.4",
  "rmcp-macros",
  "schemars",
@@ -3201,7 +3208,9 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3419,11 +3428,24 @@ dependencies = [
 name = "robonix-sentinel"
 version = "1.1.0-beta.1"
 dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
  "logos",
  "nom 8.0.0",
+ "prost",
+ "protoc-bin-vendored",
+ "rmcp",
+ "robonix-atlas",
+ "robonix-codegen",
+ "robonix-scribe",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
