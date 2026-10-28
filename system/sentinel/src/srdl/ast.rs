@@ -76,7 +76,7 @@ pub enum TriggerClause {
     Capability(String),
 }
 
-/// One required safety condition, stored without type checking or evaluation.
+/// One unevaluated safety condition; static type checking is a separate AST pass.
 #[derive(Debug)]
 pub struct RequireClause {
     /// The required safety condition; false indicates a violation when the rule applies.

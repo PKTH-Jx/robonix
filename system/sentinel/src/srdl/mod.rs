@@ -1,8 +1,9 @@
-//! Parsing for the SRDL rule language. Binding and evaluation are not implemented.
+//! SRDL parsing and static type checking. Runtime binding and evaluation are not implemented.
 
 pub mod ast;
 mod lexer;
 mod parser;
+pub mod visitor;
 
 /// One SRDL error with a source range and a human-readable location.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
