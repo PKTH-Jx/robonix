@@ -4,7 +4,7 @@ rule speed_not_exceed_10 {
         number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value
         maxage 0.1;
     require velocity <= 10;
-    enforce deny report "Velocity exceeds the configured limit.";
+    enforce deny report "Slow down the robot";
 }
 
 rule speed_not_exceed_20 {

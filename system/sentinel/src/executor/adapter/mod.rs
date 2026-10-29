@@ -9,15 +9,15 @@ use tokio::{
     time::Instant,
 };
 
-use super::transport;
 use crate::srdl::ast::{InputClause, InputField, InputType, Rule};
 
 const MAX_CONCURRENT_BINDINGS: usize = 16;
 
 mod select;
+pub(super) mod transport;
 
-/// A selected response value validated against a basic SRDL input type.
-#[derive(Debug)]
+/// A basic SRDL value shared by acquired inputs and expression results.
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputValue {
     /// A boolean.
     Boolean(bool),
@@ -25,6 +25,16 @@ pub enum InputValue {
     Number(f64),
     /// A string.
     String(String),
+}
+
+impl InputValue {
+    pub fn data_type(&self) -> InputType {
+        match self {
+            Self::Boolean(_) => InputType::Boolean,
+            Self::Number(_) => InputType::Number,
+            Self::String(_) => InputType::String,
+        }
+    }
 }
 
 /// Type-checked fields from one capability response sharing its acquisition time.

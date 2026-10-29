@@ -20,11 +20,12 @@ nom = "8.0.0"
 anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 futures = "0.3"
+reqwest.workspace = true
 rmcp = { workspace = true, features = ["transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 robonix-atlas = { path = "../atlas" }
 robonix-scribe.workspace = true
 prost.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
 tonic-prost.workspace = true
 

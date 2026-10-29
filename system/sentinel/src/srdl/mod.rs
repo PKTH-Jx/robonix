@@ -1,4 +1,4 @@
-//! SRDL parsing and static type checking. Runtime binding and evaluation are not implemented.
+//! SRDL syntax trees, parsing and source-located diagnostics.
 
 pub mod ast;
 mod lexer;

@@ -198,6 +198,38 @@ impl rmcp::ServerHandler for McpHandler {
 }
 
 #[tokio::test]
+async fn evaluates_requirements_from_real_adapter_inputs_without_applying_enforce() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    let rule = parse(
+        r#"rule evaluated {
+        trigger always;
+        input from "sensor/value" select number x = reading maxage 2,
+            boolean ready = ready maxage 2;
+        require ready && x > 0;
+        require x < 0;
+        enforce pend;
+    }"#,
+    )
+    .unwrap()
+    .rules
+    .remove(0);
+    let evaluator = crate::executor::evaluator::RuleEvaluator::new(fixture.adapter.clone());
+    let result = timeout(
+        Duration::from_secs(5),
+        evaluator.evaluate(&rule, "consumer"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.requirements, [true, false]);
+    assert_eq!(result.failed_requirements(), [2]);
+    assert!(!result.passed());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert!(fixture.channels_empty().await);
+}
+
+#[tokio::test]
 async fn acquires_field_groups_once_and_supports_scalar_roots() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;

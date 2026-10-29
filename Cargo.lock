@@ -3435,6 +3435,7 @@ dependencies = [
  "nom 8.0.0",
  "prost",
  "protoc-bin-vendored",
+ "reqwest 0.13.4",
  "rmcp",
  "robonix-atlas",
  "robonix-codegen",

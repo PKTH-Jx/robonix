@@ -65,16 +65,16 @@ pub async fn acquire(
         Ok(Err(error)) => return Some(Err(Error::AtlasConnect(error))),
         Err(_) => return Some(Err(Error::TimedOut("Atlas connection"))),
     };
-    let result = tokio::select! {
-        biased;
-        _ = cancelled => None,
-        result = async {
-            match transport {
-                pb::Transport::Grpc => grpc::acquire(&endpoint, capability).await.map_err(Error::Grpc),
-                pb::Transport::Mcp => mcp::acquire(&endpoint, capability).await.map_err(Error::Mcp),
-                _ => unreachable!(),
-            }
-        } => Some(result),
+    let result = match transport {
+        pb::Transport::Mcp => mcp::acquire(&endpoint, capability, cancelled)
+            .await
+            .map(|result| result.map_err(Error::Mcp)),
+        pb::Transport::Grpc => tokio::select! {
+            biased;
+            _ = cancelled => None,
+            result = grpc::acquire(&endpoint, capability) => Some(result.map_err(Error::Grpc)),
+        },
+        _ => unreachable!(),
     };
     // Cleanup runs after success, failure or cancellation; it must not race cancellation.
     let cleanup = match timeout(CONTROL_TIMEOUT, atlas.disconnect_capability(&channel_id)).await {

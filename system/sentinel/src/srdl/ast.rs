@@ -1,3 +1,5 @@
+//! The Abstract Syntax Tree (AST) for the Sentinel Rule Definition Language (SRDL).
+
 /// An SRDL file, which contains a list of rules.
 #[derive(Debug)]
 pub struct Program {
@@ -90,7 +92,7 @@ pub struct RequireClause {
     pub expression: Expression,
 }
 
-/// The rule's single violation response; execution is not yet implemented.
+/// The rule's single response when a safety requirement is violated.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EnforceClause {
     /// The declared disposition when a safety requirement is violated.
@@ -99,7 +101,7 @@ pub struct EnforceClause {
     pub report: Option<String>,
 }
 
-/// A declared violation response; runtime execution is not yet implemented.
+/// A declared violation response; the experimental Enforcer supports allow and deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnforceBehavior {
     /// Permit the capability call despite the violated requirement.
