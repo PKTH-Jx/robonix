@@ -3,7 +3,7 @@ use tokio::time::sleep;
 
 use super::*;
 use crate::{
-    executor::adapter::{InputErrorKind, SelectedField},
+    interpreter::adapter::{InputErrorKind, SelectedField},
     srdl::parse,
 };
 
@@ -315,9 +315,4 @@ async fn rejects_stale_future_and_invalid_input_metadata() {
             Err(Error::InvalidMaxage { .. })
         ));
     }
-    let invalid = self::rule("", "require missing > 0;");
-    assert!(matches!(
-        evaluate_inputs(&Value::Null, &invalid, stream::pending()).await,
-        Err(Error::Static(_))
-    ));
 }

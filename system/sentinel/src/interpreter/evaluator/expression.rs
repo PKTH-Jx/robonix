@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::executor::adapter::InputValue;
+use crate::interpreter::adapter::InputValue;
 use crate::srdl::ast::{
     BinaryOperator, Expression, InputType, Literal, RequireClause, UnaryOperator,
 };

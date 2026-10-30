@@ -9,7 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(test)]
-mod executor;
+mod interpreter;
 #[cfg(test)]
 mod srdl;
 

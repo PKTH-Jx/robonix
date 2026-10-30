@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
 };
 
-use crate::executor::visitor::Visitor;
+use crate::interpreter::visitor::Visitor;
 use crate::srdl::ast::{Identifier, Rule};
 
 /// Readiness and cached result for one synchronous requirement calculation.

@@ -15,8 +15,6 @@ use serde_json::Value;
 use tokio::time::{Instant, sleep_until};
 
 use super::adapter::{AcquiredInput, InputAdapter, InputError, InputValue};
-use super::type_checker::{TypeChecker, TypeError};
-use super::visitor::Visitor;
 use crate::srdl::ast::Rule;
 use dependencies::DependencyPlan;
 use freshness::Freshness;
@@ -48,8 +46,6 @@ impl RuleResult {
 /// Failures that prevent a rule result, distinct from a false requirement.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
-    Static(#[from] TypeError),
     #[error(transparent)]
     Input(#[from] InputError),
     #[error("rule '{rule}', context '{binding}': {source}")]
@@ -112,14 +108,14 @@ pub struct RuleEvaluator {
 }
 
 impl RuleEvaluator {
-    pub fn new(adapter: InputAdapter) -> Self {
+    pub(super) fn new(adapter: InputAdapter) -> Self {
         Self { adapter }
     }
 
     /// Calculate a rule result without matching triggers or executing enforce.
     /// Any failure drops the input stream so the Adapter can cancel and clean up.
     /// Context must be the Executor's trusted snapshot for this call, not provider data.
-    pub async fn evaluate(
+    pub(super) async fn evaluate(
         &self,
         rule: &Rule,
         consumer_id: &str,
@@ -134,8 +130,7 @@ async fn evaluate_inputs<'ast>(
     rule: &'ast Rule,
     inputs: impl Stream<Item = Result<AcquiredInput<'ast>, InputError>>,
 ) -> Result<RuleResult, Error> {
-    // Unknown aliases must fail before acquisition, rather than waiting on impossible dependencies.
-    TypeChecker::default().visit_rule(rule)?;
+    // SrdlInterpreter validates the immutable program before any rule is evaluated.
     let mut values = context::bind(rule, context)?;
     let mut plan = DependencyPlan::new(rule);
     // Context is ready at the start and never participates in input acquisition deadlines.
