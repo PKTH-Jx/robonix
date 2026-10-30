@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 
-use super::Visitor;
+use super::visitor::Visitor;
 use crate::srdl::ast::*;
 
 /// Collects rules whose triggers match a capability call, in declaration order.

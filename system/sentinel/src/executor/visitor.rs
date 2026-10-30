@@ -2,9 +2,6 @@
 
 use crate::srdl::ast::*;
 
-pub mod trigger_match;
-pub mod type_check;
-
 /// Override individual hooks and use walk functions to visit their children.
 pub trait Visitor<'ast> {
     type Error;
@@ -23,6 +20,10 @@ pub trait Visitor<'ast> {
 
     fn visit_input_field(&mut self, field: &'ast InputField) -> Result<(), Self::Error> {
         walk_input_field(self, field)
+    }
+
+    fn visit_context(&mut self, context: &'ast ContextClause) -> Result<(), Self::Error> {
+        walk_context(self, context)
     }
 
     fn visit_select_step(&mut self, step: &'ast SelectStep) -> Result<(), Self::Error> {
@@ -72,14 +73,28 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     for trigger in &rule.triggers {
         visitor.visit_trigger(trigger)?;
     }
-    // Input declarations are visited before requirements, independently of source order.
+    // All bindings are visited before requirements, independently of source order.
     for input in &rule.inputs {
         visitor.visit_input(input)?;
+    }
+    for context in &rule.contexts {
+        visitor.visit_context(context)?;
     }
     for require in &rule.requires {
         visitor.visit_require(require)?;
     }
     visitor.visit_enforce(&rule.enforce)
+}
+
+pub fn walk_context<'ast, V: Visitor<'ast> + ?Sized>(
+    visitor: &mut V,
+    context: &'ast ContextClause,
+) -> Result<(), V::Error> {
+    visitor.visit_identifier(&context.name)?;
+    for field in &context.path {
+        visitor.visit_identifier(field)?;
+    }
+    Ok(())
 }
 
 pub fn walk_input<'ast, V: Visitor<'ast> + ?Sized>(
@@ -198,6 +213,7 @@ mod tests {
             rule r {
                 require !ready && f(reading + 1, target.value);
                 enforce deny;
+                context string user = identity.user_id;
                 input from "source" select number reading = items[id = "sensor"].value maxage 1,
                     boolean ready maxage 2;
                 trigger always;
@@ -209,7 +225,7 @@ mod tests {
         visitor.visit_program(&program).unwrap();
         assert_eq!(
             visitor.events.join(" "),
-            "id:r trigger id:reading id:items id:id literal id:value id:ready id:ready id:f id:reading literal id:target id:value enforce"
+            "id:r trigger id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value enforce"
         );
     }
 

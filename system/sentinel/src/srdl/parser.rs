@@ -68,6 +68,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     )
         .parse(input)?;
     let mut inputs = Vec::new();
+    let mut contexts = Vec::new();
     let mut triggers = Vec::new();
     let mut requires = Vec::new();
     let mut enforce = None;
@@ -87,6 +88,11 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
                     }
                 }
                 inputs.push(clause);
+                input = rest;
+            }
+            Some(TokenKind::Context) => {
+                let (rest, clause) = context_clause(input)?;
+                contexts.push(clause);
                 input = rest;
             }
             Some(TokenKind::Trigger) => {
@@ -111,7 +117,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             _ => {
                 return Err(Err::Error(expected(
                     &input,
-                    "input, trigger, require, or enforce",
+                    "input, context, trigger, require, or enforce",
                 )));
             }
         }
@@ -143,6 +149,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
         Rule {
             name,
             inputs,
+            contexts,
             triggers,
             requires,
             enforce,
@@ -150,7 +157,28 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     ))
 }
 
-// One acquisition owns a nonempty list of TYPE NAME [= PATH] maxage NUMBER fields.
+// Context paths bind local call metadata; they do not acquire data or accept maxage.
+fn context_clause(input: Tokens<'_>) -> IResult<'_, ContextClause> {
+    let (input, (_, data_type, name, _)) = (
+        match_token(TokenKind::Context),
+        input_type,
+        identifier,
+        match_token(TokenKind::Eq),
+    )
+        .parse(input)?;
+    let (input, path) =
+        separated_list1(match_token(TokenKind::Dot), cut(select_field)).parse(input)?;
+    Ok((
+        input,
+        ContextClause {
+            data_type,
+            name,
+            path,
+        },
+    ))
+}
+
+// One acquisition owns a nonempty list of TYPE NAME [= PATH] [maxage NUMBER] fields.
 // Commas separate fields; a comma inside a filter is not valid select syntax.
 fn input_clause(input: Tokens<'_>) -> IResult<'_, InputClause> {
     let (input, (_, _, capability, _)) = (
@@ -173,13 +201,17 @@ fn input_field(input: Tokens<'_>) -> IResult<'_, InputField> {
     } else {
         (input, Vec::new())
     };
-    let (input, _) = match_token(TokenKind::Maxage)(input)?;
-    // Bare positive finite values use the default time unit (seconds); no suffix is consumed.
-    let time = input.clone();
-    let (input, maxage) = number_literal(input)?;
-    if maxage <= 0.0 {
-        return Err(Err::Error(at(&time, ErrorKind::InvalidMaxage)));
-    }
+    let (input, maxage) = if input.tok.first().map(|token| token.kind) == Some(TokenKind::Maxage) {
+        // Once maxage appears, require a positive finite value in seconds without backtracking.
+        let time = input.take_from(1);
+        let (input, maxage) = number_literal(time.clone())?;
+        if maxage <= 0.0 {
+            return Err(Err::Error(at(&time, ErrorKind::InvalidMaxage)));
+        }
+        (input, Some(maxage))
+    } else {
+        (input, None)
+    };
     Ok((
         input,
         InputField {
@@ -241,6 +273,7 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::False
         | TokenKind::Rule
         | TokenKind::Input
+        | TokenKind::Context
         | TokenKind::Trigger
         | TokenKind::Require
         | TokenKind::Enforce
@@ -353,8 +386,9 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
     };
     let rest = input.take_from(1);
     match token.kind {
-        // Trigger and enforcement keywords are contextual, preserving input and field names.
+        // Contextual keywords remain available as binding and field names.
         TokenKind::Identifier
+        | TokenKind::Context
         | TokenKind::Always
         | TokenKind::Capability
         | TokenKind::Allow

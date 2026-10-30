@@ -9,10 +9,12 @@ use crate::srdl::ast::Rule;
 
 /// Timing constraints and receipt state for one declared field.
 struct FieldTime {
-    /// Maximum age rounded to clock resolution, plus the first invalid nanosecond.
-    lifetime: Duration,
-    /// First invalid instant; None means the field has not arrived.
+    /// Maximum age plus the first invalid nanosecond; None means no expiry constraint.
+    lifetime: Option<Duration>,
+    /// First invalid instant, absent until a bounded field arrives or for an unbounded field.
     expires_at: Option<Instant>,
+    /// Receipt tracked separately because an unbounded value never has an expiry deadline.
+    received: bool,
 }
 
 /// Freshness state for every declared field, including already evaluated or unused inputs.
@@ -22,7 +24,7 @@ pub(super) struct Freshness<'ast> {
     /// Per-field timing requirements and deadlines.
     fields: BTreeMap<&'ast str, FieldTime>,
     /// Initial waiting deadline, used only until the first field arrives.
-    first_deadline: Instant,
+    first_deadline: Option<Instant>,
 }
 
 impl<'ast> Freshness<'ast> {
@@ -33,25 +35,32 @@ impl<'ast> Freshness<'ast> {
                 rule: rule.name.0.clone(),
                 input: field.name.0.clone(),
             };
-            if field.maxage <= 0.0 {
-                return Err(invalid());
-            }
-            let lifetime = Duration::try_from_secs_f64(field.maxage)
-                .map_err(|_| invalid())?
-                .checked_add(Duration::from_nanos(1))
-                .ok_or_else(invalid)?;
+            let lifetime = field
+                .maxage
+                .map(|maxage| {
+                    if maxage <= 0.0 {
+                        return Err(invalid());
+                    }
+                    Duration::try_from_secs_f64(maxage)
+                        .map_err(|_| invalid())?
+                        .checked_add(Duration::from_nanos(1))
+                        .ok_or_else(invalid)
+                })
+                .transpose()?;
             fields.insert(
                 field.name.0.as_str(),
                 FieldTime {
                     lifetime,
                     expires_at: None,
+                    received: false,
                 },
             );
         }
+        let first_deadline = (!fields.is_empty()).then_some(now + first_timeout);
         Ok(Self {
             rule,
             fields,
-            first_deadline: now + first_timeout,
+            first_deadline,
         })
     }
 
@@ -66,15 +75,19 @@ impl<'ast> Freshness<'ast> {
             .fields
             .get_mut(name)
             .expect("Adapter fields belong to the evaluated rule");
-        field.expires_at =
-            Some(
+        field.expires_at = field
+            .lifetime
+            .map(|lifetime| {
                 acquired_at
-                    .checked_add(field.lifetime)
+                    .checked_add(lifetime)
                     .ok_or_else(|| Error::InvalidMaxage {
                         rule: self.rule.name.0.clone(),
                         input: name.into(),
-                    })?,
-            );
+                    })
+            })
+            .transpose()?;
+        field.received = true;
+        self.first_deadline = None;
         Ok(())
     }
 
@@ -83,7 +96,7 @@ impl<'ast> Freshness<'ast> {
             .values()
             .filter_map(|field| field.expires_at)
             .min()
-            .or_else(|| (!self.fields.is_empty()).then_some(self.first_deadline))
+            .or(self.first_deadline)
     }
 
     pub fn check(&self, now: Instant) -> Result<(), Error> {
@@ -95,10 +108,7 @@ impl<'ast> Freshness<'ast> {
                 });
             }
         }
-        if !self.fields.is_empty()
-            && self.fields.values().all(|field| field.expires_at.is_none())
-            && now >= self.first_deadline
-        {
+        if self.first_deadline.is_some_and(|deadline| now >= deadline) {
             return Err(Error::FirstInputTimeout {
                 rule: self.rule.name.0.clone(),
             });
@@ -107,6 +117,6 @@ impl<'ast> Freshness<'ast> {
     }
 
     pub fn complete(&self) -> bool {
-        self.fields.values().all(|field| field.expires_at.is_some())
+        self.fields.values().all(|field| field.received)
     }
 }

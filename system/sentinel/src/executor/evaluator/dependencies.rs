@@ -1,4 +1,4 @@
-//! Unique input dependencies and requirement readiness accounting.
+//! Unique input and context dependencies and requirement readiness accounting.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

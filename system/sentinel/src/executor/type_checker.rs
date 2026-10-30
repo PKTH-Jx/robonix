@@ -1,8 +1,8 @@
-//! Static checks over declared input types, without resolving capability response schemas.
+//! Static checks over declared binding types, without resolving source field schemas.
 
 use std::collections::BTreeMap;
 
-use super::{Visitor, walk_rule};
+use super::visitor::{Visitor, walk_rule};
 use crate::srdl::ast::*;
 
 /// A static type error located by rule and, when applicable, requirement number.
@@ -10,7 +10,7 @@ use crate::srdl::ast::*;
 pub struct TypeError {
     /// The rule containing the invalid declaration or expression.
     pub rule: String,
-    /// The one-based requirement number; None identifies an input declaration error.
+    /// The one-based requirement number; None identifies a binding declaration error.
     pub requirement: Option<usize>,
     /// The failed type constraint.
     pub kind: TypeErrorKind,
@@ -28,13 +28,13 @@ impl std::fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Constraints enforceable using the three basic input types.
+/// Constraints enforceable using the three basic binding types.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TypeErrorKind {
-    #[error("duplicate input '{0}'")]
-    DuplicateInput(String),
-    #[error("unknown input '{0}'")]
-    UnknownInput(String),
+    #[error("duplicate binding '{0}'")]
+    DuplicateBinding(String),
+    #[error("unknown binding '{0}'")]
+    UnknownBinding(String),
     #[error("require must be boolean, found {0:?}")]
     NonBooleanRequire(InputType),
     #[error("unary operator {operator:?} does not accept {operand:?}")]
@@ -57,11 +57,11 @@ pub enum TypeErrorKind {
     UnsupportedExpression(&'static str),
 }
 
-/// Infers expression types using an independent input scope for each rule.
+/// Infers expression types using one shared input and context scope per rule.
 #[derive(Default)]
 pub struct TypeChecker {
-    /// The input names and their declared types in the current rule.
-    inputs: BTreeMap<String, InputType>,
+    /// Input and context aliases with their declared types in the current rule.
+    bindings: BTreeMap<String, InputType>,
     /// The rule name used in diagnostics.
     rule: String,
     /// The requirement currently being checked, if declarations are complete.
@@ -82,8 +82,13 @@ impl TypeChecker {
         }
     }
 
-    /// Recursively infer the type of an expression, returning an error if the expression
-    /// is invalid or unsupported.
+    fn declare(&mut self, name: &Identifier, data_type: InputType) -> Result<(), TypeError> {
+        if self.bindings.insert(name.0.clone(), data_type).is_some() {
+            return Err(self.error(TypeErrorKind::DuplicateBinding(name.0.clone())));
+        }
+        Ok(())
+    }
+
     fn infer_expression(&self, expression: &Expression) -> Result<InputType, TypeError> {
         use BinaryOperator as B;
         use InputType as T;
@@ -92,10 +97,10 @@ impl TypeChecker {
             Expression::Literal(Literal::String(_)) => Ok(T::String),
             Expression::Literal(Literal::Boolean(_)) => Ok(T::Boolean),
             Expression::Identifier(Identifier(name)) => self
-                .inputs
+                .bindings
                 .get(name)
                 .copied()
-                .ok_or_else(|| self.error(TypeErrorKind::UnknownInput(name.clone()))),
+                .ok_or_else(|| self.error(TypeErrorKind::UnknownBinding(name.clone()))),
             Expression::Unary { operator, operand } => {
                 let operand_type = self.infer_expression(operand)?;
                 match (operator, operand_type) {
@@ -150,21 +155,18 @@ impl<'ast> Visitor<'ast> for TypeChecker {
     type Error = TypeError;
 
     fn visit_rule(&mut self, rule: &Rule) -> Result<(), TypeError> {
-        self.inputs.clear();
+        self.bindings.clear();
         self.rule.clone_from(&rule.name.0);
         self.requirement = None;
         walk_rule(self, rule)
     }
 
     fn visit_input_field(&mut self, input: &InputField) -> Result<(), TypeError> {
-        if self
-            .inputs
-            .insert(input.name.0.clone(), input.data_type)
-            .is_some()
-        {
-            return Err(self.error(TypeErrorKind::DuplicateInput(input.name.0.clone())));
-        }
-        Ok(())
+        self.declare(&input.name, input.data_type)
+    }
+
+    fn visit_context(&mut self, context: &ContextClause) -> Result<(), TypeError> {
+        self.declare(&context.name, context.data_type)
     }
 
     fn visit_require(&mut self, require: &RequireClause) -> Result<(), TypeError> {
@@ -203,7 +205,7 @@ mod tests {
 
     #[test]
     fn checks_basic_types_operators_and_source_order_independence() {
-        TypeChecker::check(&parse(include_str!("../../../test.srdl")).unwrap()).unwrap();
+        TypeChecker::check(&parse(include_str!("../../test.srdl")).unwrap()).unwrap();
         TypeChecker::check(&parse("").unwrap()).unwrap();
         for expression in ["!ready", "-x < y", "x < y && (ready || label = \"active\")"] {
             check(expression).unwrap();
@@ -275,7 +277,7 @@ mod tests {
             ),
             (
                 "true || missing",
-                TypeErrorKind::UnknownInput("missing".into()),
+                TypeErrorKind::UnknownBinding("missing".into()),
             ),
         ] {
             assert_eq!(
@@ -302,13 +304,56 @@ mod tests {
             TypeError {
                 rule: "second".into(),
                 requirement: Some(2),
-                kind: TypeErrorKind::UnknownInput("x".into()),
+                kind: TypeErrorKind::UnknownBinding("x".into()),
             }
         );
         let second = r#"rule second { trigger always;
             input from "source" select boolean x = value maxage 1;
             require x; enforce deny; }"#;
         TypeChecker::check(&parse(&format!("{first} {second}")).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checks_context_types_and_a_shared_scope_independent_of_source_order() {
+        let declarations = r#"context string user = identity.user_id;
+            context boolean ready = identity.ready;
+            context number limit = arguments.limit;
+            input from "source" select number value maxage 1;"#;
+        for (expression, valid) in [
+            ("user = \"alice\" && ready && value < limit", true),
+            ("user + 1 > 0", false),
+            ("ready = limit", false),
+            ("limit", false),
+        ] {
+            let program = parse(&format!(
+                "rule r {{ require {expression}; trigger always; {declarations} enforce deny; }}"
+            ))
+            .unwrap();
+            let result = TypeChecker::check(&program);
+            assert_eq!(result.is_ok(), valid, "{expression}");
+            if let Err(error) = result {
+                assert_eq!(error.requirement, Some(1));
+            }
+        }
+        for declarations in [
+            "context string user = identity.user_id; context boolean user = identity.ready;",
+            r#"context string user = identity.user_id; input from "source" select number user maxage 1;"#,
+            r#"input from "source" select number user maxage 1; context string user = identity.user_id;"#,
+        ] {
+            let program = parse(&format!(
+                "rule r {{ trigger always; {declarations} require true; enforce deny; }}"
+            ))
+            .unwrap();
+            let error = TypeChecker::check(&program).unwrap_err();
+            assert_eq!(error.kind, TypeErrorKind::DuplicateBinding("user".into()));
+            assert_eq!(error.requirement, None);
+        }
+        let program = parse(r#"rule first { trigger always; context string user = identity.user_id; require true; enforce deny; }
+            rule second { trigger always; require user = "alice"; enforce deny; }"#).unwrap();
+        assert_eq!(
+            TypeChecker::check(&program).unwrap_err().kind,
+            TypeErrorKind::UnknownBinding("user".into())
+        );
     }
 
     #[test]
@@ -325,7 +370,7 @@ mod tests {
             TypeError {
                 rule: "duplicate".into(),
                 requirement: None,
-                kind: TypeErrorKind::DuplicateInput("x".into()),
+                kind: TypeErrorKind::DuplicateBinding("x".into()),
             }
         );
     }

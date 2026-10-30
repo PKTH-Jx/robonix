@@ -2,19 +2,21 @@
 
 pub mod expression;
 
+mod context;
 mod dependencies;
 mod freshness;
+
+pub use context::Error as ContextError;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::{Stream, StreamExt};
+use serde_json::Value;
 use tokio::time::{Instant, sleep_until};
 
 use super::adapter::{AcquiredInput, InputAdapter, InputError, InputValue};
-use super::visitor::{
-    Visitor,
-    type_check::{TypeChecker, TypeError},
-};
+use super::type_checker::{TypeChecker, TypeError};
+use super::visitor::Visitor;
 use crate::srdl::ast::Rule;
 use dependencies::DependencyPlan;
 use freshness::Freshness;
@@ -50,6 +52,16 @@ pub enum Error {
     Static(#[from] TypeError),
     #[error(transparent)]
     Input(#[from] InputError),
+    #[error("rule '{rule}', context '{binding}': {source}")]
+    Context {
+        /// The rule containing the context binding that failed.
+        rule: String,
+        /// The alias whose value could not be extracted or type checked.
+        binding: String,
+        /// The failed field traversal or basic type constraint.
+        #[source]
+        source: ContextError,
+    },
     #[error("rule '{rule}', require #{requirement}: {source}")]
     Expression {
         /// The rule whose requirement could not be calculated.
@@ -106,20 +118,31 @@ impl RuleEvaluator {
 
     /// Calculate a rule result without matching triggers or executing enforce.
     /// Any failure drops the input stream so the Adapter can cancel and clean up.
-    pub async fn evaluate(&self, rule: &Rule, consumer_id: &str) -> Result<RuleResult, Error> {
-        evaluate_inputs(rule, self.adapter.acquire(rule, consumer_id)).await
+    /// Context must be the Executor's trusted snapshot for this call, not provider data.
+    pub async fn evaluate(
+        &self,
+        rule: &Rule,
+        consumer_id: &str,
+        context: &Value,
+    ) -> Result<RuleResult, Error> {
+        evaluate_inputs(context, rule, self.adapter.acquire(rule, consumer_id)).await
     }
 }
 
 async fn evaluate_inputs<'ast>(
+    context: &Value,
     rule: &'ast Rule,
     inputs: impl Stream<Item = Result<AcquiredInput<'ast>, InputError>>,
 ) -> Result<RuleResult, Error> {
     // Unknown aliases must fail before acquisition, rather than waiting on impossible dependencies.
     TypeChecker::default().visit_rule(rule)?;
+    let mut values = context::bind(rule, context)?;
     let mut plan = DependencyPlan::new(rule);
+    // Context is ready at the start and never participates in input acquisition deadlines.
+    for name in values.keys() {
+        plan.arrived(name);
+    }
     let mut freshness = Freshness::new(rule, Instant::now(), FIRST_INPUT_TIMEOUT)?;
-    let mut values = BTreeMap::new();
     evaluate_ready(rule, &mut plan, &values, &freshness)?;
     tokio::pin!(inputs);
     loop {

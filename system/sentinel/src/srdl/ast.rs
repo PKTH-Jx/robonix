@@ -14,6 +14,8 @@ pub struct Rule {
     pub name: Identifier,
     /// Inputs available to every clause, regardless of declaration order.
     pub inputs: Vec<InputClause>,
+    /// Bindings to the Executor's immutable context for this capability call.
+    pub contexts: Vec<ContextClause>,
     /// Alternative events; any matching trigger makes the rule applicable.
     pub triggers: Vec<TriggerClause>,
     /// Required safety conditions; all must hold for the rule to pass.
@@ -47,16 +49,27 @@ pub struct InputField {
     pub name: Identifier,
     /// Response-relative traversal; an empty path selects the complete response.
     pub select: Vec<SelectStep>,
-    /// Maximum elapsed time from response acquisition to requirement evaluation, in seconds.
-    pub maxage: f64,
+    /// Maximum elapsed time from acquisition to evaluation, in seconds; None never expires.
+    pub maxage: Option<f64>,
 }
 
-/// The basic value types accepted by input declarations.
+/// One typed binding to a field in the Executor's current call context.
+#[derive(Debug)]
+pub struct ContextClause {
+    /// The basic type available to requirement expressions.
+    pub data_type: InputType,
+    /// The alias sharing the rule's scope with input fields.
+    pub name: Identifier,
+    /// Nonempty field traversal within the trusted call context, without filters.
+    pub path: Vec<Identifier>,
+}
+
+/// The basic value types accepted by input and context declarations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputType {
     /// A finite numeric value with no distinction between integers and decimals.
     Number,
-    /// Text decoded from the capability response.
+    /// Text supplied by an input or context binding.
     String,
     /// A true or false value.
     Boolean,

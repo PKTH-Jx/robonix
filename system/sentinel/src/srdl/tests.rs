@@ -54,7 +54,7 @@ fn parses_test_srdl() {
         let input = &rule.inputs[0];
         assert_eq!(input.fields[0].name.0, "velocity");
         assert_eq!(input.capability, "robonix/system/soma/get_health");
-        assert_eq!(input.fields[0].maxage, 0.1);
+        assert_eq!(input.fields[0].maxage, Some(0.1));
         assert_eq!(
             rule.requires[0].expression,
             binary(B::Lte, name("velocity"), number(limit))
@@ -218,7 +218,7 @@ fn collects_multiple_inputs_triggers_and_requirements_in_any_order() {
     assert_eq!(rule.inputs.len(), 2);
     assert_eq!(rule.inputs[0].fields[0].name, Identifier("velocity".into()));
     assert_eq!(rule.inputs[1].fields[0].data_type, InputType::Number);
-    assert_eq!(rule.inputs[1].fields[0].maxage, 2.0);
+    assert_eq!(rule.inputs[1].fields[0].maxage, Some(2.0));
     assert_eq!(
         rule.triggers,
         vec![
@@ -276,7 +276,11 @@ fn groups_fields_with_independent_paths_and_maxage() {
             .iter()
             .map(|field| (field.name.0.as_str(), field.maxage))
             .collect::<Vec<_>>(),
-        [("velocity", 0.1), ("label", 2.0), ("ready", 3.0)]
+        [
+            ("velocity", Some(0.1)),
+            ("label", Some(2.0)),
+            ("ready", Some(3.0))
+        ]
     );
     assert_eq!(
         input.fields[0].select,
@@ -290,7 +294,7 @@ fn groups_fields_with_independent_paths_and_maxage() {
         r#"input from "source" select;"#,
         r#"input from "source" select number x maxage 1,;"#,
         r#"input from "source" select number x = maxage 1;"#,
-        r#"input from "source" select number x maxage 1, number y;"#,
+        r#"input from "source" select number x maxage 1, number y maxage;"#,
         r#"input from "source" select number x = value + 1 maxage 1;"#,
     ] {
         assert!(
@@ -314,6 +318,27 @@ fn groups_fields_with_independent_paths_and_maxage() {
             ErrorKind::DuplicateInput("x".into())
         );
     }
+}
+
+#[test]
+fn accepts_optional_maxage_per_field() {
+    let parsed = rule(
+        r#"trigger always;
+        input from "source" select number first = reading,
+            boolean bounded = ready maxage 2, string root;
+        require true; enforce deny;"#,
+    )
+    .unwrap();
+    let fields = &parsed.inputs[0].fields;
+    assert_eq!(
+        fields.iter().map(|field| field.maxage).collect::<Vec<_>>(),
+        [None, Some(2.0), None]
+    );
+    assert_eq!(
+        fields[0].select,
+        [SelectStep::Field(Identifier("reading".into()))]
+    );
+    assert!(fields[2].select.is_empty());
 }
 
 #[test]
@@ -362,7 +387,6 @@ fn rejects_invalid_input_declarations() {
         r#"input from "source" select number v = items[id = 1 + 2] maxage 1;"#,
         r#"input from "source" select number v = items[id = "a" maxage 1;"#,
         r#"input number v from "source" maxage 1;"#,
-        r#"input from "source" select number v = value;"#,
     ] {
         let source =
             format!("rule invalid {{ {declaration} trigger always; require true; enforce deny; }}");
@@ -559,7 +583,7 @@ fn numeric_spellings_share_one_value_type_in_all_contexts() {
         ("1.5E+1", 15.0),
     ] {
         let input = input(&format!("readings[id = {spelling}].value"), spelling).unwrap();
-        assert_eq!(input.maxage, expected);
+        assert_eq!(input.maxage, Some(expected));
         assert!(
             matches!(input.select[1], SelectStep::Filter { value: Literal::Number(value), .. } if value == expected)
         );
@@ -768,5 +792,66 @@ fn parses_only_basic_input_types() {
             }
         );
         assert_eq!(&source[error.span], data_type);
+    }
+}
+#[test]
+fn parses_context_bindings_without_acquisition_or_freshness() {
+    let program = parse(
+        r#"rule r {
+        require user_id = "alice" && ready && count > 0;
+        context string user_id = identity.user_id;
+        trigger always;
+        context boolean ready = identity.context.true;
+        context number count = arguments.count;
+        input from "source" select number context = context maxage 1;
+        enforce deny;
+    }"#,
+    )
+    .unwrap();
+    let rule = &program.rules[0];
+    assert_eq!(
+        rule.contexts
+            .iter()
+            .map(|context| context.data_type)
+            .collect::<Vec<_>>(),
+        [InputType::String, InputType::Boolean, InputType::Number]
+    );
+    assert_eq!(rule.contexts[0].name.0, "user_id");
+    assert_eq!(
+        rule.contexts[0]
+            .path
+            .iter()
+            .map(|field| field.0.as_str())
+            .collect::<Vec<_>>(),
+        ["identity", "user_id"]
+    );
+    assert_eq!(
+        rule.contexts[1]
+            .path
+            .iter()
+            .map(|field| field.0.as_str())
+            .collect::<Vec<_>>(),
+        ["identity", "context", "true"]
+    );
+    assert_eq!(
+        rule.inputs[0].fields[0].select,
+        [SelectStep::Field(Identifier("context".into()))]
+    );
+    for clause in [
+        "context string user = identity.user_id maxage 1;",
+        "context string user = identity[role = true];",
+        "context string user = identity.;",
+        "context string user = ;",
+        "context string user identity.user_id;",
+        "context string user = identity.user_id",
+        "context length user = identity.user_id;",
+    ] {
+        assert!(
+            parse(&format!(
+                "rule r {{ trigger always; {clause} require true; enforce deny; }}"
+            ))
+            .is_err(),
+            "{clause}"
+        );
     }
 }

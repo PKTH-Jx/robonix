@@ -204,9 +204,10 @@ async fn evaluates_requirements_from_real_adapter_inputs_without_applying_enforc
     let rule = parse(
         r#"rule evaluated {
         trigger always;
+        context string user = identity.user_id;
         input from "sensor/value" select number x = reading maxage 2,
             boolean ready = ready maxage 2;
-        require ready && x > 0;
+        require user = "alice" && ready && x > 0;
         require x < 0;
         enforce pend;
     }"#,
@@ -217,7 +218,11 @@ async fn evaluates_requirements_from_real_adapter_inputs_without_applying_enforc
     let evaluator = crate::executor::evaluator::RuleEvaluator::new(fixture.adapter.clone());
     let result = timeout(
         Duration::from_secs(5),
-        evaluator.evaluate(&rule, "consumer"),
+        evaluator.evaluate(
+            &rule,
+            "consumer",
+            &serde_json::json!({"identity":{"user_id":"alice"}}),
+        ),
     )
     .await
     .unwrap()
@@ -274,7 +279,7 @@ async fn acquires_field_groups_once_and_supports_scalar_roots() {
         for (selected, (name, expected, maxage)) in acquired[0].fields.iter().zip(expected) {
             assert_eq!(
                 (selected.field.name.0.as_str(), selected.field.maxage),
-                (name, maxage)
+                (name, Some(maxage))
             );
             match (&selected.value, &expected) {
                 (InputValue::Number(actual), serde_json::Value::Number(expected)) => {

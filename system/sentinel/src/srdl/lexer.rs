@@ -36,6 +36,8 @@ pub enum TokenKind {
     // Clauses
     #[token("input")]
     Input,
+    #[token("context")]
+    Context,
     #[token("trigger")]
     Trigger,
     #[token("require")]

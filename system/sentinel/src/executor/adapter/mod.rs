@@ -28,6 +28,27 @@ pub enum InputValue {
 }
 
 impl InputValue {
+    /// Decode a basic value without coercion; errors identify the actual JSON type.
+    pub(super) fn from_json(value: &Value, expected: InputType) -> Result<Self, &'static str> {
+        let selected = match (expected, value) {
+            (InputType::Boolean, Value::Bool(boolean)) => Some(Self::Boolean(*boolean)),
+            (InputType::Number, Value::Number(number)) => number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .map(Self::Number),
+            (InputType::String, Value::String(text)) => Some(Self::String(text.clone())),
+            _ => None,
+        };
+        selected.ok_or(match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        })
+    }
+
     pub fn data_type(&self) -> InputType {
         match self {
             Self::Boolean(_) => InputType::Boolean,
@@ -119,7 +140,7 @@ impl InputAdapter {
     ///
     /// Dropping the stream cancels pending acquisition. Workers retain their shared
     /// concurrency permits until Atlas channel cleanup completes.
-    /// Results contain type-checked selected values; maxage is not evaluated here yet.
+    /// Results contain type-checked selected values; the Evaluator checks freshness.
     pub fn acquire<'ast>(
         &'ast self,
         rule: &'ast Rule,
@@ -244,22 +265,11 @@ fn select_field<'ast>(
     field: &'ast InputField,
 ) -> Result<SelectedField<'ast>, InputErrorKind> {
     let value = select::select(response, &field.select).map_err(InputErrorKind::Selection)?;
-    let selected = match (field.data_type, value) {
-        (InputType::Boolean, Value::Bool(boolean)) => Some(InputValue::Boolean(*boolean)),
-        (InputType::Number, Value::Number(number)) => number.as_f64().map(InputValue::Number),
-        (InputType::String, Value::String(text)) => Some(InputValue::String(text.clone())),
-        _ => None,
-    }
-    .ok_or_else(|| InputErrorKind::TypeMismatch {
-        expected: field.data_type,
-        actual: match value {
-            Value::Null => "null",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::String(_) => "string",
-            Value::Array(_) => "array",
-            Value::Object(_) => "object",
-        },
+    let selected = InputValue::from_json(value, field.data_type).map_err(|actual| {
+        InputErrorKind::TypeMismatch {
+            expected: field.data_type,
+            actual,
+        }
     })?;
     Ok(SelectedField {
         field,
