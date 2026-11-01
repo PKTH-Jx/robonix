@@ -6,11 +6,11 @@ and use MCP; builtin capabilities run in-process.
 
 ## Build and run
 
-From the repository root, with Atlas running:
+From the repository root, with Atlas running and `rules.srdl` prepared:
 
 ```sh
 cargo build -p robonix-executor
-./target/debug/robonix-executor --atlas 127.0.0.1:50051 --listen 127.0.0.1:50061
+./target/debug/robonix-executor --atlas 127.0.0.1:50051 --listen 127.0.0.1:50061 --sentinel-rules rules.srdl
 ```
 
 | Flag | Environment variable | Default / purpose |
@@ -18,7 +18,7 @@ cargo build -p robonix-executor
 | `--atlas` | `ROBONIX_ATLAS_ENDPOINT` | Atlas at `127.0.0.1:50051` |
 | `--listen` | `ROBONIX_EXECUTOR_LISTEN` | gRPC on `127.0.0.1:50061` |
 | `--sentinel-listen` | `ROBONIX_SENTINEL_LISTEN` | Loopback-only Sentinel management gRPC; port defaults to Executor's port plus one |
-| `--sentinel-rules` | `ROBONIX_SENTINEL_RULES` | Active Sentinel rules; defaults to `$ROBONIX_DATA_DIR/sentinel-rules.json` |
+| `--sentinel-rules` | `ROBONIX_SENTINEL_RULES` | Sentinel SRDL source; defaults to `$ROBONIX_DATA_DIR/sentinel-rules.srdl` |
 | `--sentinel-rules-seed` | `ROBONIX_SENTINEL_RULES_SEED` | Optional policy copied only when the active rule file is absent |
 | `--require-keystone` | `ROBONIX_EXECUTOR_REQUIRE_KEYSTONE` | Require a live Keystone session for execution and plan control |
 | `--id` | `ROBONIX_EXECUTOR_PROVIDER_ID` | Provider id `executor` |
@@ -40,12 +40,13 @@ those entry points accept anonymous requests without contacting Keystone and
 leave any forwarded credential uninterpreted. `list_active_plans` remains a
 read-only unauthenticated query in either mode.
 
-Every `do` call is checked against the active Sentinel policy before dispatch.
-Denied and indeterminate decisions fail the node without calling its provider.
-Administrators list or replace rules through
-`robonix/system/sentinel/list_rules` and
-`robonix/system/sentinel/replace_rules` on the loopback-only management
-endpoint. Replacements are validated and persisted before becoming active.
+Every `do` call runs the SRDL interpreter before dispatch. Rules are loaded
+and type-checked at startup; missing or invalid files stop startup. An empty
+file allows calls by default. Denials and check failures stop dispatch;
+node events carry the structured feedback in `operator_detail`.
+
+`robonix/system/sentinel/list_rules` and `replace_rules` are retained for
+SRDL rule reading and dynamic loading. Their handlers are not yet implemented.
 
 ## Execution and control
 

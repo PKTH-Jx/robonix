@@ -117,11 +117,29 @@ wait_for_port "$ATLAS_ADDR" "$ATLAS_PID"
 KEYSTONE_PID=$!
 wait_for_port "$KEYSTONE_ADDR" "$KEYSTONE_PID"
 
+# Configure a stable user-ID rule before Executor loads the SRDL source.
+"$TEST_PYTHON" - "$WORK/keystone.db" "$WORK/sentinel-rules.srdl" <<'PYRULE'
+import json
+import pathlib
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as database:
+    admin_id = database.execute("SELECT user_id FROM users WHERE username = ?", ("admin",)).fetchone()[0]
+pathlib.Path(sys.argv[2]).write_text(f'''rule require_admin_user {{
+    trigger capability "robonix/system/executor/builtin/list_dir";
+    context string user = identity.user_id;
+    require user = {json.dumps(admin_id)};
+    enforce deny report "Only the configured user may list the test workspace";
+}}
+''')
+PYRULE
+
 "$EXECUTOR_BIN" \
   --atlas "$ATLAS_ADDR" \
   --listen "$EXECUTOR_ADDR" \
   --sentinel-listen "$SENTINEL_ADDR" \
-  --sentinel-rules "$WORK/sentinel-rules.json" \
+  --sentinel-rules "$WORK/sentinel-rules.srdl" \
   --require-keystone true \
   --id executor \
   >"$EXECUTOR_LOG" 2>&1 &
@@ -402,20 +420,6 @@ with grpc.insecure_channel(pilot_endpoint) as channel:
     assert response and response[0].status.session_id == "direct-pilot-test", response
 print("PASS Pilot authenticated direct task and stop requests")
 
-with grpc.insecure_channel(sentinel_endpoint) as channel:
-    list_rules = contracts.RobonixSystemSentinelListRulesStub(channel)
-    response = list_rules.ListRules(
-        sentinel_pb2.ListRules_Request(session_token=token), timeout=5
-    )
-    assert json.loads(response.rules_json) == [], response.rules_json
-    expect_rpc_error(
-        grpc.StatusCode.UNAUTHENTICATED,
-        lambda: list_rules.ListRules(
-            sentinel_pb2.ListRules_Request(session_token="invalid-session"), timeout=5
-        ),
-        "Sentinel accepted an invalid Keystone session",
-    )
-print("PASS Sentinel resolved the administrator through Keystone")
 
 def plan(plan_id, session_token):
     return pilot_pb2.Plan(
@@ -531,112 +535,43 @@ with grpc.insecure_channel(executor_endpoint) as channel:
 
 print("PASS Executor authenticated complete, streamed, and control requests")
 
-policy = [
-    {
-        "id": "allow-admin-list-dir",
-        "effect": "allow",
-        "priority": 100,
-        "conditions": {
-            "contract": "robonix/system/executor/builtin/list_dir",
-            "roles": ["admin"],
-        },
-        "reason": "Administrators may list the test workspace",
-    },
-    {
-        "id": "deny-non-admin-list-dir",
-        "effect": "deny",
-        "priority": 10,
-        "conditions": {
-            "contract": "robonix/system/executor/builtin/list_dir",
-        },
-        "reason": "Listing the test workspace requires the administrator role",
-    },
-]
-policy_json = json.dumps(policy)
-policy_ids = [rule["id"] for rule in policy]
-
 with grpc.insecure_channel(sentinel_endpoint) as channel:
     list_rules = contracts.RobonixSystemSentinelListRulesStub(channel)
     replace_rules = contracts.RobonixSystemSentinelReplaceRulesStub(channel)
-
     for operation in (
-        lambda: list_rules.ListRules(
-            sentinel_pb2.ListRules_Request(session_token=user_token), timeout=5
-        ),
-        lambda: replace_rules.ReplaceRules(
-            sentinel_pb2.ReplaceRules_Request(
-                session_token=user_token, rules_json=policy_json
-            ),
-            timeout=5,
-        ),
+        lambda: list_rules.ListRules(sentinel_pb2.ListRules_Request(session_token=token), timeout=5),
+        lambda: replace_rules.ReplaceRules(sentinel_pb2.ReplaceRules_Request(session_token=token, rules_json="invalid"), timeout=5),
     ):
-        expect_rpc_error(
-            grpc.StatusCode.PERMISSION_DENIED,
-            operation,
-            "Sentinel allowed a normal user to manage rules",
-        )
-
-    response = replace_rules.ReplaceRules(
-        sentinel_pb2.ReplaceRules_Request(
-            session_token=token, rules_json=policy_json
-        ),
-        timeout=5,
-    )
-    active = json.loads(response.rules_json)
-    assert [rule["id"] for rule in active] == policy_ids, active
-
-    invalid_policy = json.dumps(
-        [
-            {"id": "duplicate", "effect": "deny"},
-            {"id": "duplicate", "effect": "allow"},
-        ]
-    )
-    expect_rpc_error(
-        grpc.StatusCode.INVALID_ARGUMENT,
-        lambda: replace_rules.ReplaceRules(
-            sentinel_pb2.ReplaceRules_Request(
-                session_token=token, rules_json=invalid_policy
-            ),
-            timeout=5,
-        ),
-        "Sentinel accepted duplicate rule IDs",
-    )
-
-    response = list_rules.ListRules(
-        sentinel_pb2.ListRules_Request(session_token=token), timeout=5
-    )
-    active = json.loads(response.rules_json)
-    assert [rule["id"] for rule in active] == policy_ids, active
-
-print("PASS Sentinel restricted rule management to Keystone administrators")
-print("PASS Sentinel kept the active rules after rejecting an invalid replacement")
+        expect_rpc_error(grpc.StatusCode.UNIMPLEMENTED, operation,
+                         "SRDL rule management unexpectedly accepted a runtime operation")
+print("PASS Sentinel retained its management interfaces for future SRDL loading")
 
 with grpc.insecure_channel(executor_endpoint) as channel:
     execute = contracts.RobonixSystemExecutorExecuteStub(channel)
     execute_stream = contracts.RobonixSystemExecutorExecuteStreamStub(channel)
 
-    admin_events = run_plan(execute, "role-policy-admin", token)
+    admin_events = run_plan(execute, "user-policy-admin", token)
     admin_terminal = terminal_state(admin_events, 2)
     assert admin_terminal.leaf_result.success, admin_terminal.leaf_result
 
-    user_events = run_plan(execute, "role-policy-user", user_token)
+    user_events = run_plan(execute, "user-policy-user", user_token)
     user_terminal = terminal_state(user_events, 3)
     assert not user_terminal.leaf_result.success, user_terminal.leaf_result
-    assert "deny-non-admin-list-dir" in user_terminal.leaf_result.error, (
+    assert "require_admin_user" in user_terminal.leaf_result.error, (
         user_terminal.leaf_result
     )
     assert any(
         event.HasField("plan_complete") and event.plan_complete.any_failed
         for event in user_events
     ), user_events
-    streamed_admin = run_streamed_plan(execute_stream, "role-policy-stream-admin", token)
+    streamed_admin = run_streamed_plan(execute_stream, "user-policy-stream-admin", token)
     assert terminal_state(streamed_admin, 2).leaf_result.success, streamed_admin
-    streamed_user = run_streamed_plan(execute_stream, "role-policy-stream-user", user_token)
+    streamed_user = run_streamed_plan(execute_stream, "user-policy-stream-user", user_token)
     streamed_terminal = terminal_state(streamed_user, 3)
     assert not streamed_terminal.leaf_result.success, streamed_terminal
-    assert "deny-non-admin-list-dir" in streamed_terminal.leaf_result.error, streamed_terminal
+    assert "require_admin_user" in streamed_terminal.leaf_result.error, streamed_terminal
 
-print("PASS Sentinel allowed the administrator and denied the normal user on both execution paths")
+print("PASS SRDL matched the configured user ID on complete and streamed execution paths")
 PY
 
 for database_file in "$WORK/keystone.db" "$WORK/keystone.db-wal" "$WORK/keystone.db-shm"; do
@@ -687,7 +622,7 @@ for path, allowed in ((sys.argv[1], True), (sys.argv[2], False)):
     assert any(
         result["contract_id"] == "robonix/system/executor/builtin/list_dir"
         and result["success"] == allowed
-        and (allowed or "deny-non-admin-list-dir" in result["error"])
+        and (allowed or "require_admin_user" in result["error"])
         for result in results
     ), f"unexpected Executor result for {path}: {results}"
     assert any(event.get("final_text") for event in events), path
@@ -699,5 +634,41 @@ if [[ -e "$SESSION_FILE" ]]; then
   exit 1
 fi
 echo "PASS rbnx logged in through Keystone and revoked the saved session"
+
+# Reload the shipped Webots seed through a fresh Executor, without starting a simulator.
+kill "$EXECUTOR_PID"
+wait "$EXECUTOR_PID" 2>/dev/null || true
+ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
+  --atlas "$ATLAS_ADDR" --listen "$EXECUTOR_ADDR" \
+  --sentinel-listen "$SENTINEL_ADDR" \
+  --sentinel-rules "$ROOT/examples/webots/sentinel-rules.v1.srdl" \
+  --require-keystone false --id executor >"$EXECUTOR_LOG" 2>&1 &
+EXECUTOR_PID=$!
+wait_for_port "$EXECUTOR_ADDR" "$EXECUTOR_PID"
+PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYDEMO'
+import json
+import pathlib
+import sys
+import grpc
+import pilot_pb2
+import robonix_contracts_pb2_grpc as contracts
+
+with grpc.insecure_channel(sys.argv[1]) as channel:
+    execute = contracts.RobonixSystemExecutorExecuteStub(channel)
+    for path, allowed in (("protected.txt", False), ("notes.txt", True)):
+        plan = pilot_pb2.Plan(plan_id=f"seed-{path}", nodes=[pilot_pb2.RtdlNode(
+            node_kind=2, op_id="write", description="test the shipped SRDL seed",
+            call=pilot_pb2.CapabilityCall(call_id=f"write-{path}", provider_id="executor",
+                contract_id="robonix/system/executor/builtin/write_file",
+                args_json=json.dumps({"path":path,"content":"demo"})))])
+        events = list(execute.Execute(plan, timeout=10))
+        results = [event.node_state.leaf_result for event in events
+                   if event.HasField("node_state") and event.node_state.HasField("leaf_result")]
+        assert results and results[-1].success == allowed, results
+        assert (pathlib.Path(sys.argv[2]) / path).exists() == allowed
+        if not allowed:
+            assert "protect_demo_file" in results[-1].error, results[-1]
+print("PASS shipped Webots SRDL seed allowed and blocked real write_file calls")
+PYDEMO
 
 echo "PASS Keystone, Liaison, Pilot, Sentinel, and Executor are connected"

@@ -1,0 +1,7 @@
+# This example guards write_file only; other capabilities have no matching rule.
+rule protect_demo_file {
+    trigger capability "robonix/system/executor/builtin/write_file";
+    context string path = arguments.path;
+    require path != "protected.txt";
+    enforce deny report "The demo blocks writing protected.txt through write_file";
+}

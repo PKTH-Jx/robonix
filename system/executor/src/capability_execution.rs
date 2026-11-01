@@ -7,10 +7,11 @@ use crate::pb::executor::RtdlEvent;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::rtdl_events::{self, NodeEventContext};
-use crate::sentinel_runtime::{SENTINEL_PROVIDER_ID, SentinelIdentity, SentinelRuntime};
+use crate::sentinel_runtime::{self, SENTINEL_PROVIDER_ID, SentinelIdentity, SentinelRuntime};
 use crate::verification::{self, VerificationPolicy};
 use robonix_atlas::client::AtlasClient;
 use robonix_scribe::{info, warn};
+use robonix_sentinel::Effect;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -91,39 +92,51 @@ pub(crate) async fn execute_call(
     identity: SentinelIdentity,
     verification: Arc<VerificationPolicy>,
 ) -> NodeExecution {
-    let decision = sentinel
-        .check(
-            &atlas,
-            SENTINEL_PROVIDER_ID,
-            &call.contract_id,
-            &call.args_json,
-            &identity,
-        )
-        .await;
-    if !decision.allow {
+    let checked = tokio::select! {
+        biased;
+        _ = runtime.wait_cancelled(&node.plan_id) => None,
+        result = sentinel.check(SENTINEL_PROVIDER_ID, &call.contract_id, &call.args_json, &identity) => Some(result),
+    };
+    let cancelled = checked.is_none() || runtime.is_cancelled(&node.plan_id).await;
+    let (allow, feedback) = match checked {
+        Some(Ok(result)) => (
+            result.effect == Effect::Allow,
+            sentinel_runtime::feedback(&result),
+        ),
+        Some(Err(error)) => (
+            false,
+            serde_json::json!({"effect":"deny", "context_error":error.to_string()}),
+        ),
+        None => (false, serde_json::json!({"cancelled":true})),
+    };
+    if cancelled || !allow {
+        let state = if cancelled {
+            RtdlNodeStateEnum::Canceled
+        } else {
+            RtdlNodeStateEnum::Failed
+        } as u32;
+        let error = if cancelled {
+            "cancelled during Sentinel check".to_owned()
+        } else {
+            format!("Sentinel denied capability call: {feedback}")
+        };
         let result = CapabilityCallResult {
             call_id: call.call_id.clone(),
             provider_id: call.provider_id.clone(),
             contract_id: call.contract_id.clone(),
             success: false,
             output: String::new(),
-            error: format!(
-                "Sentinel denied capability call by rule '{}': {}",
-                decision.rule_id, decision.reason
-            ),
+            error,
         };
-        warn!(
-            "[sentinel] denied call_id={} contract='{}' rule='{}': {}",
-            call.call_id, call.contract_id, decision.rule_id, decision.reason
-        );
         runtime
-            .record_op_state(&node.plan_id, &node.op_id, RtdlNodeStateEnum::Failed as u32)
+            .record_op_state(&node.plan_id, &node.op_id, state)
             .await;
         let _ = tx
-            .send(Ok(rtdl_events::node_state_from_result(
+            .send(Ok(rtdl_events::node_state(
                 &node,
-                result,
-                RtdlNodeStateEnum::Failed as u32,
+                state,
+                feedback.to_string(),
+                Some(result),
             )))
             .await;
         return NodeExecution::finished(true);
@@ -153,10 +166,31 @@ pub(crate) async fn execute_call(
         )
         .await;
 
+    if feedback["reports"]
+        .as_array()
+        .is_some_and(|reports| !reports.is_empty())
+    {
+        let _ = tx
+            .send(Ok(rtdl_events::node_state(
+                &node,
+                RtdlNodeStateEnum::Running as u32,
+                feedback.to_string(),
+                None,
+            )))
+            .await;
+    }
+
     let async_group = if call.provider_id == provider_id {
         Ok(None)
     } else {
         async_registry::resolve_async_group(&mut atlas, &call.provider_id, &call.contract_id).await
+    };
+
+    // Discovery and feedback delivery may yield after the Sentinel decision.
+    let async_group = if runtime.is_cancelled(&node.plan_id).await {
+        Err("cancelled before capability dispatch".to_owned())
+    } else {
+        async_group
     };
 
     let (mut result, mut state) = match async_group {
@@ -341,12 +375,8 @@ mod tests {
         listener.local_addr().expect("reserved address")
     }
 
-    fn sentinel_runtime() -> SentinelRuntime {
-        SentinelRuntime::load(std::env::temp_dir().join(format!(
-            "executor-capability-sentinel-{}.json",
-            uuid::Uuid::new_v4()
-        )))
-        .expect("empty Sentinel policy")
+    fn sentinel_runtime(atlas: &AtlasClient) -> SentinelRuntime {
+        SentinelRuntime::new("", atlas.clone()).expect("empty SRDL policy")
     }
 
     /// Preserve verifier outcomes and fail closed if its background task cannot finish.
@@ -393,10 +423,10 @@ mod tests {
                 description: "verify synchronously".into(),
             },
             tx,
-            atlas,
+            atlas.clone(),
             "executor".into(),
             runtime,
-            sentinel_runtime(),
+            sentinel_runtime(&atlas),
             SentinelIdentity::default(),
             Arc::new(VerificationPolicy::new(
                 false,

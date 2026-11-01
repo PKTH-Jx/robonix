@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import unittest
@@ -55,18 +54,17 @@ class WebotsDeployConfigTest(unittest.TestCase):
         )
         for document in (self.document, focused):
             executor = document["system"]["executor"]
-            self.assertEqual(executor["sentinel_listen"], "0.0.0.0:50062")
+            self.assertEqual(executor["sentinel_listen"], "127.0.0.1:50062")
             self.assertEqual(
                 executor["sentinel_rules"],
-                "${HOME}/.robonix/data/sentinel-rules.json",
+                "${HOME}/.robonix/data/sentinel-rules.srdl",
             )
             self.assertEqual(
-                executor["sentinel_rules_seed"], "sentinel-rules.v1.json"
+                executor["sentinel_rules_seed"], "sentinel-rules.v1.srdl"
             )
-        seed = ROOT / "sentinel-rules.v1.json"
-        rules = json.loads(seed.read_text())
-        self.assertTrue(rules)
-        self.assertEqual(len({rule["id"] for rule in rules}), len(rules))
+        seed = ROOT / "sentinel-rules.v1.srdl"
+        self.assertTrue(seed.is_file())
+        self.assertTrue(seed.read_text().strip())
 
     def test_documented_config_specs_exist(self):
         for relative in (

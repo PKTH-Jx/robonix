@@ -287,6 +287,25 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     assert!(result.reports[0].message.is_none());
     assert!(fixture.channels_empty().await);
 
+    let demo = SrdlInterpreter::new(
+        include_str!("../../../../../examples/webots/sentinel-rules.v1.srdl"),
+        fixture.adapter.atlas.clone(),
+    )
+    .unwrap();
+    for (path, effect) in [
+        ("protected.txt", Effect::Deny),
+        ("notes.txt", Effect::Allow),
+    ] {
+        let result = demo
+            .check(
+                "robonix/system/executor/builtin/write_file",
+                "consumer",
+                &serde_json::json!({"arguments":{"path":path}}),
+            )
+            .await;
+        assert_eq!(result.effect, effect);
+    }
+
     assert!(matches!(
         SrdlInterpreter::new("invalid", fixture.adapter.atlas.clone()),
         Err(LoadError::Parse(_))

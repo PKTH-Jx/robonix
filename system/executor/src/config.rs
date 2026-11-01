@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use robonix_sentinel::{Rule, Sentinel};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::Write;
@@ -28,7 +27,7 @@ pub struct ExecutorConfig {
     pub sentinel_listen: String,
     /// Executor's registered provider ID, also used as its consumer identity.
     pub id: String,
-    /// Active robot-local Sentinel policy persisted between restarts.
+    /// SRDL source loaded and checked once at startup.
     pub sentinel_rules: PathBuf,
     /// Optional versioned policy copied into place only when no active file exists.
     pub sentinel_rules_seed: Option<PathBuf>,
@@ -214,7 +213,7 @@ impl ExecutorConfig {
             .sentinel_rules
             .or(manifest_cfg.sentinel_rules)
             .or(file_cfg.sentinel_rules)
-            .unwrap_or_else(|| data_dir.join("sentinel-rules.json"));
+            .unwrap_or_else(|| data_dir.join("sentinel-rules.srdl"));
         let sentinel_rules_seed = args
             .sentinel_rules_seed
             .or(manifest_cfg.sentinel_rules_seed)
@@ -255,8 +254,7 @@ fn default_sentinel_listen(listen: &str) -> Result<String> {
     Ok(format!("127.0.0.1:{port}"))
 }
 
-/// Initialize a robot-local policy from a checked-in seed without replacing
-/// a policy already managed through Sentinel's admin API.
+/// Copy an SRDL seed only when no local rule file exists.
 pub(crate) fn bootstrap_sentinel_rules(path: &Path, seed: Option<&Path>) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -266,10 +264,6 @@ pub(crate) fn bootstrap_sentinel_rules(path: &Path, seed: Option<&Path>) -> Resu
     };
     let raw = std::fs::read_to_string(seed)
         .with_context(|| format!("read Sentinel rules seed '{}'", seed.display()))?;
-    let rules = serde_json::from_str::<Vec<Rule>>(&raw)
-        .with_context(|| format!("parse Sentinel rules seed '{}'", seed.display()))?;
-    Sentinel::new(rules)
-        .with_context(|| format!("validate Sentinel rules seed '{}'", seed.display()))?;
 
     if let Some(parent) = path
         .parent()
@@ -391,7 +385,7 @@ mod tests {
         assert_eq!(cfg.sentinel_listen, "127.0.0.1:50062");
         assert_eq!(
             cfg.sentinel_rules,
-            PathBuf::from("rbnx-boot/data/sentinel-rules.json")
+            PathBuf::from("rbnx-boot/data/sentinel-rules.srdl")
         );
     }
 
@@ -408,14 +402,14 @@ mod tests {
         let cfg = ExecutorConfig::resolve(args(Some(
             r#"{
                 "sentinel_listen": "127.0.0.1:51062",
-                "sentinel_rules": "/var/lib/robonix/sentinel-rules.json"
+                "sentinel_rules": "/var/lib/robonix/sentinel-rules.srdl"
             }"#,
         )))
         .unwrap();
         assert_eq!(cfg.sentinel_listen, "127.0.0.1:51062");
         assert_eq!(
             cfg.sentinel_rules,
-            PathBuf::from("/var/lib/robonix/sentinel-rules.json")
+            PathBuf::from("/var/lib/robonix/sentinel-rules.srdl")
         );
     }
 
@@ -445,11 +439,10 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&temp).expect("test directory");
-        let seed = temp.join("sentinel-rules.v1.json");
-        let target = temp.join("data/sentinel-rules.json");
-        let seed_json =
-            r#"[{"id":"demo","effect":"deny","conditions":{"contract":"robonix/demo/*"}}]"#;
-        std::fs::write(&seed, seed_json).expect("versioned seed");
+        let seed = temp.join("sentinel-rules.v1.srdl");
+        let target = temp.join("data/sentinel-rules.srdl");
+        let seed_source = "rule demo { trigger always; require false; enforce deny; }";
+        std::fs::write(&seed, seed_source).expect("versioned seed");
         let config_json = serde_json::json!({
             "sentinel_rules": target,
             "sentinel_rules_seed": seed,
@@ -469,10 +462,10 @@ mod tests {
         assert_eq!(config.sentinel_rules, target);
         assert_eq!(
             std::fs::read_to_string(&target).expect("bootstrapped rules"),
-            seed_json
+            seed_source
         );
 
-        std::fs::write(&target, "[]\n").expect("admin-managed replacement");
+        std::fs::write(&target, "# local policy\n").expect("local replacement");
         let config =
             ExecutorConfig::resolve(args(Some(&config_json))).expect("existing rules config");
         bootstrap_sentinel_rules(
@@ -482,51 +475,22 @@ mod tests {
         .expect("existing rules remain untouched");
         assert_eq!(
             std::fs::read_to_string(&target).expect("preserved rules"),
-            "[]\n"
+            "# local policy\n"
         );
         std::fs::remove_dir_all(temp).expect("remove test directory");
     }
 
     #[test]
-    fn invalid_seed_does_not_create_active_rules() {
-        let temp = std::env::temp_dir().join(format!(
-            "executor-invalid-sentinel-seed-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&temp).expect("test directory");
-        let seed = temp.join("sentinel-rules.v1.json");
-        let target = temp.join("data/sentinel-rules.json");
-        std::fs::write(&seed, r#"[{"id":"","effect":"deny"}]"#).expect("invalid seed");
-        let config_json = serde_json::json!({
-            "sentinel_rules": target,
-            "sentinel_rules_seed": seed,
-        })
-        .to_string();
-
-        let config = ExecutorConfig::resolve(args(Some(&config_json))).expect("seeded config");
-        let error = bootstrap_sentinel_rules(
-            &config.sentinel_rules,
-            config.sentinel_rules_seed.as_deref(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("validate Sentinel rules seed"));
-        assert!(!target.exists());
-        std::fs::remove_dir_all(temp).expect("remove test directory");
-    }
-
-    #[test]
-    fn checked_in_webots_seed_is_nonempty_and_valid() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/webots/sentinel-rules.v1.json");
-        let raw = std::fs::read_to_string(&path).expect("Webots Sentinel seed");
-        let rules = serde_json::from_str::<Vec<Rule>>(&raw).expect("parse Webots Sentinel seed");
-
-        assert!(
-            !rules.is_empty(),
-            "Webots Sentinel seed must not allow-all by omission"
-        );
-        Sentinel::new(rules).expect("validate Webots Sentinel seed");
+    fn seed_copy_does_not_interpret_the_source() {
+        let temp =
+            std::env::temp_dir().join(format!("executor-srdl-seed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp).unwrap();
+        let seed = temp.join("source.srdl");
+        let target = temp.join("active.srdl");
+        std::fs::write(&seed, "unchecked source").unwrap();
+        bootstrap_sentinel_rules(&target, Some(&seed)).unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchecked source");
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

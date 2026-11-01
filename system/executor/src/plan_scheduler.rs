@@ -450,12 +450,8 @@ mod scheduling_tests {
         listener.local_addr().expect("reserved address")
     }
 
-    fn sentinel_runtime() -> SentinelRuntime {
-        SentinelRuntime::load(std::env::temp_dir().join(format!(
-            "executor-scheduler-sentinel-{}.json",
-            uuid::Uuid::new_v4()
-        )))
-        .expect("empty Sentinel policy")
+    fn sentinel_runtime(atlas: &AtlasClient) -> SentinelRuntime {
+        SentinelRuntime::new("", atlas.clone()).expect("empty SRDL policy")
     }
 
     /// Both RPCs preserve sequence advancement and final failures in either verification mode.
@@ -477,9 +473,9 @@ mod scheduling_tests {
             .unwrap();
             let contract = "robonix/system/executor/builtin/get_all_plans";
             let svc = ExecutorServiceImpl::new(
-                atlas,
+                atlas.clone(),
                 "executor".into(),
-                sentinel_runtime(),
+                sentinel_runtime(&atlas),
                 false,
                 Arc::new(VerificationPolicy::new(
                     overlap,
@@ -652,9 +648,9 @@ mod scheduling_tests {
         .expect("connect test Atlas");
         let contract_id = "robonix/system/executor/builtin/get_all_plans";
         let service = ExecutorServiceImpl::new(
-            atlas,
+            atlas.clone(),
             "executor".into(),
-            sentinel_runtime(),
+            sentinel_runtime(&atlas),
             false,
             Arc::new(VerificationPolicy::new(
                 true,

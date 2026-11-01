@@ -1,14 +1,15 @@
 # Webots Sentinel demo
 
-The demo manifest seeds the local Sentinel rule file from
-`sentinel-rules.v1.json` on first boot. The seed allows administrators to call
-`robonix/skill/*` and denies those calls for other users. Rules changed later
-through Sentinel persist across restarts.
+The manifests copy `sentinel-rules.v1.srdl` to the robot-local rule file on
+first boot. This SRDL example rejects the exact `write_file` capability
+when its `path` argument equals `protected.txt`. Other paths and capabilities
+are allowed by default; this is a parameter-check example, not a general
+filesystem or role-based policy.
 
 ```bash
 rbnx boot -f examples/webots/robonix_manifest.sentinel-demo.yaml
 ```
 
-The management endpoint listens on `127.0.0.1:50062` and requires an
-administrator session. Calls outside `robonix/skill/*` are allowed unless
-another rule matches.
+Edit the configured local `.srdl` file and restart Executor to change rules.
+The loopback `list_rules` and `replace_rules` capabilities are reserved for
+future SRDL reading and dynamic loading. They currently return `Unimplemented`.

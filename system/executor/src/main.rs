@@ -60,14 +60,13 @@ async fn main() -> Result<()> {
 
     let cfg = ExecutorConfig::resolve(parsed)?;
     config::bootstrap_sentinel_rules(&cfg.sentinel_rules, cfg.sentinel_rules_seed.as_deref())?;
-    let sentinel = SentinelRuntime::load(cfg.sentinel_rules.clone())
-        .with_context(|| format!("load Sentinel rules '{}'", cfg.sentinel_rules.display()))?;
 
     info!("connecting to atlas at {}", cfg.atlas_endpoint);
     let mut atlas =
         AtlasClient::connect_with_retry(&cfg.atlas_endpoint, 10, Duration::from_secs(2))
             .await
             .context("connect to atlas")?;
+    let sentinel = SentinelRuntime::load(&cfg.sentinel_rules, atlas.clone())?;
 
     atlas
         .register_service(&cfg.id, EXECUTOR_NAMESPACE, "")
@@ -265,7 +264,7 @@ async fn main() -> Result<()> {
         "loaded {} executor verification rule(s)",
         verification.len()
     );
-    let sentinel_svc = SentinelServiceImpl::new(atlas.clone(), sentinel.clone());
+    let sentinel_svc = SentinelServiceImpl;
     let svc = ExecutorServiceImpl::new(
         atlas,
         cfg.id.clone(),

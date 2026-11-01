@@ -292,6 +292,19 @@ impl PlanRuntime {
             .is_some_and(|run| run.cancelled)
     }
 
+    /// Wait for cancellation without losing a notification between registration and checking.
+    pub async fn wait_cancelled(&self, plan_id: &str) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_cancelled(plan_id).await {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Add one async capability call to the plan's cancellation set, or cancel
     /// it immediately if the plan has already been marked cancelled.
     ///
@@ -643,9 +656,16 @@ mod tests {
         let runtime = PlanRuntime::default();
         runtime.register_plan("p").await.unwrap();
         assert!(!runtime.is_cancelled("p").await);
-
+        let cancelled = runtime.wait_cancelled("p");
+        tokio::pin!(cancelled);
+        tokio::select! {
+            _ = &mut cancelled => panic!("uncancelled plan woke cancellation waiter"),
+            _ = tokio::task::yield_now() => {},
+        }
         runtime.begin_cancel("p").await.unwrap();
-
+        tokio::time::timeout(Duration::from_secs(1), &mut cancelled)
+            .await
+            .unwrap();
         assert!(runtime.is_cancelled("p").await);
     }
 

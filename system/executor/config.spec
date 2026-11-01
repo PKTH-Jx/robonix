@@ -42,17 +42,17 @@ properties:
 
   sentinel_rules:
     type: string
-    default: rbnx-boot/data/sentinel-rules.json
+    default: rbnx-boot/data/sentinel-rules.srdl
     description: >-
-      Robot-local Sentinel rule file. When absent, Executor uses
-      $ROBONIX_DATA_DIR/sentinel-rules.json, or
-      rbnx-boot/data/sentinel-rules.json when that environment variable is
+      Robot-local Sentinel SRDL source file. When absent, Executor uses
+      $ROBONIX_DATA_DIR/sentinel-rules.srdl, or
+      rbnx-boot/data/sentinel-rules.srdl when that environment variable is
       unset. ROBONIX_SENTINEL_RULES overrides this value.
 
   sentinel_rules_seed:
     type: string
     description: >-
-      Optional initial Sentinel rule file. Executor validates and copies it to
+      Optional initial Sentinel rule file. Executor copies it to
       sentinel_rules only when the active rule file does not exist.
       ROBONIX_SENTINEL_RULES_SEED overrides this value.
 

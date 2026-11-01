@@ -4,28 +4,16 @@ Sentinel provides the transport-independent rule model and policy evaluation
 for capability calls. Executor evaluates the active rules immediately before
 dispatching each RTDL `do` node.
 
-Rules can match a contract wildcard, exact Keystone users or roles, local-time
-windows, typed call arguments, and typed robot context. The highest-priority
-matching rule wins. Calls are allowed when no rule applies, while a candidate
-rule with unavailable or wrongly typed trusted data fails closed.
+SRDL rules match exact capability IDs or `always`, bind trusted call context
+and capability inputs, and evaluate requirements before enforcement. Any
+deny or check failure rejects the call; no matching rules allows it.
 
-See [the Webots demo](../../examples/webots/SENTINEL_DEMO.md) for policy setup.
-
-Executor serves the `list_rules` and `replace_rules` capability contracts from
-the Sentinel management endpoint. Replacements are validated and persisted
-before they become active.
+Executor loads SRDL once at startup. The `list_rules` and `replace_rules`
+capabilities are retained for SRDL reading and dynamic loading; their
+handlers are not yet implemented.
 
 Run the policy tests from the repository root:
 
 ```bash
 cargo test -p robonix-sentinel
 ```
-
-For the local Keystone-to-Executor test, including Liaison, Pilot, and `rbnx`,
-build the binaries and run:
-
-```bash
-scripts/test_sentinel_keystone.sh
-```
-
-The script needs Python with `grpcio` and `grpcio-tools`.

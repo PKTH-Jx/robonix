@@ -453,8 +453,8 @@ listen: 127.0.0.1:50095
             "executor".to_string(),
             serde_yaml::from_str(
                 r#"
-sentinel_rules: data/sentinel-rules.json
-sentinel_rules_seed: sentinel-rules.v1.json
+sentinel_rules: data/sentinel-rules.srdl
+sentinel_rules_seed: sentinel-rules.v1.srdl
 "#,
             )
             .expect("executor config"),
@@ -474,7 +474,7 @@ sentinel_rules_seed: sentinel-rules.v1.json
             forwarded["sentinel_rules"].as_str(),
             Some(
                 manifest_dir
-                    .join("data/sentinel-rules.json")
+                    .join("data/sentinel-rules.srdl")
                     .to_string_lossy()
                     .as_ref()
             )
@@ -483,7 +483,7 @@ sentinel_rules_seed: sentinel-rules.v1.json
             forwarded["sentinel_rules_seed"].as_str(),
             Some(
                 manifest_dir
-                    .join("sentinel-rules.v1.json")
+                    .join("sentinel-rules.v1.srdl")
                     .to_string_lossy()
                     .as_ref()
             )
