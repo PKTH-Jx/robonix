@@ -49,7 +49,7 @@ async fn unbounded_inputs_keep_receipt_checks_without_expiry_deadlines() {
         "require a = b;",
     );
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::pending()).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::pending()).await,
         Err(Error::FirstInputTimeout { .. })
     ));
     let first = batch(&rule, 0, vec![InputValue::Number(1.0)], Instant::now());
@@ -64,14 +64,14 @@ async fn unbounded_inputs_keep_receipt_checks_without_expiry_deadlines() {
         ))
     }));
     assert!(
-        evaluate_inputs(&Value::Null, &rule, inputs)
+        evaluate_inputs(0, &Value::Null, &rule, inputs)
             .await
             .unwrap()
             .passed()
     );
     let first = batch(&rule, 0, vec![InputValue::Number(1.0)], Instant::now());
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::iter([Ok(first)])).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::iter([Ok(first)])).await,
         Err(Error::IncompleteInputs { .. })
     ));
 }
@@ -85,7 +85,7 @@ async fn evaluates_context_alone_and_with_delayed_inputs_without_expiring_contex
         context number limit = arguments.limit;"#;
     let invalid_expression = rule(declarations, "require limit / 0 > 0;");
     assert!(matches!(
-        evaluate_inputs(&context, &invalid_expression, stream::pending()).await,
+        evaluate_inputs(0, &context, &invalid_expression, stream::pending()).await,
         Err(Error::Expression {
             source: expression::Error::DivisionByZero,
             ..
@@ -95,7 +95,7 @@ async fn evaluates_context_alone_and_with_delayed_inputs_without_expiring_contex
         declarations,
         "require user = \"alice\" && ready && limit + limit = 4; require false;",
     );
-    let result = evaluate_inputs(&context, &context_only, stream::empty())
+    let result = evaluate_inputs(0, &context, &context_only, stream::empty())
         .await
         .unwrap();
     assert_eq!(result.requirements, [true, false]);
@@ -110,7 +110,7 @@ async fn evaluates_context_alone_and_with_delayed_inputs_without_expiring_contex
     );
     // Context bindings do not satisfy the first input deadline.
     assert!(matches!(
-        evaluate_inputs(&context, &slow, stream::pending()).await,
+        evaluate_inputs(0, &context, &slow, stream::pending()).await,
         Err(Error::FirstInputTimeout { .. })
     ));
     let first = batch(&slow, 0, vec![InputValue::Number(0.0)], Instant::now());
@@ -124,7 +124,7 @@ async fn evaluates_context_alone_and_with_delayed_inputs_without_expiring_contex
         ))
     }));
     assert!(
-        evaluate_inputs(&context, &slow, inputs)
+        evaluate_inputs(0, &context, &slow, inputs)
             .await
             .unwrap()
             .passed()
@@ -155,7 +155,7 @@ async fn validates_context_paths_and_types_before_acquiring_inputs() {
             },
         ),
     ] {
-        match evaluate_inputs(&context, &rule, stream::pending())
+        match evaluate_inputs(0, &context, &rule, stream::pending())
             .await
             .unwrap_err()
         {
@@ -184,13 +184,15 @@ async fn evaluates_out_of_order_inputs_and_deduplicates_dependencies() {
         Ok(batch(&rule, 1, vec![InputValue::Number(4.0)], now)),
         Ok(batch(&rule, 0, vec![InputValue::Number(2.0)], now)),
     ]);
-    let result = evaluate_inputs(&Value::Null, &rule, inputs).await.unwrap();
+    let result = evaluate_inputs(0, &Value::Null, &rule, inputs)
+        .await
+        .unwrap();
     assert_eq!(result.requirements, [true, true, false]);
     assert!(!result.passed());
     assert_eq!(result.failed_requirements(), [3]);
     let constant = self::rule("", "require true;");
     assert!(
-        evaluate_inputs(&Value::Null, &constant, stream::empty())
+        evaluate_inputs(0, &Value::Null, &constant, stream::empty())
             .await
             .unwrap()
             .passed()
@@ -208,7 +210,7 @@ async fn evaluates_ready_requirements_without_waiting_for_unrelated_inputs() {
     ))])
     .chain(stream::pending());
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, inputs).await,
+        evaluate_inputs(0, &Value::Null, &rule, inputs).await,
         Err(Error::Expression {
             requirement: 2,
             source: expression::Error::DivisionByZero,
@@ -221,11 +223,11 @@ async fn evaluates_ready_requirements_without_waiting_for_unrelated_inputs() {
 async fn distinguishes_timeouts_incomplete_streams_and_acquisition_errors() {
     let rule = rule(TWO_INPUTS, "require false;");
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::pending()).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::pending()).await,
         Err(Error::FirstInputTimeout { .. })
     ));
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::empty()).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::empty()).await,
         Err(Error::IncompleteInputs { .. })
     ));
     let error = InputError {
@@ -235,7 +237,7 @@ async fn distinguishes_timeouts_incomplete_streams_and_acquisition_errors() {
         kind: InputErrorKind::NoActiveProvider,
     };
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::iter([Err(error)])).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::iter([Err(error)])).await,
         Err(Error::Input(_))
     ));
 }
@@ -257,7 +259,7 @@ async fn keeps_completed_requirements_fresh_and_accepts_the_maxage_boundary() {
                 Instant::now(),
             ))
         }));
-        let result = evaluate_inputs(&Value::Null, &rule, inputs).await;
+        let result = evaluate_inputs(0, &Value::Null, &rule, inputs).await;
         if delay == Duration::from_secs(1) {
             assert!(result.unwrap().passed());
         } else {
@@ -283,7 +285,7 @@ async fn checks_unused_bounded_fields_alongside_unbounded_inputs() {
     );
     let inputs = stream::iter([Ok(first)]).chain(stream::pending());
     assert!(
-        matches!(evaluate_inputs(&Value::Null, &rule, inputs).await, Err(Error::Expired { input, .. }) if input == "unused")
+        matches!(evaluate_inputs(0, &Value::Null, &rule, inputs).await, Err(Error::Expired { input, .. }) if input == "unused")
     );
 }
 
@@ -296,7 +298,7 @@ async fn rejects_stale_future_and_invalid_input_metadata() {
         Ok(batch(&rule, 0, vec![InputValue::Number(1.0)], now))
     });
     assert!(
-        matches!(evaluate_inputs(&Value::Null, &rule, inputs).await, Err(Error::Expired { input, .. }) if input == "a")
+        matches!(evaluate_inputs(0, &Value::Null, &rule, inputs).await, Err(Error::Expired { input, .. }) if input == "a")
     );
     let future = batch(
         &rule,
@@ -305,13 +307,13 @@ async fn rejects_stale_future_and_invalid_input_metadata() {
         Instant::now() + Duration::from_secs(1),
     );
     assert!(matches!(
-        evaluate_inputs(&Value::Null, &rule, stream::iter([Ok(future)])).await,
+        evaluate_inputs(0, &Value::Null, &rule, stream::iter([Ok(future)])).await,
         Err(Error::FutureTimestamp { .. })
     ));
     for maxage in [0.0, f64::NAN, f64::INFINITY, 1e308] {
         rule.inputs[0].fields[0].maxage = Some(maxage);
         assert!(matches!(
-            evaluate_inputs(&Value::Null, &rule, stream::pending()).await,
+            evaluate_inputs(0, &Value::Null, &rule, stream::pending()).await,
             Err(Error::InvalidMaxage { .. })
         ));
     }
