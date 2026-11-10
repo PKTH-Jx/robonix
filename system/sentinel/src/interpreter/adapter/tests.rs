@@ -17,7 +17,7 @@ use crate::{
         enforcer::Effect,
         evaluator::{Error, RuleEvaluator, RuleResult, expression},
     },
-    srdl::parse,
+    srdl::{ast::TriggerTiming, parse},
 };
 
 fn input_rule(capability: &str) -> Rule {
@@ -227,7 +227,7 @@ impl rmcp::ServerHandler for McpHandler {
 }
 
 #[tokio::test]
-async fn returns_a_prepared_dataset_without_evaluating_predicates_or_fetching_postconditions() {
+async fn returns_a_prepared_dataset_without_evaluating_predicates_or_fetching_unused_inputs() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
     let program = parse(
@@ -236,7 +236,6 @@ async fn returns_a_prepared_dataset_without_evaluating_predicates_or_fetching_po
         input from "sensor/value" select number x = reading maxage 1;
         input from "sensor/slow" select number later;
         require x / 0 > limit;
-        ensure later > 0;
         enforce deny;
     }"#,
     )
@@ -249,7 +248,6 @@ async fn returns_a_prepared_dataset_without_evaluating_predicates_or_fetching_po
             "sentinel-test",
             Arc::new(serde_json::json!({"arguments":{"limit":10}})),
             0,
-            false,
             overall,
         )
         .pop()
@@ -278,9 +276,9 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
     let source = r#"
-        trigger [violation, passing] @ "robot/move";
-        trigger passing @ "robot/move";
-        trigger ignored @ "robot/stop";
+        trigger [violation, passing] before "robot/move";
+        trigger passing before "robot/move";
+        trigger ignored before "robot/stop";
         rule passing {
             context string user = identity.user_id;
             input from "sensor/value" select number x = reading, boolean ready = ready;
@@ -300,9 +298,16 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     "#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
     let context = serde_json::json!({"identity":{"user_id":"alice"}});
-    let (result, _) = timeout(
+    let result = timeout(
         Duration::from_secs(5),
-        interpreter.begin("plan", "move", "robot/move", "consumer", &context),
+        interpreter.check(
+            "plan",
+            "move",
+            "robot/move",
+            "consumer",
+            &context,
+            TriggerTiming::Before,
+        ),
     )
     .await
     .unwrap();
@@ -329,15 +334,22 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     assert_eq!(result.reports[1].enforcement, Some(Ok(Effect::Deny)));
     assert_eq!(result.reports[1].message.as_deref(), Some("blocked"));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
-    let (unmatched, _) = interpreter
-        .begin("plan", "unmatched", "unmatched", "consumer", &Value::Null)
+    let unmatched = interpreter
+        .check(
+            "plan",
+            "unmatched",
+            "unmatched",
+            "consumer",
+            &Value::Null,
+            TriggerTiming::Before,
+        )
         .await;
     assert_eq!(unmatched.effect, Effect::Allow);
     assert!(unmatched.reports.is_empty());
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 
     let failed = SrdlInterpreter::new(
-        r#"trigger failure @ always;
+        r#"trigger failure before always;
         rule failure {
         input from "sensor/missing" select number x;
         require x > 0; enforce allow report "unused";
@@ -345,8 +357,15 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         fixture.adapter.atlas.clone(),
     )
     .unwrap();
-    let (result, _) = failed
-        .begin("plan", "failure", "any", "consumer", &Value::Null)
+    let result = failed
+        .check(
+            "plan",
+            "failure",
+            "any",
+            "consumer",
+            &Value::Null,
+            TriggerTiming::Before,
+        )
         .await;
     assert_eq!(result.effect, Effect::Deny);
     assert!(matches!(
@@ -369,13 +388,14 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         ("protected.txt", Effect::Deny),
         ("notes.txt", Effect::Allow),
     ] {
-        let (result, _) = demo
-            .begin(
+        let result = demo
+            .check(
                 "demo",
                 path,
                 "robonix/system/executor/builtin/write_file",
                 "consumer",
                 &serde_json::json!({"arguments":{"path":path}}),
+                TriggerTiming::Before,
             )
             .await;
         assert_eq!(result.effect, effect);
@@ -387,7 +407,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     ));
     assert!(matches!(
         SrdlInterpreter::new(
-            r#"trigger invalid @ "never/matches";
+            r#"trigger invalid before "never/matches";
         rule invalid { require unknown; enforce deny;
     }"#,
             fixture.adapter.atlas.clone()
@@ -548,7 +568,7 @@ async fn interpreter_checks_rules_concurrently_and_cancellation_releases_channel
     let source = (0..MAX_CONCURRENT_BINDINGS + 1)
         .map(|index| {
             format!(
-                r#"trigger r{index} @ always;
+                r#"trigger r{index} before always;
         rule r{index} {{
         input from "sensor/slow" select number x;
         require x > 0; enforce deny;
@@ -558,8 +578,14 @@ async fn interpreter_checks_rules_concurrently_and_cancellation_releases_channel
         .collect::<String>();
     let interpreter =
         crate::interpreter::SrdlInterpreter::new(&source, fixture.adapter.atlas.clone()).unwrap();
-    let mut check =
-        Box::pin(interpreter.begin("plan", "cancel", "any", "sentinel-test", &Value::Null));
+    let mut check = Box::pin(interpreter.check(
+        "plan",
+        "cancel",
+        "any",
+        "sentinel-test",
+        &Value::Null,
+        TriggerTiming::Before,
+    ));
     timeout(Duration::from_secs(5), async {
         tokio::select! {
             _ = async {
@@ -567,7 +593,7 @@ async fn interpreter_checks_rules_concurrently_and_cancellation_releases_channel
                     tokio::task::yield_now().await;
                 }
             } => {},
-            result = &mut check => panic!("slow checks completed unexpectedly: {:?}", result.0),
+            result = &mut check => panic!("slow checks completed unexpectedly: {:?}", result.effect),
         }
     })
     .await
@@ -589,93 +615,124 @@ async fn interpreter_checks_rules_concurrently_and_cancellation_releases_channel
 }
 
 #[tokio::test]
-async fn pool_retains_multiple_rules_and_reacquires_postcondition_inputs() {
+async fn pool_checks_events_independently_with_fresh_inputs() {
     use crate::interpreter::SrdlInterpreter;
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
     let source = r#"
-        trigger [contextual, measured] @ ["robot/pick", "robot/place"];
-        trigger measured @ "robot/pick";
+        trigger [contextual, measured] after ["robot/pick", "robot/place"];
+        trigger measured after "robot/pick";
+        trigger measured before "robot/pick";
         rule measured {
             input from "sensor/value" select number x = reading maxage 1;
-            require x = 42; ensure x = 42; enforce deny;
+            require x = 42; enforce deny;
         }
         rule contextual {
             context boolean ready = arguments.ready;
-            require true; ensure ready; enforce deny;
+            require ready; enforce deny report "not ready";
         }
     "#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
-    let yes = serde_json::json!({"arguments":{"ready":true}});
-    let no = serde_json::json!({"arguments":{"ready":false}});
-    let (before, first) = interpreter
-        .begin("p", "same", "robot/pick", "test", &yes)
+    let context = serde_json::json!({"arguments":{"ready":false}});
+    // After checks need no preceding admission or retained execution state.
+    let after = interpreter
+        .check(
+            "p",
+            "same",
+            "robot/pick",
+            "test",
+            &context,
+            TriggerTiming::After,
+        )
         .await;
-    assert_eq!(before.effect, Effect::Allow);
-    assert_eq!(before.reports.len(), 2);
-    let (duplicate, handle) = interpreter
-        .begin("p", "same", "robot/pick", "test", &no)
-        .await;
-    assert_eq!(duplicate.effect, Effect::Deny);
-    assert!(handle.is_none());
-    let (before, second) = interpreter
-        .begin("q", "same", "robot/pick", "test", &no)
-        .await;
-    assert_eq!(before.effect, Effect::Allow);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
-    let after = second.unwrap().ensure().await;
-    assert_eq!(after.effect, Effect::Deny);
-    assert!(after.reports.iter().all(|report| report.ensure));
-    assert_eq!(
-        after.reports[1]
-            .evaluation
-            .as_ref()
-            .unwrap()
-            .failed_requirements(),
-        [1]
+    assert_eq!(after.effect, Effect::Allow);
+    assert_eq!(after.reports.len(), 2);
+    assert_eq!(after.reports[1].message.as_deref(), Some("not ready"));
+    assert!(
+        after
+            .reports
+            .iter()
+            .all(|r| r.timing == TriggerTiming::After && r.enforcement.is_none())
     );
-    assert_eq!(first.unwrap().ensure().await.effect, Effect::Allow);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
-    let (_, reused) = interpreter
-        .begin("p", "same", "robot/pick", "test", &yes)
+    let (before, after) = tokio::join!(
+        interpreter.check(
+            "p",
+            "same",
+            "robot/pick",
+            "test",
+            &context,
+            TriggerTiming::Before
+        ),
+        interpreter.check(
+            "p",
+            "same",
+            "robot/pick",
+            "test",
+            &context,
+            TriggerTiming::After
+        ),
+    );
+    assert_eq!(before.effect, Effect::Allow);
+    assert_eq!(before.reports.len(), 1);
+    assert_eq!(after.reports.len(), 2);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+    let repeated = interpreter
+        .check(
+            "p",
+            "same",
+            "robot/pick",
+            "test",
+            &context,
+            TriggerTiming::Before,
+        )
         .await;
-    assert!(reused.is_some());
+    assert_eq!(repeated.effect, Effect::Allow);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
+    let unmatched = interpreter
+        .check(
+            "p",
+            "place",
+            "robot/place",
+            "test",
+            &context,
+            TriggerTiming::Before,
+        )
+        .await;
+    assert!(unmatched.reports.is_empty());
 }
 
 #[tokio::test]
-async fn pending_postconditions_wait_for_completion_and_cancel_with_their_owner() {
+async fn each_timing_cancels_acquisition_when_its_check_future_is_dropped() {
     use crate::interpreter::SrdlInterpreter;
     let mut fixture = AtlasFixture::new().await;
     let entered = fixture.serve_mcp().await;
-    let source = r#"trigger hold @ always;
+    let source = r#"trigger hold before always; trigger hold after always;
         rule hold {
-        input from "sensor/slow" select boolean ready;
-        require true; ensure ready; enforce deny;
-    }"#;
+            input from "sensor/slow" select boolean ready;
+            require ready; enforce deny;
+        }"#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
-    let (before, checks) = interpreter
-        .begin("p", "c", "robot/pick", "test", &Value::Null)
-        .await;
-    assert_eq!(before.effect, Effect::Allow);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    let checking = tokio::spawn(checks.unwrap().ensure());
-    timeout(Duration::from_secs(5), entered.notified())
+    for timing in [TriggerTiming::Before, TriggerTiming::After] {
+        let mut checking =
+            Box::pin(interpreter.check("p", "c", "robot/pick", "test", &Value::Null, timing));
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = entered.notified() => {},
+                _ = &mut checking => panic!("slow check completed unexpectedly"),
+            }
+        })
         .await
         .unwrap();
-    checking.abort();
-    assert!(checking.await.unwrap_err().is_cancelled());
-    timeout(Duration::from_secs(10), async {
-        while !fixture.channels_empty().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let (_, checks) = interpreter
-        .begin("p", "c", "robot/pick", "test", &Value::Null)
-        .await;
-    assert!(checks.is_some());
-    drop(checks);
+        drop(checking);
+        timeout(Duration::from_secs(15), async {
+            while !fixture.channels_empty().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 }
 
 async fn evaluate_inputs<'a>(
@@ -693,7 +750,7 @@ async fn evaluate_inputs<'a>(
         inputs,
     )
     .await?;
-    RuleEvaluator::evaluate(check_id, rule, false, &prepared)
+    RuleEvaluator::evaluate(check_id, rule, &prepared)
 }
 
 /// Simulate Adapter receipt notifications while retaining the real snapshot acquisition path.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! One owner for invocation-bound rule states, acquisitions, and FIFO evaluation.
+//! One owner for active rule checks, acquisitions, and FIFO evaluation.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -14,11 +14,11 @@ use futures::{
 };
 use serde_json::Value;
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time::Instant,
 };
 
-use super::{CallKey, Command, Error, RULE_TIMEOUT, RuleEvaluator, RuleResult};
+use super::{CallKey, Check, Error, RULE_TIMEOUT, RuleEvaluator, RuleResult};
 use crate::{
     interpreter::{
         adapter::{Deadline, InputAdapter, Prepared},
@@ -34,7 +34,6 @@ type RuleKey = (CallKey, usize);
 /// Processing state of one rule's preconditions or postconditions.
 #[derive(Clone, Copy)]
 enum Status {
-    Pending,
     Waiting,
     Evaluating,
     Enforcing,
@@ -42,10 +41,8 @@ enum Status {
 
 /// Processing state retained for a matching rule until its applicable checks finish.
 struct RuleEntry {
-    /// Preconditions are removed after their combined enforcement decision.
-    require: Option<Status>,
-    /// Postconditions remain pending until successful execution is reported.
-    ensure: Option<Status>,
+    /// Current stage of this independently triggered check.
+    status: Status,
     /// Cancels acquisition while preserving the Adapter's connection cleanup.
     acquisition: Option<AbortHandle>,
     /// Retained deadlines keep early results valid through combined enforcement.
@@ -54,20 +51,20 @@ struct RuleEntry {
     retries: usize,
 }
 
-/// Invocation metadata shared by every rule matched for one call.
+/// Metadata and combined results for one active lifecycle check.
 struct Invocation {
     /// Distinguishes late responses from a later reuse of the same call key.
     check_id: u64,
     /// Atlas identity used for acquiring rule inputs.
     consumer: Arc<str>,
-    /// Trusted arguments and identity, fixed across both condition groups.
+    /// Trusted arguments and identity for this check.
     context: Arc<Value>,
-    /// Source indices retained so completion never repeats trigger matching.
+    /// Source indices of rules selected for this check.
     rules: Vec<usize>,
     /// Completed results ordered by their rule's source index.
     results: BTreeMap<usize, Result<RuleResult, Error>>,
-    /// Delivers the current precondition or postcondition decision.
-    reply: Option<oneshot::Sender<EnforcementResult>>,
+    /// Delivers this check's combined decision and reports exactly once.
+    reply: oneshot::Sender<EnforcementResult>,
     /// Detects owner drop before a queued cancellation notification is processed.
     owner: watch::Receiver<()>,
     /// Retires the cancellation watcher together with the invocation.
@@ -82,8 +79,6 @@ struct ReadyCheck {
     key: RuleKey,
     /// Rejects events left over from an earlier invocation.
     check_id: u64,
-    /// Selects the entry's postconditions rather than its preconditions.
-    ensure: bool,
     /// A fixed observation set, or the failure that prevented acquisition.
     data: Result<Prepared, Error>,
 }
@@ -96,7 +91,7 @@ pub(super) struct Pool<'a> {
     adapter: &'a InputAdapter,
     /// Active rule entries keyed by plan, call, and source rule index.
     rules: HashMap<RuleKey, RuleEntry>,
-    /// Combined decisions and lifetime metadata for each invocation.
+    /// Combined results and cancellation metadata for active checks.
     calls: HashMap<CallKey, Invocation>,
     /// Acquisition completions, each carrying its original invocation generation.
     acquiring: FuturesUnordered<BoxFuture<'a, Option<ReadyCheck>>>,
@@ -121,12 +116,12 @@ impl<'a> Pool<'a> {
 
     /// Multiplex work without holding a lock across acquisition or completion waits.
     /// Cancellation has a separate stream so a full command queue cannot prevent cleanup.
-    pub(super) async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+    pub(super) async fn run(mut self, mut checks: mpsc::Receiver<Check>) {
         loop {
             tokio::select! {
-                // Process commands in arrival order
-                command = commands.recv() => match command {
-                    Some(command) => self.command(command),
+                // Process check requests in arrival order
+                check = checks.recv() => match check {
+                    Some(check) => self.check(check),
                     None => break,
                 },
                 // Process acquisition completions
@@ -134,8 +129,7 @@ impl<'a> Pool<'a> {
                     if let Some(result) = result
                         && self.current(&result.key.0, result.check_id)
                         && let Some(entry) = self.rules.get_mut(&result.key) {
-                                let status = if result.ensure { &mut entry.ensure } else { &mut entry.require };
-                                *status = Some(Status::Evaluating);
+                                entry.status = Status::Evaluating;
                                 entry.acquisition = None;
                                 self.ready.push_back(result);
                     }
@@ -162,47 +156,41 @@ impl<'a> Pool<'a> {
             .is_some_and(|call| call.check_id == check_id)
     }
 
-    /// Dispatch one command without holding a lock across any await points.
-    fn command(&mut self, command: Command) {
-        match command {
-            Command::Begin {
-                key,
-                check_id,
-                capability,
-                consumer,
-                context,
-                cancel,
-                reply,
-                permit,
-            } => {
-                self.begin(
-                    key, check_id, capability, consumer, context, cancel, reply, permit,
-                );
-            }
-            Command::Complete {
-                key,
-                check_id,
-                reply,
-            } => self.complete(key, check_id, reply),
+    /// Register either timing through the same matching and acquisition path.
+    fn check(&mut self, check: Check) {
+        let Check {
+            key,
+            check_id,
+            capability,
+            consumer,
+            context,
+            cancel,
+            reply,
+            permit,
+        } = check;
+        let rules = TriggerMatcher::match_indices(self.program, &capability, key.2);
+        super::super::logging::log(
+            robonix_scribe::Level::Info,
+            format!(
+                "[sentinel] check_id={check_id} plan_id={:?} call_id={:?} timing={:?} capability={capability:?} consumer={consumer:?} triggered_rules={:?}",
+                key.0,
+                key.1,
+                key.2,
+                rules
+                    .iter()
+                    .map(|index| self.program.rules[*index].name.0.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if rules.is_empty() {
+            let decision = EnforcementResult {
+                effect: Effect::Allow,
+                reports: Vec::new(),
+            };
+            super::super::SrdlInterpreter::log_decision(check_id, &decision);
+            let _ = reply.send(decision);
+            return;
         }
-    }
-
-    /// Match once and retain admission capacity until cancellation work is retired.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "The handler takes ownership of every Command::Begin field."
-    )]
-    fn begin(
-        &mut self,
-        key: CallKey,
-        check_id: u64,
-        capability: String,
-        consumer: Arc<str>,
-        context: Arc<Value>,
-        cancel: watch::Receiver<()>,
-        reply: oneshot::Sender<EnforcementResult>,
-        permit: OwnedSemaphorePermit,
-    ) {
         if self
             .calls
             .get(&key)
@@ -212,34 +200,10 @@ impl<'a> Pool<'a> {
         }
         if self.calls.contains_key(&key) {
             let _ = reply.send(EnforcementResult::failure(
-                "Capability call already has active Sentinel checks",
-                false,
+                "Capability event already has active Sentinel checks",
+                key.2,
             ));
             return;
-        }
-        let rules = TriggerMatcher::match_indices(self.program, &capability);
-        super::super::logging::log(
-            robonix_scribe::Level::Info,
-            format!(
-                "[sentinel] check_id={check_id} capability={capability:?} consumer={consumer:?} triggered_rules={:?}",
-                rules
-                    .iter()
-                    .map(|index| self.program.rules[*index].name.0.as_str())
-                    .collect::<Vec<_>>()
-            ),
-        );
-        for index in &rules {
-            self.rules.insert(
-                (key.clone(), *index),
-                RuleEntry {
-                    require: Some(Status::Waiting),
-                    ensure: (!self.program.rules[*index].ensures.is_empty())
-                        .then_some(Status::Pending),
-                    acquisition: None,
-                    freshness: None,
-                    retries: 0,
-                },
-            );
         }
         let (cancellation, registration) = AbortHandle::new_pair();
         self.calls.insert(
@@ -250,7 +214,7 @@ impl<'a> Pool<'a> {
                 context,
                 rules: rules.clone(),
                 results: BTreeMap::new(),
-                reply: Some(reply),
+                reply,
                 owner: cancel.clone(),
                 cancellation,
                 deadline: Instant::now() + RULE_TIMEOUT,
@@ -274,36 +238,11 @@ impl<'a> Pool<'a> {
             }
             .boxed(),
         );
-        self.acquire(&key, rules, false);
-        if self.calls[&key].rules.is_empty() {
-            self.enforce(&key, false);
-        }
-    }
-
-    /// Activate retained postconditions with a new budget after successful capability execution.
-    fn complete(&mut self, key: CallKey, check_id: u64, reply: oneshot::Sender<EnforcementResult>) {
-        if !self.current(&key, check_id) {
-            let _ = reply.send(EnforcementResult::failure(
-                "No retained Sentinel checks for this invocation",
-                true,
-            ));
-            return;
-        }
-        let indices = self.calls[&key].rules.clone();
-        let call = self.calls.get_mut(&key).unwrap();
-        call.reply = Some(reply);
-        call.deadline = Instant::now() + RULE_TIMEOUT;
-        for index in &indices {
-            self.rules.get_mut(&(key.clone(), *index)).unwrap().retries = 0;
-        }
-        self.acquire(&key, indices.clone(), true);
-        if indices.is_empty() {
-            self.enforce(&key, true);
-        }
+        self.acquire(&key, rules);
     }
 
     /// Register peers together before fetching, then retain one atomic snapshot per rule.
-    fn acquire(&mut self, key: &CallKey, indices: Vec<usize>, ensure: bool) {
+    fn acquire(&mut self, key: &CallKey, indices: Vec<usize>) {
         let call = &self.calls[key];
         let check_id = call.check_id;
         let deadline = call.deadline;
@@ -312,19 +251,18 @@ impl<'a> Pool<'a> {
             &call.consumer,
             call.context.clone(),
             check_id,
-            ensure,
             deadline,
         );
         for (index, dataset) in indices.into_iter().zip(datasets) {
             let key = (key.clone(), index);
             let (abort, registration) = AbortHandle::new_pair();
-            let entry = self.rules.get_mut(&key).unwrap();
-            let status = if ensure {
-                &mut entry.ensure
-            } else {
-                &mut entry.require
-            };
-            *status = Some(Status::Waiting);
+            let entry = self.rules.entry(key.clone()).or_insert(RuleEntry {
+                status: Status::Waiting,
+                acquisition: None,
+                freshness: None,
+                retries: 0,
+            });
+            entry.status = Status::Waiting;
             entry.freshness = None;
             entry.acquisition = Some(abort);
             self.acquiring.push(
@@ -335,7 +273,6 @@ impl<'a> Pool<'a> {
                             ReadyCheck {
                                 key,
                                 check_id,
-                                ensure,
                                 data,
                             }
                         },
@@ -386,8 +323,7 @@ impl<'a> Pool<'a> {
                     .deadline
                     .check(rule, Instant::now())
                     .and_then(|()| {
-                        let result =
-                            RuleEvaluator::evaluate(ready.check_id, rule, ready.ensure, &prepared)?;
+                        let result = RuleEvaluator::evaluate(ready.check_id, rule, &prepared)?;
                         prepared.deadline.check(rule, Instant::now())?;
                         Ok(result)
                     });
@@ -402,24 +338,20 @@ impl<'a> Pool<'a> {
             });
         }
         if self.retry(&ready.key, &result) {
-            self.acquire(&ready.key.0, vec![ready.key.1], ready.ensure);
+            self.acquire(&ready.key.0, vec![ready.key.1]);
             return;
         }
         let entry = self.rules.get_mut(&ready.key).unwrap();
-        if ready.ensure {
-            entry.ensure = Some(Status::Enforcing);
-        } else {
-            entry.require = Some(Status::Enforcing);
-        }
+        entry.status = Status::Enforcing;
         let call = self.calls.get_mut(&ready.key.0).unwrap();
         call.results.insert(ready.key.1, result);
         if call.results.len() == call.rules.len() {
-            self.enforce(&ready.key.0, ready.ensure);
+            self.enforce(&ready.key.0);
         }
     }
 
     /// Combine every matched rule, rechecking snapshots that finished before slower rules.
-    fn enforce(&mut self, key: &CallKey, ensure: bool) {
+    fn enforce(&mut self, key: &CallKey) {
         let results = std::mem::take(&mut self.calls.get_mut(key).unwrap().results);
         let mut completed = BTreeMap::new();
         let mut retries = Vec::new();
@@ -441,60 +373,40 @@ impl<'a> Pool<'a> {
         let call = self.calls.get_mut(key).unwrap();
         if !retries.is_empty() {
             call.results = completed;
-            self.acquire(key, retries, ensure);
+            self.acquire(key, retries);
             return;
         }
-        let mut decision = Enforcer::enforce(
+        let decision = Enforcer::enforce(
             completed
                 .into_iter()
                 .map(|(index, result)| (&self.program.rules[index], result)),
+            key.2,
         );
-        for report in &mut decision.reports {
-            report.ensure = ensure;
-        }
         super::super::SrdlInterpreter::log_decision(call.check_id, &decision);
-        let denied = decision.effect == Effect::Deny;
-        if let Some(reply) = call.reply.take() {
-            let _ = reply.send(decision);
-        }
-        // Keep only rules with postconditions after precondition enforcement.
-        if ensure || denied {
-            self.remove(key);
-        } else {
-            call.rules.retain(|index| {
-                let rule_key = (key.clone(), *index);
-                if let Some(entry) = self.rules.get_mut(&rule_key) {
-                    entry.require = None;
-                    if entry.ensure.is_none() {
-                        self.rules.remove(&rule_key);
-                        return false;
-                    }
-                }
-                true
-            });
-        }
+        let _ = self.remove(key).reply.send(decision);
     }
 
     /// Abort acquisition and retire the watcher even if its caller never polls the reply.
-    fn remove(&mut self, key: &CallKey) {
-        if let Some(call) = self.calls.remove(key) {
-            call.cancellation.abort();
-            for index in call.rules {
-                if let Some(entry) = self.rules.remove(&(key.clone(), index))
-                    && let Some(acquisition) = entry.acquisition
-                {
-                    acquisition.abort();
-                }
+    fn remove(&mut self, key: &CallKey) -> Invocation {
+        let call = self.calls.remove(key).unwrap();
+        call.cancellation.abort();
+        for index in &call.rules {
+            if let Some(entry) = self.rules.remove(&(key.clone(), *index))
+                && let Some(acquisition) = entry.acquisition
+            {
+                acquisition.abort();
             }
-            self.ready
-                .retain(|ready| &ready.key.0 != key || ready.check_id != call.check_id);
         }
+        self.ready
+            .retain(|ready| &ready.key.0 != key || ready.check_id != call.check_id);
+        call
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srdl::ast::TriggerTiming;
     use robonix_atlas::{
         client::AtlasClient,
         service::{AtlasRegistry, serve_atlas},
@@ -541,17 +453,17 @@ mod tests {
         let (adapter, server) = adapter().await;
         tokio::time::pause();
         let program = crate::srdl::parse(
-            r#"trigger a @ always;
+            r#"trigger a before always;
             rule a {
             input from "sensor/a" select number x maxage 1;
             require x / 0 > 0; enforce deny; }"#,
         )
         .unwrap();
         let mut pool = Pool::new(&program, &adapter);
-        let key = ("plan".into(), "call".into());
+        let key = ("plan".into(), "call".into(), TriggerTiming::Before);
         let (_owner, cancel) = watch::channel(());
         let (reply, receive) = oneshot::channel();
-        pool.command(Command::Begin {
+        pool.check(Check {
             key: key.clone(),
             check_id: 1,
             capability: "robot/pick".into(),
@@ -568,7 +480,6 @@ mod tests {
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 0),
             check_id: 1,
-            ensure: false,
             data: Ok(stale),
         });
         assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
@@ -577,7 +488,6 @@ mod tests {
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 0),
             check_id: 1,
-            ensure: false,
             data: Ok(snapshot(&program.rules[0], overall)),
         });
         let result = receive.await.unwrap();
@@ -599,19 +509,20 @@ mod tests {
         tokio::time::pause();
         let program = crate::srdl::parse(
             r#"
-            trigger [a, b] @ always;
+            trigger [a, b] before always;
+            trigger [a, b] after always;
             rule a { input from "sensor/a" select number x maxage 1;
-                require x > 0; ensure x > 0; enforce deny; }
+                require x > 0; enforce deny; }
             rule b { input from "sensor/b" select number x;
-                require x > 0; ensure x > 0; enforce deny; }
+                require x > 0; enforce deny; }
         "#,
         )
         .unwrap();
         let mut pool = Pool::new(&program, &adapter);
-        let key = ("plan".into(), "call".into());
+        let key = ("plan".into(), "call".into(), TriggerTiming::Before);
         let (_owner, cancel) = watch::channel(());
         let (reply, receive) = oneshot::channel();
-        pool.command(Command::Begin {
+        pool.check(Check {
             key: key.clone(),
             check_id: 1,
             capability: "robot/pick".into(),
@@ -627,14 +538,12 @@ mod tests {
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 0),
             check_id: 1,
-            ensure: false,
             data: Ok(snapshot(&program.rules[0], deadline)),
         });
         tokio::time::advance(Duration::from_secs(2)).await;
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 1),
             check_id: 1,
-            ensure: false,
             data: Ok(snapshot(&program.rules[1], deadline)),
         });
         assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
@@ -644,16 +553,24 @@ mod tests {
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 0),
             check_id: 1,
-            ensure: false,
             data: Ok(snapshot(&program.rules[0], deadline)),
         });
         assert_eq!(receive.await.unwrap().effect, Effect::Allow);
+        assert!(pool.rules.is_empty());
+        assert!(pool.calls.is_empty());
 
+        let key = ("plan".into(), "call".into(), TriggerTiming::After);
+        let (_after_owner, cancel) = watch::channel(());
         let (reply, receive) = oneshot::channel();
-        pool.command(Command::Complete {
+        pool.check(Check {
             key: key.clone(),
-            check_id: 1,
+            check_id: 2,
+            capability: "robot/pick".into(),
+            consumer: Arc::from("test"),
+            context: Arc::new(Value::Null),
+            cancel,
             reply,
+            permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
         });
         assert!(pool.calls[&key].deadline > deadline);
         assert_eq!(pool.rules[&(key.clone(), 0)].retries, 0);
@@ -661,15 +578,13 @@ mod tests {
         let deadline = pool.calls[&key].deadline;
         pool.evaluate(ReadyCheck {
             key: (key.clone(), 1),
-            check_id: 1,
-            ensure: true,
+            check_id: 2,
             data: Ok(snapshot(&program.rules[1], deadline)),
         });
         for attempt in 0..=MAX_FRESHNESS_RETRIES {
             pool.evaluate(ReadyCheck {
                 key: (key.clone(), 0),
-                check_id: 1,
-                ensure: true,
+                check_id: 2,
                 data: Err(Error::Expired {
                     rule: "a".into(),
                     input: "x".into(),
@@ -682,7 +597,8 @@ mod tests {
             }
         }
         let result = receive.await.unwrap();
-        assert_eq!(result.effect, Effect::Deny);
+        assert_eq!(result.effect, Effect::Allow);
+        assert_eq!(result.reports[0].timing, TriggerTiming::After);
         assert!(matches!(
             result.reports[0].evaluation,
             Err(Error::Expired { .. })
@@ -693,15 +609,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuse_and_completion_retire_watchers_even_if_owners_remain_alive() {
+    async fn cancelled_reuse_ignores_old_work_and_releases_capacity_after_checks() {
         let (adapter, server) = adapter().await;
-        let program = crate::srdl::parse("").unwrap();
+        let program = crate::srdl::parse(
+            r#"trigger a before always;
+            rule a { input from "sensor/a" select number x; require x > 0; enforce deny; }"#,
+        )
+        .unwrap();
         let mut pool = Pool::new(&program, &adapter);
         let permits = Arc::new(Semaphore::new(2));
-        let key = ("plan".to_owned(), "call".to_owned());
+        let key = ("plan".to_owned(), "call".to_owned(), TriggerTiming::Before);
         let (owner, cancel) = watch::channel(());
-        let (reply, receive) = oneshot::channel();
-        pool.command(Command::Begin {
+        let (reply, old_receive) = oneshot::channel();
+        pool.check(Check {
             key: key.clone(),
             check_id: 1,
             capability: "robot/pick".into(),
@@ -711,12 +631,12 @@ mod tests {
             reply,
             permit: permits.clone().try_acquire_owned().unwrap(),
         });
-        assert_eq!(receive.await.unwrap().effect, Effect::Allow);
+        pool.acquiring.clear();
         drop(owner);
         // Reuse happens before the cancellation stream has been polled.
         let (_owner, cancel) = watch::channel(());
         let (reply, receive) = oneshot::channel();
-        pool.command(Command::Begin {
+        pool.check(Check {
             key: key.clone(),
             check_id: 2,
             capability: "robot/pick".into(),
@@ -726,17 +646,23 @@ mod tests {
             reply,
             permit: permits.clone().try_acquire_owned().unwrap(),
         });
-        assert_eq!(receive.await.unwrap().effect, Effect::Allow);
-        assert!(pool.current(&key, 2));
-        let (reply, receive) = oneshot::channel();
-        pool.command(Command::Complete {
-            key,
+        pool.acquiring.clear();
+        assert!(old_receive.await.is_err());
+        let deadline = pool.calls[&key].deadline;
+        pool.evaluate(ReadyCheck {
+            key: (key.clone(), 0),
+            check_id: 1,
+            data: Ok(snapshot(&program.rules[0], deadline)),
+        });
+        assert!(pool.calls[&key].results.is_empty());
+        pool.evaluate(ReadyCheck {
+            key: (key.clone(), 0),
             check_id: 2,
-            reply,
+            data: Ok(snapshot(&program.rules[0], deadline)),
         });
         assert!(pool.calls.is_empty());
         assert!(pool.rules.is_empty());
-        // Keep both completion receiver and owner alive while retiring the watchers.
+        // Check completion releases capacity even while its submitting owner is alive.
         timeout(Duration::from_secs(1), async {
             while let Some(event) = pool.cancelled.next().await {
                 assert!(event.is_none());

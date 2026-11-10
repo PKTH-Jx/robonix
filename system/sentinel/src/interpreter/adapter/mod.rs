@@ -252,12 +252,11 @@ impl InputAdapter {
         consumer: &str,
         context: Arc<Value>,
         check_id: u64,
-        ensure: bool,
         deadline: Instant,
     ) -> Vec<BoxFuture<'ast, Result<Prepared, Error>>> {
         let selected: Vec<_> = rules
             .into_iter()
-            .map(|rule| (rule, dependencies::References::collect(rule, ensure)))
+            .map(|rule| (rule, dependencies::References::collect(rule)))
             .collect();
         let inputs = self.fetch_group(
             selected.iter().map(|(rule, names)| (*rule, names)),

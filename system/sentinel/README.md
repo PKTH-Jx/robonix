@@ -1,26 +1,31 @@
 # Sentinel - capability-call policy
 
-Sentinel evaluates SRDL safety rules for capability calls. Executor checks
-`require` before dispatch and `ensure` after successful execution, before accepting
-success or starting dependent work. Denials and check failures reject the call;
-unmatched calls are allowed.
+Sentinel evaluates SRDL safety rules for capability calls. `before` checks can
+reject dispatch. `after` checks run only after successful execution and report
+violations or check errors without changing success or rejecting dependent work.
 
-Declare triggers outside rule blocks: `trigger safety @ "robot/move";` applies
-rule `safety` to that contract ID. Either side accepts a nonempty bracketed list;
-every listed rule applies to every listed capability. `@ always` matches all calls.
-Rules run once per call in definition order, including when triggers overlap.
-Rules without a trigger association do not run. Unknown rule references and
-duplicate rule definitions prevent loading.
+Declare triggers outside rule blocks:
 
-The Adapter binds context, acquires inputs, and returns a complete dataset after
-checking freshness. The evaluator calculates predicates atomically. A shared pool
-retains pending postconditions and schedules ready datasets in FIFO order;
-input fetching uses rounds ordered by deadline.
+```text
+trigger safety before ["robot/pick", "robot/put_down"];
+trigger released after "robot/put_down";
+```
 
-Construct `SrdlInterpreter` inside Tokio. Use `begin` to check preconditions and
-retain the returned `CallChecks`; call `ensure` after successful execution, or
-drop the handle on failure or cancellation. Each condition group acquires fresh
-inputs while retaining the original call context. Rules still require `require`;
+Both sides accept a single item or a nonempty bracketed list. Every listed rule
+applies to every listed capability; `always` matches all calls. Rules use `require`
+for conditions and run once per event in definition order. After checks ignore
+the enforcement behavior and retain violation messages. Unknown rule references
+and duplicate definitions prevent loading. Unmatched checks return Allow immediately
+after trigger matching.
+
+Construct `SrdlInterpreter` inside Tokio. Call `check` with `TriggerTiming::Before`
+before dispatch and with `TriggerTiming::After` only after successful execution.
+Both use the same acquisition, evaluation, timeout and cancellation path; dropping
+a check future cancels its work. No evaluator state is retained between checks.
+Each check acquires fresh inputs and gets a new timeout budget. The Adapter checks
+freshness, and the evaluator calculates each rule atomically. Ready datasets use
+FIFO ordering; input fetching uses rounds ordered by deadline.
+
 `keep` and dynamic rule loading are not implemented.
 
 Runtime logs correlate checks using `check_id` and omit string values and provider

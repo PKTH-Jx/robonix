@@ -18,10 +18,8 @@ pub struct Rule {
     pub inputs: Vec<InputClause>,
     /// Bindings to the Executor's immutable context for this capability call.
     pub contexts: Vec<ContextClause>,
-    /// Preconditions evaluated before capability dispatch.
+    /// Conditions evaluated whenever a before or after trigger selects this rule.
     pub requires: Vec<RequireClause>,
-    /// Postconditions checked before accepting the capability's reported success.
-    pub ensures: Vec<EnsureClause>,
     /// The response declared for a violated safety condition.
     pub enforce: EnforceClause,
 }
@@ -96,8 +94,20 @@ pub enum SelectStep {
 pub struct TriggerClause {
     /// Rule names resolved against the complete program when loading SRDL.
     pub rules: Vec<Identifier>,
+    /// Whether matching occurs before dispatch or after successful execution.
+    pub timing: TriggerTiming,
     /// Alternative selectors; any match applies all named rules to the call.
     pub capabilities: Vec<TriggerTarget>,
+}
+
+/// The capability lifecycle event that starts an independent rule check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerTiming {
+    /// Check conditions before permitting capability dispatch.
+    Before,
+    /// Report conditions after successful capability execution.
+    After,
 }
 
 /// A capability selector on the right side of a trigger declaration.
@@ -109,17 +119,10 @@ pub enum TriggerTarget {
     Capability(String),
 }
 
-/// An unevaluated precondition for admitting a capability call.
+/// An unevaluated condition used by either trigger timing.
 #[derive(Debug)]
 pub struct RequireClause {
-    /// The Boolean condition checked before dispatch; false invokes the declared enforcement.
-    pub expression: Expression,
-}
-
-/// An unevaluated postcondition for accepting a capability's reported success.
-#[derive(Debug)]
-pub struct EnsureClause {
-    /// The expression to check before accepting successful completion.
+    /// The Boolean condition whose violation is enforced before dispatch or reported afterward.
     pub expression: Expression,
 }
 

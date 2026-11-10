@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::evaluator::{self, RuleResult};
-use crate::srdl::ast::{EnforceBehavior, Rule};
+use crate::srdl::ast::{EnforceBehavior, Rule, TriggerTiming};
 
 /// Capability-call decision returned by SRDL enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,8 +23,8 @@ pub enum Error {
 /// One rule's check and violation response, retained for feedback to the caller.
 #[derive(Debug)]
 pub struct RuleReport {
-    /// Whether these outcomes belong to postconditions rather than preconditions.
-    pub ensure: bool,
+    /// The event that caused this rule to be checked.
+    pub timing: TriggerTiming,
     /// The SRDL rule that produced this feedback.
     pub rule: String,
     /// Predicate values in clause order, or the failure that prevented calculation.
@@ -38,23 +38,27 @@ pub struct RuleReport {
 /// Combined decision and rule feedback for one capability call.
 #[derive(Debug)]
 pub struct EnforcementResult {
-    /// Deny if any rule rejects the call or fails during checking or enforcement.
+    /// Before checks may deny admission; after checks always allow and report their results.
     pub effect: Effect,
     /// All supplied rule results, in the caller's declaration order.
     pub reports: Vec<RuleReport>,
 }
 
 impl EnforcementResult {
-    /// Fail closed when the pool cannot produce the requested decision.
-    pub(super) fn failure(message: &'static str, ensure: bool) -> Self {
+    /// Pool failures deny admission but cannot change a completed execution's result.
+    pub(super) fn failure(message: &'static str, timing: TriggerTiming) -> Self {
         Self {
-            effect: Effect::Deny,
+            effect: if timing == TriggerTiming::Before {
+                Effect::Deny
+            } else {
+                Effect::Allow
+            },
             reports: vec![RuleReport {
                 rule: "sentinel".into(),
                 evaluation: Err(evaluator::Error::Pool(message)),
                 enforcement: None,
                 message: None,
-                ensure,
+                timing,
             }],
         }
     }
@@ -67,29 +71,36 @@ impl Enforcer {
     /// Consume all matched results in declaration order; an empty set allows the call.
     pub fn enforce<'ast>(
         results: impl IntoIterator<Item = (&'ast Rule, Result<RuleResult, evaluator::Error>)>,
+        timing: TriggerTiming,
     ) -> EnforcementResult {
         let mut effect = Effect::Allow;
         let mut reports = Vec::new();
         for (rule, evaluation) in results {
             let (enforcement, message) = match &evaluation {
                 Ok(result) if !result.passed() => {
-                    let decision = match rule.enforce.behavior {
-                        EnforceBehavior::Allow => Ok(Effect::Allow),
-                        EnforceBehavior::Deny => Ok(Effect::Deny),
-                        behavior @ EnforceBehavior::Pend => {
-                            Err(Error::UnsupportedBehavior(behavior))
-                        }
+                    let decision = if timing == TriggerTiming::After {
+                        None
+                    } else {
+                        Some(match rule.enforce.behavior {
+                            EnforceBehavior::Allow => Ok(Effect::Allow),
+                            EnforceBehavior::Deny => Ok(Effect::Deny),
+                            behavior @ EnforceBehavior::Pend => {
+                                Err(Error::UnsupportedBehavior(behavior))
+                            }
+                        })
                     };
-                    (Some(decision), rule.enforce.report.clone())
+                    (decision, rule.enforce.report.clone())
                 }
                 _ => (None, None),
             };
-            if evaluation.is_err() || matches!(enforcement, Some(Ok(Effect::Deny) | Err(_))) {
+            if timing == TriggerTiming::Before
+                && (evaluation.is_err() || matches!(enforcement, Some(Ok(Effect::Deny) | Err(_))))
+            {
                 effect = Effect::Deny;
             }
             // Keep later feedback even after a denial so the caller sees every matched rule.
             reports.push(RuleReport {
-                ensure: false,
+                timing,
                 rule: rule.name.0.clone(),
                 evaluation,
                 enforcement,
@@ -123,7 +134,7 @@ mod tests {
                 let result = RuleResult {
                     requirements: vec![true, passed],
                 };
-                let mut output = Enforcer::enforce([(&rule, Ok(result))]);
+                let mut output = Enforcer::enforce([(&rule, Ok(result))], TriggerTiming::Before);
                 assert_eq!(output.effect, if passed { Effect::Allow } else { expected });
                 let report = output.reports.remove(0);
                 assert_eq!(report.rule, "r");
@@ -132,6 +143,22 @@ mod tests {
                 assert_eq!(
                     evaluation.failed_requirements(),
                     if passed { vec![] } else { vec![2] }
+                );
+                let after = Enforcer::enforce(
+                    [(
+                        &rule,
+                        Ok(RuleResult {
+                            requirements: vec![true, passed],
+                        }),
+                    )],
+                    TriggerTiming::After,
+                );
+                assert_eq!(after.effect, Effect::Allow);
+                assert_eq!(after.reports[0].timing, TriggerTiming::After);
+                assert!(after.reports[0].enforcement.is_none());
+                assert_eq!(
+                    after.reports[0].message.as_deref(),
+                    if passed { None } else { Some("unsafe") }
                 );
                 if passed {
                     assert!(report.enforcement.is_none());
@@ -161,7 +188,7 @@ mod tests {
             rule: "r".into(),
             input: "reading".into(),
         };
-        let mut output = Enforcer::enforce([(&rule, Err(failure))]);
+        let mut output = Enforcer::enforce([(&rule, Err(failure))], TriggerTiming::Before);
         assert_eq!(output.effect, Effect::Deny);
         let report = output.reports.remove(0);
         assert!(
@@ -169,6 +196,16 @@ mod tests {
         );
         assert!(report.enforcement.is_none());
         assert!(report.message.is_none());
+        let after = Enforcer::enforce(
+            [(&rule, Err(evaluator::Error::Timeout { rule: "r".into() }))],
+            TriggerTiming::After,
+        );
+        assert_eq!(after.effect, Effect::Allow);
+        assert!(after.reports[0].evaluation.is_err());
+        assert!(after.reports[0].enforcement.is_none());
+        let failure = EnforcementResult::failure("worker stopped", TriggerTiming::After);
+        assert_eq!(failure.effect, Effect::Allow);
+        assert!(failure.reports[0].evaluation.is_err());
     }
 
     #[test]
@@ -181,14 +218,17 @@ mod tests {
         "#,
         )
         .unwrap();
-        let output = Enforcer::enforce(program.rules.iter().map(|rule| {
-            (
-                rule,
-                Ok(RuleResult {
-                    requirements: vec![false],
-                }),
-            )
-        }));
+        let output = Enforcer::enforce(
+            program.rules.iter().map(|rule| {
+                (
+                    rule,
+                    Ok(RuleResult {
+                        requirements: vec![false],
+                    }),
+                )
+            }),
+            TriggerTiming::Before,
+        );
         assert_eq!(output.effect, Effect::Deny);
         assert_eq!(
             output
@@ -208,7 +248,7 @@ mod tests {
         );
         assert_eq!(output.reports[0].enforcement, Some(Ok(Effect::Allow)));
         assert_eq!(output.reports[2].enforcement, Some(Ok(Effect::Allow)));
-        let empty = Enforcer::enforce([]);
+        let empty = Enforcer::enforce([], TriggerTiming::Before);
         assert_eq!(empty.effect, Effect::Allow);
         assert!(empty.reports.is_empty());
     }

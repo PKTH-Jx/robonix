@@ -7,8 +7,6 @@ mod logging;
 pub mod trigger_matcher;
 pub mod type_checker;
 
-pub use evaluator::CallChecks;
-
 use std::sync::atomic::AtomicU64;
 
 use robonix_atlas::client::AtlasClient;
@@ -21,7 +19,7 @@ use self::{
     evaluator::RuleEvaluator,
     type_checker::{TypeChecker, TypeError},
 };
-use crate::srdl;
+use crate::srdl::{self, ast::TriggerTiming};
 
 static NEXT_CHECK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,17 +50,18 @@ impl SrdlInterpreter {
         })
     }
 
-    /// Match once and retain postconditions until completion or owner cancellation.
-    pub async fn begin(
+    /// Check one lifecycle event without retaining state between events.
+    pub async fn check(
         &self,
         plan_id: &str,
         call_id: &str,
         capability: &str,
         consumer_id: &str,
         context: &Value,
-    ) -> (EnforcementResult, Option<CallChecks>) {
+        timing: TriggerTiming,
+    ) -> EnforcementResult {
         self.evaluator
-            .begin(plan_id, call_id, capability, consumer_id, context)
+            .check(plan_id, call_id, capability, consumer_id, context, timing)
             .await
     }
 
@@ -73,9 +72,9 @@ impl SrdlInterpreter {
                 Ok(result) => logging::log(
                     Level::Info,
                     format!(
-                        "[sentinel] check_id={check_id} rule={:?} ensure={} result={} requirements={:?} enforcement={:?} report={:?}",
+                        "[sentinel] check_id={check_id} rule={:?} timing={:?} result={} requirements={:?} enforcement={:?} report={:?}",
                         report.rule,
-                        report.ensure,
+                        report.timing,
                         if result.passed() {
                             "passed"
                         } else {
@@ -89,9 +88,9 @@ impl SrdlInterpreter {
                 Err(error) => logging::log(
                     Level::Warn,
                     format!(
-                        "[sentinel] check_id={check_id} rule={:?} ensure={} result=error error={:?}",
+                        "[sentinel] check_id={check_id} rule={:?} timing={:?} result=error error={:?}",
                         report.rule,
-                        report.ensure,
+                        report.timing,
                         logging::error(error)
                     ),
                 ),

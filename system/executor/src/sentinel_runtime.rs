@@ -8,7 +8,10 @@ use crate::pb::pilot::CapabilityCall;
 use anyhow::{Context, Result};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_scribe::warn;
-use robonix_sentinel::interpreter::{CallChecks, SrdlInterpreter, enforcer::EnforcementResult};
+use robonix_sentinel::{
+    interpreter::{SrdlInterpreter, enforcer::EnforcementResult},
+    srdl::ast::TriggerTiming,
+};
 use serde_json::{Map, Value};
 use tonic::{Request, Response, Status};
 
@@ -40,7 +43,7 @@ pub struct SentinelIdentity {
 /// Immutable SRDL policy and shared Atlas acquisition resources for all active plans.
 #[derive(Clone)]
 pub struct SentinelRuntime {
-    /// Shared interpreter with one pool for all admitted invocations.
+    /// Shared interpreter with one pool for independent before and after checks.
     interpreter: Arc<SrdlInterpreter>,
 }
 
@@ -62,21 +65,23 @@ impl SentinelRuntime {
         })
     }
 
-    pub async fn begin(
+    pub async fn check(
         &self,
         plan_id: &str,
         call: &CapabilityCall,
         identity: &SentinelIdentity,
-    ) -> Result<(EnforcementResult, Option<CallChecks>), serde_json::Error> {
+        timing: TriggerTiming,
+    ) -> Result<EnforcementResult, serde_json::Error> {
         let context = Self::context(&call.args_json, identity)?;
         Ok(self
             .interpreter
-            .begin(
+            .check(
                 plan_id,
                 &call.call_id,
                 &call.contract_id,
                 SENTINEL_PROVIDER_ID,
                 &context,
+                timing,
             )
             .await)
     }
@@ -109,7 +114,7 @@ pub fn feedback(result: &EnforcementResult) -> Value {
                 Some(Err(error)) => (None, Some(error.to_string())),
                 None => (None, None),
             };
-            serde_json::json!({"rule":report.rule, "ensure":report.ensure, "requirements":requirements,
+            serde_json::json!({"rule":report.rule, "timing":report.timing, "requirements":requirements,
             "violations":violations, "enforcement":enforcement, "report":report.message,
             "evaluation_error":evaluation_error, "enforcement_error":enforcement_error})
         })
@@ -226,7 +231,7 @@ mod tests {
         assert!(SentinelRuntime::load(&path, atlas.clone()).is_err());
         std::fs::write(
             &path,
-            r#"trigger guard @ "move";
+            r#"trigger guard before "move";
             rule guard {
             context string user = identity.user_id;
             context boolean permitted = arguments.permitted;
@@ -256,7 +261,10 @@ mod tests {
                 contract_id: "move".into(),
                 args_json: args,
             };
-            let (decision, _) = runtime.begin("plan", &call, &identity).await.unwrap();
+            let decision = runtime
+                .check("plan", &call, &identity, TriggerTiming::Before)
+                .await
+                .unwrap();
             assert_eq!(decision.effect, effect);
             let report = &feedback(&decision)["reports"][0];
             if !known {
@@ -274,12 +282,20 @@ mod tests {
             contract_id: "other".into(),
             args_json: "{}".into(),
         };
-        let (unmatched, _) = runtime.begin("plan", &call, &anonymous).await.unwrap();
+        let unmatched = runtime
+            .check("plan", &call, &anonymous, TriggerTiming::Before)
+            .await
+            .unwrap();
         assert_eq!(unmatched.effect, Effect::Allow);
         assert!(unmatched.reports.is_empty());
         for invalid in ["{", "[]", "null"] {
             call.args_json = invalid.into();
-            assert!(runtime.begin("plan", &call, &anonymous).await.is_err());
+            assert!(
+                runtime
+                    .check("plan", &call, &anonymous, TriggerTiming::Before)
+                    .await
+                    .is_err()
+            );
         }
         std::fs::remove_file(path).unwrap();
         server.abort();

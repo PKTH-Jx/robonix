@@ -12,6 +12,7 @@ use crate::verification::{self, VerificationPolicy};
 use robonix_atlas::client::AtlasClient;
 use robonix_scribe::{info, warn};
 use robonix_sentinel::interpreter::enforcer::Effect;
+use robonix_sentinel::srdl::ast::TriggerTiming;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -95,24 +96,21 @@ pub(crate) async fn execute_call(
     let checked = tokio::select! {
         biased;
         _ = runtime.wait_cancelled(&node.plan_id) => None,
-        result = sentinel.begin(&node.plan_id, call, &identity) => Some(result),
+        result = sentinel.check(&node.plan_id, call, &identity, TriggerTiming::Before) => Some(result),
     };
     let cancelled = checked.is_none() || runtime.is_cancelled(&node.plan_id).await;
-    let (allow, feedback, checks) = match checked {
-        Some(Ok((result, checks))) => (
+    let (allow, feedback) = match checked {
+        Some(Ok(result)) => (
             result.effect == Effect::Allow,
             sentinel_runtime::feedback(&result),
-            checks,
         ),
         Some(Err(error)) => (
             false,
             serde_json::json!({"effect":"deny", "context_error":error.to_string()}),
-            None,
         ),
-        None => (false, serde_json::json!({"cancelled":true}), None),
+        None => (false, serde_json::json!({"cancelled":true})),
     };
     if cancelled || !allow {
-        drop(checks);
         let state = if cancelled {
             RtdlNodeStateEnum::Canceled
         } else {
@@ -223,26 +221,20 @@ pub(crate) async fn execute_call(
     };
 
     let mut sentinel_detail = String::new();
-    let mut postcondition_failed = false;
-    if let Some(checks) =
-        checks.filter(|_| result.success && state == RtdlNodeStateEnum::Succeeded as u32)
-    {
+    if result.success && state == RtdlNodeStateEnum::Succeeded as u32 {
         let checked = tokio::select! {
             biased;
             _ = runtime.wait_cancelled(&node.plan_id) => None,
-            result = checks.ensure() => Some(result),
+            result = sentinel.check(&node.plan_id, call, &identity, TriggerTiming::After) => Some(result),
         };
         match checked {
-            Some(checked) => {
+            Some(Ok(checked)) => {
                 if !checked.reports.is_empty() {
                     sentinel_detail = sentinel_runtime::feedback(&checked).to_string();
                 }
-                if checked.effect != Effect::Allow {
-                    postcondition_failed = true;
-                    result.success = false;
-                    result.error = format!("Sentinel postcondition failed: {sentinel_detail}");
-                    state = RtdlNodeStateEnum::Failed as u32;
-                }
+            }
+            Some(Err(error)) => {
+                sentinel_detail = serde_json::json!({"effect":"allow", "timing":"after", "context_error":error.to_string()}).to_string();
             }
             None => {
                 result.success = false;
@@ -330,12 +322,6 @@ pub(crate) async fn execute_call(
 
     if result.success {
         log_success(call, &result);
-    } else if postcondition_failed {
-        // Provider error payloads remain in feedback, not in the process log.
-        warn!(
-            "[executor] '{}' failed: Sentinel rejected completion",
-            call.contract_id
-        );
     } else {
         warn!("[executor] '{}' failed: {}", call.contract_id, result.error);
     }
@@ -421,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_postcondition_blocks_success_and_overlapping_verification() {
+    async fn after_checks_report_violations_and_errors_only_for_successful_calls() {
         let address = reserve_address();
         let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
         let atlas = AtlasClient::connect_with_retry(
@@ -431,59 +417,67 @@ mod tests {
         )
         .await
         .unwrap();
-        let runtime = PlanRuntime::default();
-        runtime.register_plan("postcondition-plan").await.unwrap();
-        let contract = "robonix/system/executor/builtin/get_all_plans";
-        let sentinel = SentinelRuntime::new(&format!(
-            "trigger post @ \"{contract}\"; rule post {{ require true; ensure false; enforce deny; }}"
-        ), atlas.clone()).unwrap();
-        let target = CapabilityCall {
-            call_id: "postcondition-call".into(),
-            provider_id: "executor".into(),
-            contract_id: contract.into(),
-            args_json: "{}".into(),
-        };
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let execution = execute_call(
-            &target,
-            NodeEventContext {
-                plan_id: "postcondition-plan".into(),
-                node_index: 0,
-                node_kind: RTDL_DO,
-                op_id: "post".into(),
-                description: "check completed call".into(),
-            },
-            tx,
-            atlas,
-            "executor".into(),
-            runtime,
-            sentinel,
-            SentinelIdentity::default(),
-            Arc::new(VerificationPolicy::new(
-                true,
-                vec![VerificationRule {
-                    target_contract_id: contract.into(),
-                    target_provider_id: None,
-                    verifier_provider_id: "missing_verifier".into(),
-                    verifier_args: serde_json::json!({}),
-                }],
-            )),
-        )
-        .await;
-        assert!(execution.failed);
-        assert!(execution.verifier.is_none());
-        let mut terminal = None;
-        while let Some(event) = rx.recv().await {
-            let node = event.unwrap().node_state.unwrap();
-            if let Some(result) = node.leaf_result {
-                terminal = Some((result, node.operator_detail));
+        for (name, condition, succeeds) in [
+            ("get_all_plans", "false", true),
+            ("get_all_plans", "1 / 0 > 0", true),
+            ("missing", "false", false),
+        ] {
+            let runtime = PlanRuntime::default();
+            runtime.register_plan("postcondition-plan").await.unwrap();
+            let contract = format!("robonix/system/executor/builtin/{name}");
+            let sentinel = SentinelRuntime::new(&format!(
+                "trigger post after \"{contract}\"; rule post {{ require {condition}; enforce deny report \"postcondition violated\"; }}"
+            ), atlas.clone()).unwrap();
+            let target = CapabilityCall {
+                call_id: "postcondition-call".into(),
+                provider_id: "executor".into(),
+                contract_id: contract,
+                args_json: "{}".into(),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let execution = execute_call(
+                &target,
+                NodeEventContext {
+                    plan_id: "postcondition-plan".into(),
+                    node_index: 0,
+                    node_kind: RTDL_DO,
+                    op_id: "post".into(),
+                    description: "check completed call".into(),
+                },
+                tx,
+                atlas.clone(),
+                "executor".into(),
+                runtime,
+                sentinel,
+                SentinelIdentity::default(),
+                Arc::new(VerificationPolicy::new(false, Vec::new())),
+            )
+            .await;
+            assert_eq!(execution.failed, !succeeds);
+            assert!(execution.verifier.is_none());
+            let node = rx.recv().await.unwrap().unwrap().node_state.unwrap();
+            let result = node.leaf_result.unwrap();
+            assert_eq!(result.success, succeeds);
+            if succeeds {
+                assert_eq!(node.state, RtdlNodeStateEnum::Succeeded as u32);
+                assert!(result.output.contains("postcondition-plan"));
+                let detail: serde_json::Value =
+                    serde_json::from_str(&node.operator_detail).unwrap();
+                assert_eq!(detail["effect"], "allow");
+                let report = &detail["reports"][0];
+                assert_eq!(report["timing"], "after");
+                assert!(report["enforcement"].is_null());
+                if condition == "false" {
+                    assert_eq!(report["report"], "postcondition violated");
+                    assert_eq!(report["violations"], serde_json::json!([1]));
+                } else {
+                    assert!(report["evaluation_error"].is_string());
+                }
+            } else {
+                assert!(node.operator_detail.is_empty());
             }
+            assert!(rx.recv().await.is_none());
         }
-        let (result, detail) = terminal.unwrap();
-        assert!(!result.success);
-        assert!(result.output.contains("postcondition-plan"));
-        assert!(result.error.contains("Sentinel postcondition failed"));
-        assert!(detail.contains("\"ensure\":true"));
         server.abort();
     }
 

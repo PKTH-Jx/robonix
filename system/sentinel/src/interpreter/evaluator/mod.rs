@@ -18,20 +18,20 @@ use self::pool::Pool;
 use super::{
     NEXT_CHECK_ID,
     adapter::{InputAdapter, InputError, Prepared},
-    enforcer::{Effect, EnforcementResult},
+    enforcer::EnforcementResult,
     logging,
 };
-use crate::srdl::ast::{Program, Rule};
+use crate::srdl::ast::{Program, Rule, TriggerTiming};
 
 const CAPACITY: usize = 256;
-type CallKey = (String, String);
+type CallKey = (String, String, TriggerTiming);
 
 const RULE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Predicate results for one active clause group, in source declaration order.
+/// Predicate results for one triggered rule, in source declaration order.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuleResult {
-    /// True means the corresponding require or ensure expression holds.
+    /// True means the corresponding require expression holds.
     pub requirements: Vec<bool>,
 }
 
@@ -67,13 +67,11 @@ pub enum Error {
         #[source]
         source: ContextError,
     },
-    #[error("rule '{rule}', {clause} #{requirement}: {source}")]
+    #[error("rule '{rule}', require #{requirement}: {source}")]
     Expression {
         /// The rule whose requirement could not be calculated.
         rule: String,
-        /// The condition keyword identifying preconditions or postconditions.
-        clause: &'static str,
-        /// The one-based index within that clause group.
+        /// The one-based condition index in the rule.
         requirement: usize,
         /// The arithmetic, value or expression failure.
         #[source]
@@ -112,77 +110,31 @@ pub enum Error {
     },
 }
 
-/// Invocation lifecycle notifications serialized by the pool worker.
-enum Command {
-    /// Match rules, check `require`, and retain `ensure` clauses for successful completion.
-    Begin {
-        /// Plan and call IDs locating this invocation's rule entries.
-        key: CallKey,
-        /// Generation distinguishing this invocation from later reuse of its IDs.
-        check_id: u64,
-        /// Capability contract ID used for the single trigger-matching pass.
-        capability: String,
-        /// Atlas consumer identity used to acquire rule inputs.
-        consumer: Arc<str>,
-        /// Trusted arguments and identity shared by precondition and postcondition preparation.
-        context: Arc<Value>,
-        /// Owner-drop notification that cancels active and retained checks.
-        cancel: watch::Receiver<()>,
-        /// Returns the combined precondition decision before capability dispatch.
-        reply: oneshot::Sender<EnforcementResult>,
-        /// Admission slot retained until the invocation's cancellation watcher is retired.
-        permit: OwnedSemaphorePermit,
-    },
-    /// Report successful capability execution and activate the retained `ensure` checks.
-    Complete {
-        /// Plan and call IDs identifying the retained invocation.
-        key: CallKey,
-        /// Rejects completion notifications belonging to an earlier reuse of those IDs.
-        check_id: u64,
-        /// Returns the combined postcondition decision before execution success is accepted.
-        reply: oneshot::Sender<EnforcementResult>,
-    },
-}
-
-/// Retains the matched postconditions and cancels pool work when its owner drops it.
-pub struct CallChecks {
-    /// Invocation identity supplied by Executor.
+/// One independently owned before or after check submitted to the pool.
+struct Check {
+    /// Plan, call, and timing distinguish concurrent lifecycle events.
     key: CallKey,
-    /// Generation that binds completion to the original precondition check.
+    /// Generation rejecting late work when the same key is reused.
     check_id: u64,
-    /// Bounded delivery of the successful completion notification.
-    sender: mpsc::Sender<Command>,
-    /// Dropping this sender cancels outstanding acquisition and pending entries.
-    _cancel: watch::Sender<()>,
-}
-
-impl CallChecks {
-    /// Check the retained postconditions using new observations after successful execution.
-    pub async fn ensure(self) -> EnforcementResult {
-        let (reply, receive) = oneshot::channel();
-        if self
-            .sender
-            .send(Command::Complete {
-                key: self.key.clone(),
-                check_id: self.check_id,
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return EnforcementResult::failure("Sentinel check pool stopped", true);
-        }
-        receive.await.unwrap_or_else(|_| {
-            EnforcementResult::failure("Sentinel postcondition check stopped", true)
-        })
-    }
+    /// Contract used to select rules for this event.
+    capability: String,
+    /// Atlas consumer identity used to acquire inputs.
+    consumer: Arc<str>,
+    /// Trusted call arguments and identity for this event's conditions.
+    context: Arc<Value>,
+    /// Dropping the submitting future cancels acquisition and releases metadata.
+    cancel: watch::Receiver<()>,
+    /// Delivers this event's combined enforcement result and reports.
+    reply: oneshot::Sender<EnforcementResult>,
+    /// Bounds active checks until their cancellation watcher is retired.
+    permit: OwnedSemaphorePermit,
 }
 
 /// Invocation admission and atomic predicate calculation through a shared pool worker.
 pub struct RuleEvaluator {
-    /// Delivers invocation notifications to the worker started during construction.
-    sender: mpsc::Sender<Command>,
-    /// Backpressure bounds active calls and their retained postconditions.
+    /// Delivers independent checks to the worker started during construction.
+    sender: mpsc::Sender<Check>,
+    /// Backpressure bounds active checks and their cancellation watchers.
     permits: Arc<Semaphore>,
 }
 
@@ -198,90 +150,62 @@ impl RuleEvaluator {
         }
     }
 
-    /// Wait for the combined precondition decision and return ownership of retained checks.
-    /// Dropping that ownership cancels work independently of command-channel capacity.
-    pub(in crate::interpreter) async fn begin(
+    /// Both timings share acquisition, evaluation, timeout and cancellation behavior.
+    pub(in crate::interpreter) async fn check(
         &self,
         plan_id: &str,
         call_id: &str,
         capability: &str,
         consumer: &str,
         context: &Value,
-    ) -> (EnforcementResult, Option<CallChecks>) {
-        // Admission precedes enqueueing so retained calls and cancellation watchers share a bound.
+        timing: TriggerTiming,
+    ) -> EnforcementResult {
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
-            .expect("private admission semaphore stays open");
-        let key = (plan_id.to_owned(), call_id.to_owned());
+            .expect("private check semaphore stays open");
         let check_id = NEXT_CHECK_ID.fetch_add(1, Ordering::Relaxed);
-        let (cancel, cancelled) = watch::channel(());
-        let handle = CallChecks {
-            key: key.clone(),
-            check_id,
-            sender: self.sender.clone(),
-            _cancel: cancel,
-        };
+        // Keep cancellation ownership local so no state survives the check future.
+        let (_owner, cancel) = watch::channel(());
         let (reply, receive) = oneshot::channel();
-        let command = Command::Begin {
-            key,
+        let check = Check {
+            key: (plan_id.to_owned(), call_id.to_owned(), timing),
             check_id,
             capability: capability.to_owned(),
             consumer: Arc::from(consumer),
             context: Arc::new(context.clone()),
-            cancel: cancelled,
+            cancel,
             reply,
             permit,
         };
-        if self.sender.send(command).await.is_err() {
-            return (
-                EnforcementResult::failure("Sentinel check pool stopped", false),
-                None,
-            );
+        if self.sender.send(check).await.is_err() {
+            return EnforcementResult::failure("Sentinel check pool stopped", timing);
         }
-        let result = receive.await.unwrap_or_else(|_| {
-            EnforcementResult::failure("Sentinel precondition check stopped", false)
-        });
-        let handle = (result.effect == Effect::Allow).then_some(handle);
-        (result, handle)
+        receive
+            .await
+            .unwrap_or_else(|_| EnforcementResult::failure("Sentinel rule check stopped", timing))
     }
 
-    /// Evaluate one clause group synchronously against this snapshot.
+    /// Evaluate all conditions synchronously against this snapshot.
     pub(super) fn evaluate(
         check_id: u64,
         rule: &Rule,
-        ensure: bool,
         prepared: &Prepared,
     ) -> Result<RuleResult, Error> {
-        let clause = if ensure { "ensure" } else { "require" };
-        let expressions = rule
-            .requires
-            .iter()
-            .filter(|_| !ensure)
-            .map(|c| &c.expression)
-            .chain(
-                rule.ensures
-                    .iter()
-                    .filter(|_| ensure)
-                    .map(|c| &c.expression),
-            );
         let mut requirements = Vec::new();
-        for (index, expression) in expressions.enumerate() {
-            let result =
-                expression::evaluate_condition(expression, &prepared.values).map_err(|source| {
-                    Error::Expression {
-                        rule: rule.name.0.clone(),
-                        clause,
-                        requirement: index + 1,
-                        source,
-                    }
+        for (index, condition) in rule.requires.iter().enumerate() {
+            let result = expression::evaluate_condition(&condition.expression, &prepared.values)
+                .map_err(|source| Error::Expression {
+                    rule: rule.name.0.clone(),
+                    requirement: index + 1,
+                    source,
                 })?;
             logging::log(
                 Level::Info,
                 format!(
-                    "[sentinel] check_id={check_id} rule={:?} {clause}={} result={result}",
+                    "[sentinel] check_id={check_id} rule={:?} require={} result={result}",
                     rule.name.0,
                     index + 1
                 ),

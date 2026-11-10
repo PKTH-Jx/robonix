@@ -1,4 +1,4 @@
-trigger speed_not_exceed_10 @ "robonix/primitive/chassis/move";
+trigger speed_not_exceed_10 before "robonix/primitive/chassis/move";
 
 rule speed_not_exceed_10 {
     input from "robonix/system/soma/get_health" select
@@ -16,4 +16,4 @@ rule speed_not_exceed_20 {
         maxage 0.1;
 }
 
-trigger speed_not_exceed_20 @ always;
+trigger speed_not_exceed_20 before always;

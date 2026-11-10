@@ -441,7 +441,7 @@ mod tests {
         std::fs::create_dir_all(&temp).expect("test directory");
         let seed = temp.join("sentinel-rules.v1.srdl");
         let target = temp.join("data/sentinel-rules.srdl");
-        let seed_source = "trigger demo @ always; rule demo { require false; enforce deny; }";
+        let seed_source = "trigger demo before always; rule demo { require false; enforce deny; }";
         std::fs::write(&seed, seed_source).expect("versioned seed");
         let config_json = serde_json::json!({
             "sentinel_rules": target,

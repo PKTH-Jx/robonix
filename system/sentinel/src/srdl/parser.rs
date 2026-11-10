@@ -70,7 +70,7 @@ fn program(mut input: Tokens<'_>) -> IResult<'_, Program> {
 }
 
 // Clauses may precede their bindings; references remain unresolved here.
-// Rules require a precondition and one enforcement response, independently of triggers.
+// Rules require a condition and one enforcement response, independently of triggers.
 fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     let (mut input, (_, name, _)) = (
         match_token(TokenKind::Rule),
@@ -81,7 +81,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     let mut inputs = Vec::new();
     let mut contexts = Vec::new();
     let mut requires = Vec::new();
-    let mut ensures = Vec::new();
     let mut enforce = None;
     let mut input_names = std::collections::BTreeSet::new();
     // Preserve order within each clause kind, independently of declaration order.
@@ -111,11 +110,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
                 requires.push(clause);
                 input = rest;
             }
-            Some(TokenKind::Ensure) => {
-                let (rest, clause) = ensure_clause(input)?;
-                ensures.push(clause);
-                input = rest;
-            }
             Some(TokenKind::Enforce) if enforce.is_none() => {
                 let (rest, clause) = enforce_clause(input)?;
                 enforce = Some(clause);
@@ -128,7 +122,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             _ => {
                 return Err(Err::Error(expected(
                     &input,
-                    "input, context, require, ensure, or enforce",
+                    "input, context, require, or enforce",
                 )));
             }
         }
@@ -156,7 +150,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             inputs,
             contexts,
             requires,
-            ensures,
             enforce,
         },
     ))
@@ -281,7 +274,8 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Context
         | TokenKind::Trigger
         | TokenKind::Require
-        | TokenKind::Ensure
+        | TokenKind::Before
+        | TokenKind::After
         | TokenKind::Enforce
         | TokenKind::From
         | TokenKind::Select
@@ -316,12 +310,18 @@ fn string_literal(input: Tokens<'_>) -> IResult<'_, String> {
 fn trigger_clause(input: Tokens<'_>) -> IResult<'_, TriggerClause> {
     let (input, _) = match_token(TokenKind::Trigger)(input)?;
     let (input, rules) = one_or_list(input, identifier)?;
-    let (input, _) = match_token(TokenKind::At)(input)?;
+    let timing = match input.tok.first().map(|token| token.kind) {
+        Some(TokenKind::Before) => TriggerTiming::Before,
+        Some(TokenKind::After) => TriggerTiming::After,
+        _ => return Err(Err::Error(expected(&input, "'before' or 'after'"))),
+    };
+    let input = input.take_from(1);
     let (input, capabilities) = one_or_list(input, trigger_target)?;
     Ok((
         input,
         TriggerClause {
             rules,
+            timing,
             capabilities,
         },
     ))
@@ -354,12 +354,6 @@ fn require_clause(input: Tokens<'_>) -> IResult<'_, RequireClause> {
     let (input, _) = match_token(TokenKind::Require)(input)?;
     let (input, expression) = condition_expression(input)?;
     Ok((input, RequireClause { expression }))
-}
-
-fn ensure_clause(input: Tokens<'_>) -> IResult<'_, EnsureClause> {
-    let (input, _) = match_token(TokenKind::Ensure)(input)?;
-    let (input, expression) = condition_expression(input)?;
-    Ok((input, EnsureClause { expression }))
 }
 
 // Bound the token count before allocating a potentially deep condition AST.
@@ -406,7 +400,6 @@ fn match_token(kind: TokenKind) -> impl FnMut(Tokens<'_>) -> IResult<'_, Tokens<
         TokenKind::Semicolon => "';'".to_owned(),
         TokenKind::Comma => "','".to_owned(),
         TokenKind::Eq => "'='".to_owned(),
-        TokenKind::At => "'@'".to_owned(),
         TokenKind::Minus => "'-'".to_owned(),
         TokenKind::StringLiteral => "a string literal".to_owned(),
         TokenKind::NumberLiteral => "a number".to_owned(),
@@ -431,6 +424,8 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
         TokenKind::Identifier
         | TokenKind::Context
         | TokenKind::Always
+        | TokenKind::Before
+        | TokenKind::After
         | TokenKind::Allow
         | TokenKind::Deny
         | TokenKind::Pend

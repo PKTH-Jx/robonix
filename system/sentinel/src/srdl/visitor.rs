@@ -40,10 +40,6 @@ pub trait Visitor<'ast> {
         walk_require(self, require)
     }
 
-    fn visit_ensure(&mut self, ensure: &'ast EnsureClause) -> Result<(), Self::Error> {
-        walk_ensure(self, ensure)
-    }
-
     fn visit_enforce(&mut self, _enforce: &'ast EnforceClause) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -79,7 +75,7 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     rule: &'ast Rule,
 ) -> Result<(), V::Error> {
     visitor.visit_identifier(&rule.name)?;
-    // Both condition kinds need the complete binding scope, regardless of source order.
+    // Conditions need the complete binding scope, regardless of source order.
     for input in &rule.inputs {
         visitor.visit_input(input)?;
     }
@@ -88,9 +84,6 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     }
     for require in &rule.requires {
         visitor.visit_require(require)?;
-    }
-    for ensure in &rule.ensures {
-        visitor.visit_ensure(ensure)?;
     }
     visitor.visit_enforce(&rule.enforce)
 }
@@ -155,14 +148,6 @@ pub fn walk_require<'ast, V: Visitor<'ast> + ?Sized>(
     require: &'ast RequireClause,
 ) -> Result<(), V::Error> {
     visitor.visit_expression(&require.expression)?;
-    Ok(())
-}
-
-pub fn walk_ensure<'ast, V: Visitor<'ast> + ?Sized>(
-    visitor: &mut V,
-    ensure: &'ast EnsureClause,
-) -> Result<(), V::Error> {
-    visitor.visit_expression(&ensure.expression)?;
     Ok(())
 }
 
@@ -238,14 +223,14 @@ mod tests {
         let program = parse(
             r#"
             rule r {
-                ensure user = "alice";
+                require user = "alice";
                 require !ready && f(reading + 1, target.value);
                 enforce deny;
                 context string user = identity.user_id;
                 input from "source" select number reading = items[id = "sensor"].value maxage 1,
                     boolean ready maxage 2;
             }
-            trigger r @ always;
+            trigger r before always;
         "#,
         )
         .unwrap();
@@ -253,21 +238,21 @@ mod tests {
         visitor.visit_program(&program).unwrap();
         assert_eq!(
             visitor.events.join(" "),
-            "id:r id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value id:user literal enforce trigger id:r"
+            "id:r id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:user literal id:ready id:f id:reading literal id:target id:value enforce trigger id:r"
         );
     }
 
     #[test]
     fn propagates_errors_without_visiting_remaining_children() {
         let program =
-            parse("rule r { require stop_here || false; enforce deny; } trigger r @ always;")
+            parse("rule r { require stop_here || false; enforce deny; } trigger r before always;")
                 .unwrap();
         let mut visitor = Recorder::default();
         assert_eq!(visitor.visit_program(&program), Err("stopped"));
         assert_eq!(visitor.events, ["id:r", "id:stop_here"]);
         let program = parse(
-            "rule r { require true; ensure stop_here;
-                ensure skipped; enforce deny; }",
+            "rule r { require true; require stop_here;
+                require skipped; enforce deny; }",
         )
         .unwrap();
         let mut visitor = Recorder::default();

@@ -1,5 +1,5 @@
 # This example guards write_file only; other capabilities have no matching rule.
-trigger protect_demo_file @ "robonix/system/executor/builtin/write_file";
+trigger protect_demo_file before "robonix/system/executor/builtin/write_file";
 
 rule protect_demo_file {
     context string path = arguments.path;

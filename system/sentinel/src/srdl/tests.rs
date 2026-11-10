@@ -1,6 +1,6 @@
 use super::ast::{
     BinaryOperator as B, EnforceBehavior, EnforceClause, Expression as E, Identifier, InputField,
-    InputType, Literal, Rule, SelectStep, TriggerTarget, UnaryOperator as U,
+    InputType, Literal, Rule, SelectStep, TriggerTarget, TriggerTiming, UnaryOperator as U,
 };
 use super::{Error, ErrorKind, parse};
 
@@ -200,10 +200,7 @@ fn rejects_invalid_expressions_and_partial_programs() {
     assert!(parse(&format!("{valid} rule broken {{")).is_err());
     assert_eq!(
         condition("a @ b").unwrap_err().kind,
-        ErrorKind::Expected {
-            expected: "';'".into(),
-            found: "\"@\"".into()
-        }
+        ErrorKind::InvalidToken
     );
 }
 
@@ -406,19 +403,34 @@ fn rejects_missing_semicolons_duplicate_inputs_and_invalid_clause_counts() {
 fn parses_top_level_triggers_with_single_items_and_lists() {
     let program = parse(
         r#"
-        trigger r1 @ "robot/move";
+        trigger r1 before "robot/move";
         rule r1 { require true; enforce deny; }
-        trigger [r1, r2] @ capA;
-        trigger r2 @ ["robot/move", "robot/stop"];
-        rule r2 { require true; ensure true; enforce deny; }
-        trigger [r2, r1] @ ["robot/move", capB];
-        trigger [r1] @ [always];
-        trigger r2 @ "always";
+        trigger [r1, r2] after capA;
+        trigger r2 before ["robot/move", "robot/stop"];
+        rule r2 { require true; enforce deny; }
+        trigger [r2, r1] before ["robot/move", capB];
+        trigger [r1] after [always];
+        trigger r2 before "always";
     "#,
     )
     .unwrap();
     assert_eq!(program.rules.len(), 2);
     assert_eq!(program.triggers.len(), 6);
+    assert_eq!(
+        program
+            .triggers
+            .iter()
+            .map(|t| t.timing)
+            .collect::<Vec<_>>(),
+        [
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::Before,
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::Before
+        ]
+    );
     for (trigger, (rules, capabilities)) in program.triggers.iter().zip([
         (
             vec!["r1"],
@@ -464,32 +476,36 @@ fn rejects_invalid_trigger_syntax() {
         "trigger r;",
         "trigger always;",
         r#"trigger capability "source";"#,
-        "trigger r @;",
-        "trigger r @ always",
+        "trigger r @ capA;",
+        "trigger r before;",
+        "trigger r after;",
+        "trigger r after [];",
+        "trigger r after [capA,];",
+        "trigger r before always",
         "trigger r always;",
-        "trigger [] @ capA;",
-        "trigger r @ [];",
-        "trigger [r,] @ capA;",
-        "trigger r @ [capA,];",
-        "trigger [r r2] @ capA;",
-        "trigger r @ [capA capB];",
-        "trigger [[r]] @ capA;",
-        "trigger r @ [[capA]];",
-        "trigger [r @ capA;",
-        "trigger r @ [capA;",
-        "trigger r, r2 @ capA;",
-        "trigger r @ capA, capB;",
-        "trigger 1 @ capA;",
-        "trigger r @ 1;",
-        r#"trigger "r" @ capA;"#,
-        r#"trigger r @ "bad\uD800";"#,
+        "trigger [] before capA;",
+        "trigger r before [];",
+        "trigger [r,] before capA;",
+        "trigger r before [capA,];",
+        "trigger [r r2] before capA;",
+        "trigger r before [capA capB];",
+        "trigger [[r]] before capA;",
+        "trigger r before [[capA]];",
+        "trigger [r before capA;",
+        "trigger r before [capA;",
+        "trigger r, r2 before capA;",
+        "trigger r before capA, capB;",
+        "trigger 1 before capA;",
+        "trigger r before 1;",
+        r#"trigger "r" before capA;"#,
+        r#"trigger r before "bad\uD800";"#,
     ] {
         let source = format!("rule r {{ require true; enforce deny; }} {trigger}");
         assert!(parse(&source).is_err(), "accepted {trigger}");
     }
     for trigger in [
         "trigger always;",
-        "trigger r @ capA;",
+        "trigger r before capA;",
         r#"trigger capability "capA";"#,
     ] {
         assert!(
@@ -512,7 +528,7 @@ fn contextual_keywords_remain_usable_as_names() {
             input from "source" select number {input_name} = value maxage 1;
             require {input_name} > {other}; enforce deny;
         }}
-        trigger {rule_name} @ always;"#
+        trigger {rule_name} before always;"#
         ))
         .unwrap();
         let rule = &program.rules[0];
@@ -581,6 +597,8 @@ fn selects_keyword_named_fields_at_every_path_position() {
         "input",
         "trigger",
         "require",
+        "before",
+        "after",
         "ensure",
         "enforce",
         "from",
@@ -798,21 +816,9 @@ fn distinguishes_numeric_comparison_and_limit_errors() {
 }
 
 #[test]
-fn applies_condition_syntax_and_limits_to_postconditions() {
-    for (expression, expected) in [
-        ("a < b < c".into(), ErrorKind::ChainedComparison),
-        (
-            vec!["a"; 600].join(" + "),
-            ErrorKind::ExpressionTooLong(1024),
-        ),
-        (
-            format!("{}a", "!".repeat(200)),
-            ErrorKind::ExpressionTooDeep(128),
-        ),
-    ] {
-        let source = format!("require true; ensure {expression}; enforce deny;");
-        assert_eq!(rule(&source).unwrap_err().kind, expected);
-    }
+fn rejects_removed_ensure_clauses() {
+    assert!(rule("require true; ensure false; enforce deny;").is_err());
+    assert!(rule("ensure true; enforce deny;").is_err());
 }
 
 #[test]

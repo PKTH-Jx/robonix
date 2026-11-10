@@ -25,17 +25,11 @@ impl<'ast> Visitor<'ast> for References<'ast> {
 }
 
 impl<'ast> References<'ast> {
-    /// Select only bindings needed by the active clause group, deferring postcondition inputs.
-    pub(super) fn collect(rule: &'ast Rule, ensure: bool) -> BTreeSet<&'ast str> {
+    /// Select only bindings referenced by this rule's conditions.
+    pub(super) fn collect(rule: &'ast Rule) -> BTreeSet<&'ast str> {
         let mut references = References::default();
-        if ensure {
-            for condition in &rule.ensures {
-                references.visit_expression(&condition.expression).unwrap();
-            }
-        } else {
-            for condition in &rule.requires {
-                references.visit_expression(&condition.expression).unwrap();
-            }
+        for condition in &rule.requires {
+            references.visit_expression(&condition.expression).unwrap();
         }
         references.names
     }

@@ -42,8 +42,6 @@ pub enum TokenKind {
     Trigger,
     #[token("require")]
     Require,
-    #[token("ensure")]
-    Ensure,
     #[token("enforce")]
     Enforce,
 
@@ -56,8 +54,10 @@ pub enum TokenKind {
     Maxage,
 
     // Trigger syntax
-    #[token("@")]
-    At,
+    #[token("before")]
+    Before,
+    #[token("after")]
+    After,
     #[token("always")]
     Always,
 

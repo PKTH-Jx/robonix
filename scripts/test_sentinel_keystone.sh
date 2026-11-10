@@ -126,7 +126,7 @@ import sys
 
 with sqlite3.connect(sys.argv[1]) as database:
     admin_id = database.execute("SELECT user_id FROM users WHERE username = ?", ("admin",)).fetchone()[0]
-pathlib.Path(sys.argv[2]).write_text(f'''trigger require_admin_user @ "robonix/system/executor/builtin/list_dir";
+pathlib.Path(sys.argv[2]).write_text(f'''trigger require_admin_user before "robonix/system/executor/builtin/list_dir";
 rule require_admin_user {{
     context string user = identity.user_id;
     require user = {json.dumps(admin_id)};
@@ -673,31 +673,34 @@ PYDEMO
 
 echo "PASS Keystone, Liaison, Pilot, Sentinel, and Executor are connected"
 
-# Postconditions gate completion after the first write has physically happened.
+# After checks report violations while successful writes and dependent work continue.
 kill "$EXECUTOR_PID"
 wait "$EXECUTOR_PID" 2>/dev/null || true
-cat >"$WORK/ensure.srdl" <<'RULES'
-trigger [write_checks, additional_write_check] @ "robonix/system/executor/builtin/write_file";
-rule write_checks {
+cat >"$WORK/after.srdl" <<'RULES'
+trigger [write_before, additional_write_check] before "robonix/system/executor/builtin/write_file";
+trigger [write_after, additional_write_check] after "robonix/system/executor/builtin/write_file";
+rule write_before {
     context boolean permitted = arguments.permitted;
-    context boolean accepted = arguments.accepted;
     require permitted;
-    ensure accepted;
+    enforce deny report "Write was not permitted";
+}
+rule write_after {
+    context boolean accepted = arguments.accepted;
+    require accepted;
     enforce deny report "Write postcondition was not satisfied";
 }
 rule additional_write_check {
     require true;
-    ensure true;
     enforce deny;
 }
 RULES
 ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
   --atlas "$ATLAS_ADDR" --listen "$EXECUTOR_ADDR" \
-  --sentinel-listen "$SENTINEL_ADDR" --sentinel-rules "$WORK/ensure.srdl" \
+  --sentinel-listen "$SENTINEL_ADDR" --sentinel-rules "$WORK/after.srdl" \
   --require-keystone false --id executor >"$EXECUTOR_LOG" 2>&1 &
 EXECUTOR_PID=$!
 wait_for_port "$EXECUTOR_ADDR" "$EXECUTOR_PID"
-PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYENSURE'
+PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYAFTER'
 import json
 import pathlib
 import sys
@@ -711,7 +714,7 @@ with grpc.insecure_channel(sys.argv[1]) as channel:
     streamed = contracts.RobonixSystemExecutorExecuteStreamStub(channel)
     for use_stream in (False, True):
         for permitted, accepted in ((False, True), (True, False), (True, True)):
-            name = f"ensure-{use_stream}-{permitted}-{accepted}"
+            name = f"after-{use_stream}-{permitted}-{accepted}"
             paths = [f"{name}-first.txt", f"{name}-next.txt"]
             leaves = [pilot_pb2.RtdlNode(
                 node_kind=2, op_id=f"write-{index}", description="write test evidence",
@@ -734,15 +737,17 @@ with grpc.insecure_channel(sys.argv[1]) as channel:
                 root.children.extend([1, 2])
                 events = list(execute.Execute(pilot_pb2.Plan(plan_id=name, nodes=[root, *leaves]), timeout=10))
             assert (pathlib.Path(sys.argv[2]) / paths[0]).exists() == permitted
-            assert (pathlib.Path(sys.argv[2]) / paths[1]).exists() == (permitted and accepted)
+            assert (pathlib.Path(sys.argv[2]) / paths[1]).exists() == permitted
             nodes = [event.node_state for event in events if event.HasField("node_state")]
             first = next(node for node in nodes if node.op_id == "write-0" and node.HasField("leaf_result"))
-            assert first.leaf_result.success == (permitted and accepted), first
+            assert first.leaf_result.success == permitted, first
             if permitted and not accepted:
-                assert "Sentinel postcondition failed" in first.leaf_result.error
+                assert first.leaf_result.success and not first.leaf_result.error
                 reports = json.loads(first.operator_detail)["reports"]
-                assert len(reports) == 2 and all(report["ensure"] for report in reports)
+                assert len(reports) == 2 and all(report["timing"] == "after" for report in reports)
+                assert reports[0]["report"] == "Write postcondition was not satisfied"
+                assert all(report["enforcement"] is None for report in reports)
             final = next(event.plan_complete for event in events if event.HasField("plan_complete"))
-            assert final.any_failed == (not (permitted and accepted))
-print("PASS require/ensure gated real writes and dependent execution on complete and streamed plans")
-PYENSURE
+            assert final.any_failed == (not permitted)
+print("PASS before checks gated writes and after checks reported without blocking dependent execution")
+PYAFTER
