@@ -541,7 +541,8 @@ mod tests {
         let (adapter, server) = adapter().await;
         tokio::time::pause();
         let program = crate::srdl::parse(
-            r#"rule a { trigger always;
+            r#"trigger a @ always;
+            rule a {
             input from "sensor/a" select number x maxage 1;
             require x / 0 > 0; enforce deny; }"#,
         )
@@ -598,9 +599,10 @@ mod tests {
         tokio::time::pause();
         let program = crate::srdl::parse(
             r#"
-            rule a { trigger always; input from "sensor/a" select number x maxage 1;
+            trigger [a, b] @ always;
+            rule a { input from "sensor/a" select number x maxage 1;
                 require x > 0; ensure x > 0; enforce deny; }
-            rule b { trigger always; input from "sensor/b" select number x;
+            rule b { input from "sensor/b" select number x;
                 require x > 0; ensure x > 0; enforce deny; }
         "#,
         )

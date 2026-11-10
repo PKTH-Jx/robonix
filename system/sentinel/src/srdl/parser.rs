@@ -49,17 +49,28 @@ pub fn parse_srdl(input: Tokens<'_>) -> Result<Program, Error> {
 
 fn program(mut input: Tokens<'_>) -> IResult<'_, Program> {
     let mut rules = Vec::new();
-    // Do not backtrack over malformed rules or replace their errors with trailing-input errors.
+    let mut triggers = Vec::new();
+    // Preserve declaration errors instead of replacing them with trailing-input errors.
     while !input.tok.is_empty() {
-        let (rest, rule) = rule(input)?;
-        rules.push(rule);
-        input = rest;
+        match input.tok[0].kind {
+            TokenKind::Rule => {
+                let (rest, rule) = rule(input)?;
+                rules.push(rule);
+                input = rest;
+            }
+            TokenKind::Trigger => {
+                let (rest, clause) = trigger_clause(input)?;
+                triggers.push(clause);
+                (input, _) = match_token(TokenKind::Semicolon)(rest)?;
+            }
+            _ => return Err(Err::Error(expected(&input, "rule or trigger"))),
+        }
     }
-    Ok((input, Program { rules }))
+    Ok((input, Program { rules, triggers }))
 }
 
 // Clauses may precede their bindings; references remain unresolved here.
-// Rules still require a trigger, a require clause, and one enforcement response.
+// Rules require a precondition and one enforcement response, independently of triggers.
 fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     let (mut input, (_, name, _)) = (
         match_token(TokenKind::Rule),
@@ -69,7 +80,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
         .parse(input)?;
     let mut inputs = Vec::new();
     let mut contexts = Vec::new();
-    let mut triggers = Vec::new();
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     let mut enforce = None;
@@ -96,11 +106,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
                 contexts.push(clause);
                 input = rest;
             }
-            Some(TokenKind::Trigger) => {
-                let (rest, clause) = trigger_clause(input)?;
-                triggers.push(clause);
-                input = rest;
-            }
             Some(TokenKind::Require) => {
                 let (rest, clause) = require_clause(input)?;
                 requires.push(clause);
@@ -123,7 +128,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             _ => {
                 return Err(Err::Error(expected(
                     &input,
-                    "input, context, trigger, require, ensure, or enforce",
+                    "input, context, require, ensure, or enforce",
                 )));
             }
         }
@@ -132,12 +137,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     }
     let closing = input.clone();
     let (input, _) = match_token(TokenKind::RBrace)(input)?;
-    if triggers.is_empty() {
-        return Err(Err::Error(at(
-            &closing,
-            ErrorKind::MissingClause("trigger"),
-        )));
-    }
     if requires.is_empty() {
         return Err(Err::Error(at(
             &closing,
@@ -156,7 +155,6 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             name,
             inputs,
             contexts,
-            triggers,
             requires,
             ensures,
             enforce,
@@ -289,7 +287,6 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Select
         | TokenKind::Maxage
         | TokenKind::Always
-        | TokenKind::Capability
         | TokenKind::Allow
         | TokenKind::Deny
         | TokenKind::Pend
@@ -315,16 +312,41 @@ fn string_literal(input: Tokens<'_>) -> IResult<'_, String> {
     Ok((input, value))
 }
 
-// Grammar: trigger always | trigger capability "CONTRACT".
-// Select invocations without assigning condition phases; the rule consumes the semicolon.
+// Both lists form a Cartesian product; matching still selects each rule only once.
 fn trigger_clause(input: Tokens<'_>) -> IResult<'_, TriggerClause> {
     let (input, _) = match_token(TokenKind::Trigger)(input)?;
+    let (input, rules) = one_or_list(input, identifier)?;
+    let (input, _) = match_token(TokenKind::At)(input)?;
+    let (input, capabilities) = one_or_list(input, trigger_target)?;
+    Ok((
+        input,
+        TriggerClause {
+            rules,
+            capabilities,
+        },
+    ))
+}
+
+fn one_or_list<'a, T>(
+    input: Tokens<'a>,
+    item: impl FnMut(Tokens<'a>) -> IResult<'a, T>,
+) -> IResult<'a, Vec<T>> {
+    if input.tok.first().map(|t| t.kind) != Some(TokenKind::LBracket) {
+        return map(item, |value| vec![value]).parse(input);
+    }
+    let (input, items) =
+        separated_list1(match_token(TokenKind::Comma), cut(item)).parse(input.take_from(1))?;
+    let (input, _) = match_token(TokenKind::RBracket)(input)?;
+    Ok((input, items))
+}
+
+fn trigger_target(input: Tokens<'_>) -> IResult<'_, TriggerTarget> {
     match input.tok.first().map(|t| t.kind) {
-        Some(TokenKind::Always) => Ok((input.take_from(1), TriggerClause::Always)),
-        Some(TokenKind::Capability) => {
-            map(string_literal, TriggerClause::Capability).parse(input.take_from(1))
+        Some(TokenKind::Always) => Ok((input.take_from(1), TriggerTarget::Always)),
+        Some(TokenKind::StringLiteral) => {
+            map(string_literal, TriggerTarget::Capability).parse(input)
         }
-        _ => Err(Err::Error(expected(&input, "'always' or 'capability'"))),
+        _ => map(identifier, |name| TriggerTarget::Capability(name.0)).parse(input),
     }
 }
 
@@ -384,6 +406,7 @@ fn match_token(kind: TokenKind) -> impl FnMut(Tokens<'_>) -> IResult<'_, Tokens<
         TokenKind::Semicolon => "';'".to_owned(),
         TokenKind::Comma => "','".to_owned(),
         TokenKind::Eq => "'='".to_owned(),
+        TokenKind::At => "'@'".to_owned(),
         TokenKind::Minus => "'-'".to_owned(),
         TokenKind::StringLiteral => "a string literal".to_owned(),
         TokenKind::NumberLiteral => "a number".to_owned(),
@@ -408,7 +431,6 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
         TokenKind::Identifier
         | TokenKind::Context
         | TokenKind::Always
-        | TokenKind::Capability
         | TokenKind::Allow
         | TokenKind::Deny
         | TokenKind::Pend

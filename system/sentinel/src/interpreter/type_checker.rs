@@ -1,10 +1,10 @@
-//! Static checks over declared binding types, without resolving source field schemas.
+//! Static checks for trigger references and binding types, without resolving source schemas.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::srdl::{
     ast::*,
-    visitor::{Visitor, walk_rule},
+    visitor::{Visitor, walk_program, walk_rule},
 };
 
 /// A static type error located by rule and the affected precondition or postcondition.
@@ -35,9 +35,13 @@ impl std::fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Constraints enforceable using the three basic binding types.
+/// Invalid rule references, declarations, or operations on the three basic binding types.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TypeErrorKind {
+    #[error("duplicate rule '{0}'")]
+    DuplicateRule(String),
+    #[error("trigger references unknown rule '{0}'")]
+    UnknownRule(String),
     #[error("duplicate binding '{0}'")]
     DuplicateBinding(String),
     #[error("unknown binding '{0}'")]
@@ -166,6 +170,28 @@ impl TypeChecker {
 impl<'ast> Visitor<'ast> for TypeChecker {
     type Error = TypeError;
 
+    fn visit_program(&mut self, program: &Program) -> Result<(), TypeError> {
+        self.requirement = None;
+        self.ensure = None;
+        let mut names = BTreeSet::new();
+        for rule in &program.rules {
+            if !names.insert(&rule.name.0) {
+                self.rule.clone_from(&rule.name.0);
+                return Err(self.error(TypeErrorKind::DuplicateRule(rule.name.0.clone())));
+            }
+        }
+        // Resolve after collecting all definitions so triggers may precede their rules.
+        for trigger in &program.triggers {
+            for name in &trigger.rules {
+                if !names.contains(&name.0) {
+                    self.rule.clone_from(&name.0);
+                    return Err(self.error(TypeErrorKind::UnknownRule(name.0.clone())));
+                }
+            }
+        }
+        walk_program(self, program)
+    }
+
     fn visit_rule(&mut self, rule: &Rule) -> Result<(), TypeError> {
         self.bindings.clear();
         self.rule.clone_from(&rule.name.0);
@@ -220,7 +246,7 @@ mod tests {
             input from "source" select number x = value maxage 1,
                 number y = value maxage 1, string label = label maxage 1,
                 boolean ready = ready maxage 1;
-            trigger always; enforce deny;
+            enforce deny;
         }}"#
             ))
             .unwrap(),
@@ -269,6 +295,44 @@ mod tests {
                 check(&format!("ready {operator} x")).unwrap_err().kind,
                 TypeErrorKind::InvalidBinary { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn resolves_trigger_references_and_rejects_ambiguous_rule_names() {
+        let definitions =
+            "rule a { require true; enforce deny; } rule b { require true; enforce deny; }";
+        let program = parse(&format!(
+            "trigger [b, a, a] @ [capA, capB]; {definitions} trigger b @ always;"
+        ))
+        .unwrap();
+        TypeChecker::check(&program).unwrap();
+        for (source, name, kind) in [
+            (
+                "trigger missing @ capA;".to_owned(),
+                "missing",
+                TypeErrorKind::UnknownRule("missing".into()),
+            ),
+            (
+                format!("{definitions} trigger [a, missing] @ capA;"),
+                "missing",
+                TypeErrorKind::UnknownRule("missing".into()),
+            ),
+            (
+                format!("{definitions} rule a {{ require true; enforce deny; }}"),
+                "a",
+                TypeErrorKind::DuplicateRule("a".into()),
+            ),
+        ] {
+            assert_eq!(
+                TypeChecker::check(&parse(&source).unwrap()).unwrap_err(),
+                TypeError {
+                    rule: name.into(),
+                    requirement: None,
+                    ensure: None,
+                    kind,
+                }
+            );
         }
     }
 
@@ -323,7 +387,6 @@ mod tests {
                 r#"rule typed {{
                 ensure {expression};
                 require true;
-                trigger always;
                 context boolean ready = arguments.ready;
                 input from "source" select number x, string label;
                 enforce deny;
@@ -357,8 +420,8 @@ mod tests {
     #[test]
     fn numbers_postconditions_separately_and_resets_between_rules() {
         let program = parse(
-            "rule first { trigger always; require true; ensure true; enforce deny; }
-             rule second { trigger always; require true; require false;
+            "rule first { require true; ensure true; enforce deny; }
+             rule second { require true; require false;
                  ensure true; ensure missing; enforce deny; }",
         )
         .unwrap();
@@ -373,10 +436,10 @@ mod tests {
 
     #[test]
     fn isolates_rule_scopes_and_reports_requirement_number() {
-        let first = r#"rule first { trigger always;
+        let first = r#"rule first {
             input from "source" select number x = value maxage 1;
             require x > 0; ensure true; enforce deny; }"#;
-        let second = "rule second { trigger always; require true; require x > 0; enforce deny; }";
+        let second = "rule second { require true; require x > 0; enforce deny; }";
         let program = parse(&format!("{first} {second}")).unwrap();
         assert_eq!(
             TypeChecker::check(&program).unwrap_err(),
@@ -387,7 +450,7 @@ mod tests {
                 kind: TypeErrorKind::UnknownBinding("x".into()),
             }
         );
-        let second = r#"rule second { trigger always;
+        let second = r#"rule second {
             input from "source" select boolean x = value maxage 1;
             require x; enforce deny; }"#;
         TypeChecker::check(&parse(&format!("{first} {second}")).unwrap()).unwrap();
@@ -406,7 +469,7 @@ mod tests {
             ("limit", false),
         ] {
             let program = parse(&format!(
-                "rule r {{ require {expression}; trigger always; {declarations} enforce deny; }}"
+                "rule r {{ require {expression}; {declarations} enforce deny; }}"
             ))
             .unwrap();
             let result = TypeChecker::check(&program);
@@ -421,15 +484,18 @@ mod tests {
             r#"input from "source" select number user maxage 1; context string user = identity.user_id;"#,
         ] {
             let program = parse(&format!(
-                "rule r {{ trigger always; {declarations} require true; enforce deny; }}"
+                "rule r {{ {declarations} require true; enforce deny; }}"
             ))
             .unwrap();
             let error = TypeChecker::check(&program).unwrap_err();
             assert_eq!(error.kind, TypeErrorKind::DuplicateBinding("user".into()));
             assert_eq!(error.requirement, None);
         }
-        let program = parse(r#"rule first { trigger always; context string user = identity.user_id; require true; enforce deny; }
-            rule second { trigger always; require user = "alice"; enforce deny; }"#).unwrap();
+        let program = parse(
+            r#"rule first { context string user = identity.user_id; require true; enforce deny; }
+            rule second { require user = "alice"; enforce deny; }"#,
+        )
+        .unwrap();
         assert_eq!(
             TypeChecker::check(&program).unwrap_err().kind,
             TypeErrorKind::UnknownBinding("user".into())
@@ -439,7 +505,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_inputs_in_constructed_ast() {
         let mut program = parse(
-            r#"rule duplicate { trigger always;
+            r#"rule duplicate {
             input from "source" select number x = value maxage 1, string y = value maxage 1;
             require true; enforce deny; }"#,
         )

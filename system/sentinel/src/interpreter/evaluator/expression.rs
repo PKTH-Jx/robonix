@@ -154,15 +154,13 @@ mod tests {
     use crate::srdl::parse;
 
     fn condition(source: &str) -> Expression {
-        parse(&format!(
-            "rule r {{ trigger always; require {source}; enforce deny; }}"
-        ))
-        .unwrap()
-        .rules
-        .remove(0)
-        .requires
-        .remove(0)
-        .expression
+        parse(&format!("rule r {{ require {source}; enforce deny; }}"))
+            .unwrap()
+            .rules
+            .remove(0)
+            .requires
+            .remove(0)
+            .expression
     }
 
     fn inputs() -> BTreeMap<String, Arc<InputValue>> {

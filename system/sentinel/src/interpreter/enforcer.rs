@@ -113,7 +113,7 @@ mod tests {
             ("pend", Effect::Deny),
         ] {
             let rule = parse(&format!(
-                r#"rule r {{ trigger always; require true; require false;
+                r#"rule r {{ require true; require false;
                 enforce {behavior} report "unsafe"; }}"#
             ))
             .unwrap()
@@ -153,11 +153,10 @@ mod tests {
 
     #[test]
     fn preserves_evaluation_failures_without_applying_enforce() {
-        let rule =
-            parse(r#"rule r { trigger always; require false; enforce allow report "violation"; }"#)
-                .unwrap()
-                .rules
-                .remove(0);
+        let rule = parse(r#"rule r { require false; enforce allow report "violation"; }"#)
+            .unwrap()
+            .rules
+            .remove(0);
         let failure = evaluator::Error::Expired {
             rule: "r".into(),
             input: "reading".into(),
@@ -176,9 +175,9 @@ mod tests {
     fn combines_denials_without_losing_feedback_or_changing_order() {
         let program = parse(
             r#"
-            rule allow_first { trigger always; require false; enforce allow; }
-            rule deny { trigger always; require false; enforce deny report "blocked"; }
-            rule allow_last { trigger always; require false; enforce allow report "continue"; }
+            rule allow_first { require false; enforce allow; }
+            rule deny { require false; enforce deny report "blocked"; }
+            rule allow_last { require false; enforce allow report "continue"; }
         "#,
         )
         .unwrap();

@@ -56,10 +56,10 @@ pub enum TokenKind {
     Maxage,
 
     // Trigger syntax
+    #[token("@")]
+    At,
     #[token("always")]
     Always,
-    #[token("capability")]
-    Capability,
 
     // Enforcement syntax
     #[token("allow")]

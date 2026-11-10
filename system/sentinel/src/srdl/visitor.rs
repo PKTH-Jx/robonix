@@ -32,8 +32,8 @@ pub trait Visitor<'ast> {
         walk_select_step(self, step)
     }
 
-    fn visit_trigger(&mut self, _trigger: &'ast TriggerClause) -> Result<(), Self::Error> {
-        Ok(())
+    fn visit_trigger(&mut self, trigger: &'ast TriggerClause) -> Result<(), Self::Error> {
+        walk_trigger(self, trigger)
     }
 
     fn visit_require(&mut self, require: &'ast RequireClause) -> Result<(), Self::Error> {
@@ -68,6 +68,9 @@ pub fn walk_program<'ast, V: Visitor<'ast> + ?Sized>(
     for rule in &program.rules {
         visitor.visit_rule(rule)?;
     }
+    for trigger in &program.triggers {
+        visitor.visit_trigger(trigger)?;
+    }
     Ok(())
 }
 
@@ -76,9 +79,6 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     rule: &'ast Rule,
 ) -> Result<(), V::Error> {
     visitor.visit_identifier(&rule.name)?;
-    for trigger in &rule.triggers {
-        visitor.visit_trigger(trigger)?;
-    }
     // Both condition kinds need the complete binding scope, regardless of source order.
     for input in &rule.inputs {
         visitor.visit_input(input)?;
@@ -93,6 +93,16 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
         visitor.visit_ensure(ensure)?;
     }
     visitor.visit_enforce(&rule.enforce)
+}
+
+pub fn walk_trigger<'ast, V: Visitor<'ast> + ?Sized>(
+    visitor: &mut V,
+    trigger: &'ast TriggerClause,
+) -> Result<(), V::Error> {
+    for name in &trigger.rules {
+        visitor.visit_identifier(name)?;
+    }
+    Ok(())
 }
 
 pub fn walk_context<'ast, V: Visitor<'ast> + ?Sized>(
@@ -212,9 +222,9 @@ mod tests {
             Ok(())
         }
 
-        fn visit_trigger(&mut self, _trigger: &TriggerClause) -> Result<(), Self::Error> {
+        fn visit_trigger(&mut self, trigger: &TriggerClause) -> Result<(), Self::Error> {
             self.events.push("trigger".into());
-            Ok(())
+            walk_trigger(self, trigger)
         }
 
         fn visit_enforce(&mut self, _enforce: &EnforceClause) -> Result<(), Self::Error> {
@@ -234,8 +244,8 @@ mod tests {
                 context string user = identity.user_id;
                 input from "source" select number reading = items[id = "sensor"].value maxage 1,
                     boolean ready maxage 2;
-                trigger always;
             }
+            trigger r @ always;
         "#,
         )
         .unwrap();
@@ -243,27 +253,25 @@ mod tests {
         visitor.visit_program(&program).unwrap();
         assert_eq!(
             visitor.events.join(" "),
-            "id:r trigger id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value id:user literal enforce"
+            "id:r id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value id:user literal enforce trigger id:r"
         );
     }
 
     #[test]
     fn propagates_errors_without_visiting_remaining_children() {
         let program =
-            parse("rule r { trigger always; require stop_here || false; enforce deny; }").unwrap();
+            parse("rule r { require stop_here || false; enforce deny; } trigger r @ always;")
+                .unwrap();
         let mut visitor = Recorder::default();
         assert_eq!(visitor.visit_program(&program), Err("stopped"));
-        assert_eq!(visitor.events, ["id:r", "trigger", "id:stop_here"]);
+        assert_eq!(visitor.events, ["id:r", "id:stop_here"]);
         let program = parse(
-            "rule r { trigger always; require true; ensure stop_here;
+            "rule r { require true; ensure stop_here;
                 ensure skipped; enforce deny; }",
         )
         .unwrap();
         let mut visitor = Recorder::default();
         assert_eq!(visitor.visit_program(&program), Err("stopped"));
-        assert_eq!(
-            visitor.events,
-            ["id:r", "trigger", "literal", "id:stop_here"]
-        );
+        assert_eq!(visitor.events, ["id:r", "literal", "id:stop_here"]);
     }
 }

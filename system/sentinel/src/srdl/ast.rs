@@ -1,10 +1,12 @@
 //! The Abstract Syntax Tree (AST) for the Sentinel Rule Definition Language (SRDL).
 
-/// An SRDL file, which contains a list of rules.
+/// An SRDL file containing reusable rules and their capability associations.
 #[derive(Debug)]
 pub struct Program {
     /// The list of rules in the program.
     pub rules: Vec<Rule>,
+    /// Top-level associations selecting which rules apply to capability calls.
+    pub triggers: Vec<TriggerClause>,
 }
 
 /// A rule in the SRDL language.
@@ -16,8 +18,6 @@ pub struct Rule {
     pub inputs: Vec<InputClause>,
     /// Bindings to the Executor's immutable context for this capability call.
     pub contexts: Vec<ContextClause>,
-    /// Alternative capability selectors; any match makes the rule applicable.
-    pub triggers: Vec<TriggerClause>,
     /// Preconditions evaluated before capability dispatch.
     pub requires: Vec<RequireClause>,
     /// Postconditions checked before accepting the capability's reported success.
@@ -91,9 +91,18 @@ pub enum SelectStep {
     },
 }
 
-/// Selects the capability invocations to which a rule applies.
+/// Associates every named rule with every listed capability selector.
 #[derive(Debug, PartialEq, Eq)]
-pub enum TriggerClause {
+pub struct TriggerClause {
+    /// Rule names resolved against the complete program when loading SRDL.
+    pub rules: Vec<Identifier>,
+    /// Alternative selectors; any match applies all named rules to the call.
+    pub capabilities: Vec<TriggerTarget>,
+}
+
+/// A capability selector on the right side of a trigger declaration.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TriggerTarget {
     /// Match every capability invocation, without scheduling checks itself.
     Always,
     /// Apply when the call's contract ID exactly equals the declared string.

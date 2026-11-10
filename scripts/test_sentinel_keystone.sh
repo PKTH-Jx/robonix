@@ -126,8 +126,8 @@ import sys
 
 with sqlite3.connect(sys.argv[1]) as database:
     admin_id = database.execute("SELECT user_id FROM users WHERE username = ?", ("admin",)).fetchone()[0]
-pathlib.Path(sys.argv[2]).write_text(f'''rule require_admin_user {{
-    trigger capability "robonix/system/executor/builtin/list_dir";
+pathlib.Path(sys.argv[2]).write_text(f'''trigger require_admin_user @ "robonix/system/executor/builtin/list_dir";
+rule require_admin_user {{
     context string user = identity.user_id;
     require user = {json.dumps(admin_id)};
     enforce deny report "Only the configured user may list the test workspace";
@@ -677,8 +677,8 @@ echo "PASS Keystone, Liaison, Pilot, Sentinel, and Executor are connected"
 kill "$EXECUTOR_PID"
 wait "$EXECUTOR_PID" 2>/dev/null || true
 cat >"$WORK/ensure.srdl" <<'RULES'
+trigger [write_checks, additional_write_check] @ "robonix/system/executor/builtin/write_file";
 rule write_checks {
-    trigger capability "robonix/system/executor/builtin/write_file";
     context boolean permitted = arguments.permitted;
     context boolean accepted = arguments.accepted;
     require permitted;
@@ -686,7 +686,6 @@ rule write_checks {
     enforce deny report "Write postcondition was not satisfied";
 }
 rule additional_write_check {
-    trigger capability "robonix/system/executor/builtin/write_file";
     require true;
     ensure true;
     enforce deny;

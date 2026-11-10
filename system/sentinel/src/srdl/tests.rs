@@ -1,6 +1,6 @@
 use super::ast::{
     BinaryOperator as B, EnforceBehavior, EnforceClause, Expression as E, Identifier, InputField,
-    InputType, Literal, Rule, SelectStep, TriggerClause, UnaryOperator as U,
+    InputType, Literal, Rule, SelectStep, TriggerTarget, UnaryOperator as U,
 };
 use super::{Error, ErrorKind, parse};
 
@@ -11,7 +11,7 @@ fn rule(body: &str) -> Result<Rule, Error> {
 fn input(selection: &str, maxage: &str) -> Result<InputField, Error> {
     Ok(rule(&format!(
         r#"input from "source" select number reading = {selection} maxage {maxage};
-        trigger always; require true; enforce deny;"#
+        require true; enforce deny;"#
     ))?
     .inputs
     .remove(0)
@@ -20,12 +20,10 @@ fn input(selection: &str, maxage: &str) -> Result<InputField, Error> {
 }
 
 fn condition(source: &str) -> Result<E, Error> {
-    Ok(
-        rule(&format!("trigger always; require {source}; enforce deny;"))?
-            .requires
-            .remove(0)
-            .expression,
-    )
+    Ok(rule(&format!("require {source}; enforce deny;"))?
+        .requires
+        .remove(0)
+        .expression)
 }
 
 fn name(value: &str) -> E {
@@ -62,10 +60,18 @@ fn parses_test_srdl() {
         assert_eq!(rule.enforce.behavior, EnforceBehavior::Deny);
     }
     assert!(matches!(
-        program.rules[0].triggers[0],
-        TriggerClause::Capability(_)
+        program.triggers[0].capabilities[0],
+        TriggerTarget::Capability(_)
     ));
-    assert_eq!(program.rules[1].triggers, [TriggerClause::Always]);
+    assert_eq!(
+        program.triggers[0].rules,
+        [Identifier("speed_not_exceed_10".into())]
+    );
+    assert_eq!(program.triggers[1].capabilities, [TriggerTarget::Always]);
+    assert_eq!(
+        program.triggers[1].rules,
+        [Identifier("speed_not_exceed_20".into())]
+    );
     assert!(parse("# no active rules\n").unwrap().rules.is_empty());
 }
 
@@ -189,27 +195,28 @@ fn rejects_invalid_expressions_and_partial_programs() {
         assert!(condition(source).is_err(), "accepted {source:?}");
     }
     assert!(parse("rule broken {").is_err());
-    let valid = "rule a { trigger always; require true; enforce deny; }";
+    let valid = "rule a { require true; enforce deny; }";
     assert!(parse(&format!("{valid} garbage")).is_err());
     assert!(parse(&format!("{valid} rule broken {{")).is_err());
     assert_eq!(
         condition("a @ b").unwrap_err().kind,
-        ErrorKind::InvalidToken
+        ErrorKind::Expected {
+            expected: "';'".into(),
+            found: "\"@\"".into()
+        }
     );
 }
 
 #[test]
-fn collects_multiple_inputs_triggers_and_requirements_in_any_order() {
+fn collects_multiple_inputs_and_requirements_in_any_order() {
     let program = parse(
         r#"
         rule limits {
             require velocity <= 0.5;
             enforce deny;
             input from "robonix/system/soma/get_health" select number velocity = snapshot.actuators[component_id = "left_wheel"].velocity maxage 0.1;
-            trigger capability "robonix/primitive/chassis/move";
             require motor_temp < 60;
             input from "robonix/system/soma/get_health" select number motor_temp = snapshot.actuators[component_id = "left_wheel"].motor_temp maxage 2;
-            trigger capability "robonix/primitive/quadruped/move";
         }
     "#,
     )
@@ -219,13 +226,6 @@ fn collects_multiple_inputs_triggers_and_requirements_in_any_order() {
     assert_eq!(rule.inputs[0].fields[0].name, Identifier("velocity".into()));
     assert_eq!(rule.inputs[1].fields[0].data_type, InputType::Number);
     assert_eq!(rule.inputs[1].fields[0].maxage, Some(2.0));
-    assert_eq!(
-        rule.triggers,
-        vec![
-            TriggerClause::Capability("robonix/primitive/chassis/move".into()),
-            TriggerClause::Capability("robonix/primitive/quadruped/move".into()),
-        ]
-    );
     assert_eq!(rule.requires.len(), 2);
     assert_eq!(
         rule.requires[0].expression,
@@ -241,20 +241,12 @@ fn collects_multiple_inputs_triggers_and_requirements_in_any_order() {
 fn accepts_statement_order_independently() {
     let clauses = [
         r#"input from "source" select number x = value maxage 1;"#,
-        "trigger always;",
         "require x > 0;",
         "enforce deny;",
     ];
-    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+    for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
         let parsed = rule(&order.map(|i| clauses[i]).join(" ")).unwrap();
-        assert_eq!(
-            (
-                parsed.inputs.len(),
-                parsed.triggers.len(),
-                parsed.requires.len()
-            ),
-            (1, 1, 1)
-        );
+        assert_eq!((parsed.inputs.len(), parsed.requires.len()), (1, 1));
     }
 }
 
@@ -264,7 +256,7 @@ fn groups_fields_with_independent_paths_and_maxage() {
         r#"require velocity > 0;
         input from "source" select number velocity = snapshot.velocity maxage 0.1,
             string label = snapshot.label maxage 2, boolean ready maxage 3;
-        trigger always; enforce deny;"#,
+        enforce deny;"#,
     )
     .unwrap();
     assert_eq!(parsed.inputs.len(), 1);
@@ -298,10 +290,7 @@ fn groups_fields_with_independent_paths_and_maxage() {
         r#"input from "source" select number x = value + 1 maxage 1;"#,
     ] {
         assert!(
-            rule(&format!(
-                "{declaration} trigger always; require true; enforce deny;"
-            ))
-            .is_err(),
+            rule(&format!("{declaration} require true; enforce deny;")).is_err(),
             "{declaration}"
         );
     }
@@ -310,11 +299,9 @@ fn groups_fields_with_independent_paths_and_maxage() {
         r#"input from "a" select number x maxage 1; input from "b" select number x maxage 2;"#,
     ] {
         assert_eq!(
-            rule(&format!(
-                "{declarations} trigger always; require true; enforce deny;"
-            ))
-            .unwrap_err()
-            .kind,
+            rule(&format!("{declarations} require true; enforce deny;"))
+                .unwrap_err()
+                .kind,
             ErrorKind::DuplicateInput("x".into())
         );
     }
@@ -323,8 +310,7 @@ fn groups_fields_with_independent_paths_and_maxage() {
 #[test]
 fn accepts_optional_maxage_per_field() {
     let parsed = rule(
-        r#"trigger always;
-        input from "source" select number first = reading,
+        r#"input from "source" select number first = reading,
             boolean bounded = ready maxage 2, string root;
         require true; enforce deny;"#,
     )
@@ -388,8 +374,7 @@ fn rejects_invalid_input_declarations() {
         r#"input from "source" select number v = items[id = "a" maxage 1;"#,
         r#"input number v from "source" maxage 1;"#,
     ] {
-        let source =
-            format!("rule invalid {{ {declaration} trigger always; require true; enforce deny; }}");
+        let source = format!("rule invalid {{ {declaration} require true; enforce deny; }}");
         assert!(parse(&source).is_err(), "accepted {declaration}");
     }
 }
@@ -397,20 +382,18 @@ fn rejects_invalid_input_declarations() {
 #[test]
 fn rejects_missing_semicolons_duplicate_inputs_and_invalid_clause_counts() {
     for body in [
-        "trigger always; check true; enforce deny;",
-        "trigger always; require true; action stop;",
-        "trigger always require true; enforce deny;",
-        "trigger always; require true enforce deny;",
-        "trigger always; require true; enforce deny",
-        "trigger always; require true; enforce deny;;",
-        "trigger always; require true; enforce deny; enforce deny;",
-        "trigger always; require true;",
-        "require true; enforce deny;",
-        "trigger always; enforce deny;",
+        "check true; enforce deny;",
+        "require true; action stop;",
+        "require true enforce deny;",
+        "require true; enforce deny",
+        "require true; enforce deny;;",
+        "require true; enforce deny; enforce deny;",
+        "require true;",
+        "enforce deny;",
         "",
         r#"input from "source" select number v = value maxage 1;
            input from "source" select number v = value maxage 2;
-           trigger always; require true; enforce deny;"#,
+           require true; enforce deny;"#,
     ] {
         assert!(
             parse(&format!("rule invalid {{ {body} }}")).is_err(),
@@ -420,24 +403,101 @@ fn rejects_missing_semicolons_duplicate_inputs_and_invalid_clause_counts() {
 }
 
 #[test]
+fn parses_top_level_triggers_with_single_items_and_lists() {
+    let program = parse(
+        r#"
+        trigger r1 @ "robot/move";
+        rule r1 { require true; enforce deny; }
+        trigger [r1, r2] @ capA;
+        trigger r2 @ ["robot/move", "robot/stop"];
+        rule r2 { require true; ensure true; enforce deny; }
+        trigger [r2, r1] @ ["robot/move", capB];
+        trigger [r1] @ [always];
+        trigger r2 @ "always";
+    "#,
+    )
+    .unwrap();
+    assert_eq!(program.rules.len(), 2);
+    assert_eq!(program.triggers.len(), 6);
+    for (trigger, (rules, capabilities)) in program.triggers.iter().zip([
+        (
+            vec!["r1"],
+            vec![TriggerTarget::Capability("robot/move".into())],
+        ),
+        (
+            vec!["r1", "r2"],
+            vec![TriggerTarget::Capability("capA".into())],
+        ),
+        (
+            vec!["r2"],
+            vec![
+                TriggerTarget::Capability("robot/move".into()),
+                TriggerTarget::Capability("robot/stop".into()),
+            ],
+        ),
+        (
+            vec!["r2", "r1"],
+            vec![
+                TriggerTarget::Capability("robot/move".into()),
+                TriggerTarget::Capability("capB".into()),
+            ],
+        ),
+        (vec!["r1"], vec![TriggerTarget::Always]),
+        (vec!["r2"], vec![TriggerTarget::Capability("always".into())]),
+    ]) {
+        assert_eq!(
+            trigger
+                .rules
+                .iter()
+                .map(|name| name.0.as_str())
+                .collect::<Vec<_>>(),
+            rules
+        );
+        assert_eq!(trigger.capabilities, capabilities);
+    }
+}
+
+#[test]
 fn rejects_invalid_trigger_syntax() {
     for trigger in [
         "trigger;",
-        "trigger move;",
-        "trigger always_extra;",
-        "trigger always() ;",
-        r#"trigger "always";"#,
-        r#"trigger always "source";"#,
-        "trigger capability;",
-        "trigger capability source;",
-        "trigger capability 1;",
-        "trigger capability always;",
-        r#"trigger capability "source" extra;"#,
-        r#"trigger capability "source" require true;"#,
-        "trigger always require true;",
+        "trigger r;",
+        "trigger always;",
+        r#"trigger capability "source";"#,
+        "trigger r @;",
+        "trigger r @ always",
+        "trigger r always;",
+        "trigger [] @ capA;",
+        "trigger r @ [];",
+        "trigger [r,] @ capA;",
+        "trigger r @ [capA,];",
+        "trigger [r r2] @ capA;",
+        "trigger r @ [capA capB];",
+        "trigger [[r]] @ capA;",
+        "trigger r @ [[capA]];",
+        "trigger [r @ capA;",
+        "trigger r @ [capA;",
+        "trigger r, r2 @ capA;",
+        "trigger r @ capA, capB;",
+        "trigger 1 @ capA;",
+        "trigger r @ 1;",
+        r#"trigger "r" @ capA;"#,
+        r#"trigger r @ "bad\uD800";"#,
     ] {
-        let source = format!("rule invalid {{ {trigger} require true; enforce deny; }}");
+        let source = format!("rule r {{ require true; enforce deny; }} {trigger}");
         assert!(parse(&source).is_err(), "accepted {trigger}");
+    }
+    for trigger in [
+        "trigger always;",
+        "trigger r @ capA;",
+        r#"trigger capability "capA";"#,
+    ] {
+        assert!(
+            parse(&format!(
+                "rule r {{ {trigger} require true; enforce deny; }}"
+            ))
+            .is_err()
+        );
     }
 }
 
@@ -450,8 +510,9 @@ fn contextual_keywords_remain_usable_as_names() {
         let program = parse(&format!(
             r#"rule {rule_name} {{
             input from "source" select number {input_name} = value maxage 1;
-            require {input_name} > {other}; trigger always; enforce deny;
-        }}"#
+            require {input_name} > {other}; enforce deny;
+        }}
+        trigger {rule_name} @ always;"#
         ))
         .unwrap();
         let rule = &program.rules[0];
@@ -477,7 +538,7 @@ fn parses_enforcement_behaviors_with_optional_reports() {
             (r#" report "等待\n\"用户\"\u0041""#, Some("等待\n\"用户\"A")),
         ] {
             let program = parse(&format!(
-                "rule response {{ enforce {keyword}{suffix}; trigger always; require false; }}"
+                "rule response {{ enforce {keyword}{suffix}; require false; }}"
             ))
             .unwrap();
             assert_eq!(
@@ -508,7 +569,7 @@ fn rejects_invalid_enforcement_behaviors_and_reports() {
         r#"enforce deny report "reason""#,
         r#"enforce deny report "\uD800";"#,
     ] {
-        let source = format!("rule invalid {{ trigger always; require false; {clause} }}");
+        let source = format!("rule invalid {{ require false; {clause} }}");
         assert!(parse(&source).is_err(), "accepted {clause}");
     }
 }
@@ -568,7 +629,7 @@ fn select_keyword_fields_preserve_delimiters_and_literal_rules() {
     ] {
         assert!(input(path, "1").is_err(), "{path}");
     }
-    assert!(parse("rule input { trigger always; require true; enforce deny; }").is_err());
+    assert!(parse("rule input { require true; enforce deny; }").is_err());
 }
 
 #[test]
@@ -623,7 +684,7 @@ fn rejects_invalid_numbers_consistently_in_all_contexts() {
 
 #[test]
 fn reports_the_original_error_inside_a_later_rule() {
-    let source = "rule first { trigger always; require true; enforce deny; }\nrule second {\n    trigger always\n    require true;\n    enforce deny;\n}";
+    let source = "rule first { require true; enforce deny; }\nrule second {\n    enforce deny\n    require true;\n}";
     let error = parse(source).unwrap_err();
     let start = source.rfind("require").unwrap();
     assert_eq!(error.span, start..start + "require".len());
@@ -643,7 +704,7 @@ fn reports_the_original_error_inside_a_later_rule() {
 
 #[test]
 fn reports_eof_and_unicode_locations() {
-    let source = "rule r { trigger always; require true; enforce deny; # end\n  ";
+    let source = "rule r { require true; enforce deny; # end\n  ";
     let error = parse(source).unwrap_err();
     assert_eq!(error.span, source.len()..source.len());
     assert_eq!((error.line, error.column), (2, 3));
@@ -654,11 +715,10 @@ fn reports_eof_and_unicode_locations() {
             found: "end of input".into(),
         }
     );
-    let error =
-        parse("rule r { trigger always; require \"温度\" @ 1; enforce deny; }").unwrap_err();
+    let error = parse("rule r { require \"温度\" ? 1; enforce deny; }").unwrap_err();
     assert_eq!(error.kind, ErrorKind::InvalidToken);
-    assert_eq!(error.span, 42..43);
-    assert_eq!((error.line, error.column), (1, 39));
+    assert_eq!(error.span, 26..27);
+    assert_eq!((error.line, error.column), (1, 23));
 }
 
 #[test]
@@ -666,20 +726,16 @@ fn distinguishes_duplicate_and_missing_clauses() {
     let source = r#"rule r {
         input from "source" select number x = value maxage 1;
         input from "source" select number x = value maxage 1;
-        trigger always; require true; enforce deny;
+        require true; enforce deny;
     }"#;
     let error = parse(source).unwrap_err();
     assert_eq!(error.kind, ErrorKind::DuplicateInput("x".into()));
     assert_eq!(error.span.start, source.rfind("input").unwrap());
-    let source = "rule r { trigger always; require true; enforce deny; enforce allow; }";
+    let source = "rule r { require true; enforce deny; enforce allow; }";
     let error = parse(source).unwrap_err();
     assert_eq!(error.kind, ErrorKind::DuplicateEnforce);
     assert_eq!(error.span.start, source.rfind("enforce").unwrap());
-    for (body, missing) in [
-        ("require true; enforce deny;", "trigger"),
-        ("trigger always; enforce deny;", "require"),
-        ("trigger always; require true;", "enforce"),
-    ] {
+    for (body, missing) in [("enforce deny;", "require"), ("require true;", "enforce")] {
         let source = format!("rule r {{ {body} }}");
         let error = parse(&source).unwrap_err();
         assert_eq!(error.kind, ErrorKind::MissingClause(missing));
@@ -689,7 +745,7 @@ fn distinguishes_duplicate_and_missing_clauses() {
 
 #[test]
 fn retains_report_and_argument_failures() {
-    let source = "rule r { trigger always; require true; enforce deny report 1; }";
+    let source = "rule r { require true; enforce deny report 1; }";
     let error = parse(source).unwrap_err();
     assert_eq!(
         error.kind,
@@ -699,7 +755,7 @@ fn retains_report_and_argument_failures() {
         }
     );
     assert_eq!(error.span.start, source.find('1').unwrap());
-    let source = r#"rule r { trigger always; require true; enforce deny report "\uD800"; }"#;
+    let source = r#"rule r { require true; enforce deny report "\uD800"; }"#;
     let error = parse(source).unwrap_err();
     assert_eq!(error.kind, ErrorKind::InvalidString);
     assert_eq!(&source[error.span], r#""\uD800""#);
@@ -719,7 +775,7 @@ fn distinguishes_numeric_comparison_and_limit_errors() {
     let error = parse(
         r#"rule r {
         input from "source" select number x = value maxage 0;
-        trigger always; require true; enforce deny;
+        require true; enforce deny;
     }"#,
     )
     .unwrap_err();
@@ -754,7 +810,7 @@ fn applies_condition_syntax_and_limits_to_postconditions() {
             ErrorKind::ExpressionTooDeep(128),
         ),
     ] {
-        let source = format!("trigger always; require true; ensure {expression}; enforce deny;");
+        let source = format!("require true; ensure {expression}; enforce deny;");
         assert_eq!(rule(&source).unwrap_err().kind, expected);
     }
 }
@@ -764,7 +820,6 @@ fn parses_only_basic_input_types() {
     let program = parse(
         r#"
         rule basic {
-            trigger always;
             input from "source" select number velocity = velocity maxage 0.1,
                 string mode = mode maxage 1, boolean ready = ready maxage 1;
             require ready && mode = "active" && velocity <= 1;
@@ -796,7 +851,6 @@ fn parses_only_basic_input_types() {
     ] {
         let source = format!(
             r#"rule invalid {{
-            trigger always;
             input from "source" select {data_type} reading = value maxage 1;
             require true;
             enforce deny;
@@ -819,7 +873,6 @@ fn parses_context_bindings_without_acquisition_or_freshness() {
         r#"rule r {
         require user_id = "alice" && ready && count > 0;
         context string user_id = identity.user_id;
-        trigger always;
         context boolean ready = identity.context.true;
         context number count = arguments.count;
         input from "source" select number context = context maxage 1;
@@ -867,7 +920,7 @@ fn parses_context_bindings_without_acquisition_or_freshness() {
     ] {
         assert!(
             parse(&format!(
-                "rule r {{ trigger always; {clause} require true; enforce deny; }}"
+                "rule r {{ {clause} require true; enforce deny; }}"
             ))
             .is_err(),
             "{clause}"

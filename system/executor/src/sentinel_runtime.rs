@@ -226,8 +226,8 @@ mod tests {
         assert!(SentinelRuntime::load(&path, atlas.clone()).is_err());
         std::fs::write(
             &path,
-            r#"rule guard {
-            trigger capability "move";
+            r#"trigger guard @ "move";
+            rule guard {
             context string user = identity.user_id;
             context boolean permitted = arguments.permitted;
             require user = "alice"; require permitted;

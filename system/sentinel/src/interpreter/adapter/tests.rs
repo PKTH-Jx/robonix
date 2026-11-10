@@ -22,7 +22,7 @@ use crate::{
 
 fn input_rule(capability: &str) -> Rule {
     parse(&format!(
-        r#"rule r {{ trigger always;
+        r#"rule r {{
             input from "{capability}" select number x = reading maxage 1;
             require x > 0; enforce deny; }}"#
     ))
@@ -232,7 +232,6 @@ async fn returns_a_prepared_dataset_without_evaluating_predicates_or_fetching_po
     fixture.serve_mcp().await;
     let program = parse(
         r#"rule r {
-        trigger always;
         context number limit = arguments.limit;
         input from "sensor/value" select number x = reading maxage 1;
         input from "sensor/slow" select number later;
@@ -279,21 +278,21 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
     let source = r#"
+        trigger [violation, passing] @ "robot/move";
+        trigger passing @ "robot/move";
+        trigger ignored @ "robot/stop";
         rule passing {
-            trigger capability "robot/move";
             context string user = identity.user_id;
             input from "sensor/value" select number x = reading, boolean ready = ready;
             require user = "alice" && ready && x > 0;
             enforce deny report "unused";
         }
         rule violation {
-            trigger capability "robot/move";
             input from "sensor/value" select number x = reading;
             require x < 0;
             enforce deny report "blocked";
         }
         rule ignored {
-            trigger capability "robot/stop";
             context string missing = unknown.field;
             require missing = "unused";
             enforce deny;
@@ -338,8 +337,8 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 
     let failed = SrdlInterpreter::new(
-        r#"rule failure {
-        trigger always;
+        r#"trigger failure @ always;
+        rule failure {
         input from "sensor/missing" select number x;
         require x > 0; enforce allow report "unused";
     }"#,
@@ -388,8 +387,8 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     ));
     assert!(matches!(
         SrdlInterpreter::new(
-            r#"rule invalid {
-        trigger capability "never/matches"; require unknown; enforce deny;
+            r#"trigger invalid @ "never/matches";
+        rule invalid { require unknown; enforce deny;
     }"#,
             fixture.adapter.atlas.clone()
         ),
@@ -420,7 +419,7 @@ async fn acquires_typed_field_groups_once_and_cleans_channels() {
         ),
     ] {
         let program = parse(&format!(
-            r#"rule r {{ trigger always;
+            r#"rule r {{
                 input from "sensor/{source}" select {fields};
                 require true; enforce deny; }}"#
         ))
@@ -463,7 +462,7 @@ async fn acquires_typed_field_groups_once_and_cleans_channels() {
         assert!(fixture.channels_empty().await);
     }
     let program = parse(
-        r#"rule r { trigger always;
+        r#"rule r {
             input from "sensor/value" select number velocity = reading maxage 1,
                 boolean ready = missing maxage 2;
             require true; enforce deny; }"#,
@@ -514,7 +513,7 @@ async fn rejects_type_mismatches_without_coercion_and_preserves_error_context() 
         ("number x", InputType::Number, "object"),
     ] {
         let program = parse(&format!(
-            r#"rule typed {{ trigger always;
+            r#"rule typed {{
             input from "sensor/value" select {field} maxage 1;
             require true; enforce deny; }}"#
         ))
@@ -549,8 +548,8 @@ async fn interpreter_checks_rules_concurrently_and_cancellation_releases_channel
     let source = (0..MAX_CONCURRENT_BINDINGS + 1)
         .map(|index| {
             format!(
-                r#"rule r{index} {{
-        trigger always;
+                r#"trigger r{index} @ always;
+        rule r{index} {{
         input from "sensor/slow" select number x;
         require x > 0; enforce deny;
     }}"#
@@ -595,13 +594,13 @@ async fn pool_retains_multiple_rules_and_reacquires_postcondition_inputs() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
     let source = r#"
+        trigger [contextual, measured] @ ["robot/pick", "robot/place"];
+        trigger measured @ "robot/pick";
         rule measured {
-            trigger capability "robot/pick";
             input from "sensor/value" select number x = reading maxage 1;
             require x = 42; ensure x = 42; enforce deny;
         }
         rule contextual {
-            trigger capability "robot/pick";
             context boolean ready = arguments.ready;
             require true; ensure ready; enforce deny;
         }
@@ -648,8 +647,8 @@ async fn pending_postconditions_wait_for_completion_and_cancel_with_their_owner(
     use crate::interpreter::SrdlInterpreter;
     let mut fixture = AtlasFixture::new().await;
     let entered = fixture.serve_mcp().await;
-    let source = r#"rule hold {
-        trigger always;
+    let source = r#"trigger hold @ always;
+        rule hold {
         input from "sensor/slow" select boolean ready;
         require true; ensure ready; enforce deny;
     }"#;
@@ -730,7 +729,7 @@ async fn prepare_inputs<'a>(
 
 fn rule(inputs: &str, requirements: &str) -> Rule {
     parse(&format!(
-        "rule r {{ trigger always; {inputs} {requirements} enforce pend; }}"
+        "rule r {{ {inputs} {requirements} enforce pend; }}"
     ))
     .unwrap()
     .rules

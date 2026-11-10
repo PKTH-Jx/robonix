@@ -5,6 +5,13 @@ Sentinel evaluates SRDL safety rules for capability calls. Executor checks
 success or starting dependent work. Denials and check failures reject the call;
 unmatched calls are allowed.
 
+Declare triggers outside rule blocks: `trigger safety @ "robot/move";` applies
+rule `safety` to that contract ID. Either side accepts a nonempty bracketed list;
+every listed rule applies to every listed capability. `@ always` matches all calls.
+Rules run once per call in definition order, including when triggers overlap.
+Rules without a trigger association do not run. Unknown rule references and
+duplicate rule definitions prevent loading.
+
 The Adapter binds context, acquires inputs, and returns a complete dataset after
 checking freshness. The evaluator calculates predicates atomically. A shared pool
 retains pending postconditions and schedules ready datasets in FIFO order;

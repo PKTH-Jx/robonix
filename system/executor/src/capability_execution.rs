@@ -435,7 +435,7 @@ mod tests {
         runtime.register_plan("postcondition-plan").await.unwrap();
         let contract = "robonix/system/executor/builtin/get_all_plans";
         let sentinel = SentinelRuntime::new(&format!(
-            "rule post {{ trigger capability \"{contract}\"; require true; ensure false; enforce deny; }}"
+            "trigger post @ \"{contract}\"; rule post {{ require true; ensure false; enforce deny; }}"
         ), atlas.clone()).unwrap();
         let target = CapabilityCall {
             call_id: "postcondition-call".into(),

@@ -84,7 +84,7 @@ mod tests {
 
     fn steps(path: &str) -> Vec<SelectStep> {
         parse(&format!(
-            r#"rule r {{ trigger always;
+            r#"rule r {{
             input from "source" select number x = {path} maxage 1;
             require true; enforce deny; }}"#
         ))
