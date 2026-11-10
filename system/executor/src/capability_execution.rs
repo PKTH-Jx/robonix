@@ -7,11 +7,11 @@ use crate::pb::executor::RtdlEvent;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::rtdl_events::{self, NodeEventContext};
-use crate::sentinel_runtime::{self, SENTINEL_PROVIDER_ID, SentinelIdentity, SentinelRuntime};
+use crate::sentinel_runtime::{self, SentinelIdentity, SentinelRuntime};
 use crate::verification::{self, VerificationPolicy};
 use robonix_atlas::client::AtlasClient;
 use robonix_scribe::{info, warn};
-use robonix_sentinel::Effect;
+use robonix_sentinel::interpreter::enforcer::Effect;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -95,21 +95,24 @@ pub(crate) async fn execute_call(
     let checked = tokio::select! {
         biased;
         _ = runtime.wait_cancelled(&node.plan_id) => None,
-        result = sentinel.check(SENTINEL_PROVIDER_ID, &call.contract_id, &call.args_json, &identity) => Some(result),
+        result = sentinel.begin(&node.plan_id, call, &identity) => Some(result),
     };
     let cancelled = checked.is_none() || runtime.is_cancelled(&node.plan_id).await;
-    let (allow, feedback) = match checked {
-        Some(Ok(result)) => (
+    let (allow, feedback, checks) = match checked {
+        Some(Ok((result, checks))) => (
             result.effect == Effect::Allow,
             sentinel_runtime::feedback(&result),
+            checks,
         ),
         Some(Err(error)) => (
             false,
             serde_json::json!({"effect":"deny", "context_error":error.to_string()}),
+            None,
         ),
-        None => (false, serde_json::json!({"cancelled":true})),
+        None => (false, serde_json::json!({"cancelled":true}), None),
     };
     if cancelled || !allow {
+        drop(checks);
         let state = if cancelled {
             RtdlNodeStateEnum::Canceled
         } else {
@@ -219,6 +222,36 @@ pub(crate) async fn execute_call(
         }
     };
 
+    let mut sentinel_detail = String::new();
+    let mut postcondition_failed = false;
+    if let Some(checks) =
+        checks.filter(|_| result.success && state == RtdlNodeStateEnum::Succeeded as u32)
+    {
+        let checked = tokio::select! {
+            biased;
+            _ = runtime.wait_cancelled(&node.plan_id) => None,
+            result = checks.ensure() => Some(result),
+        };
+        match checked {
+            Some(checked) => {
+                if !checked.reports.is_empty() {
+                    sentinel_detail = sentinel_runtime::feedback(&checked).to_string();
+                }
+                if checked.effect != Effect::Allow {
+                    postcondition_failed = true;
+                    result.success = false;
+                    result.error = format!("Sentinel postcondition failed: {sentinel_detail}");
+                    state = RtdlNodeStateEnum::Failed as u32;
+                }
+            }
+            None => {
+                result.success = false;
+                result.error = "cancelled during Sentinel postcondition check".into();
+                state = RtdlNodeStateEnum::Canceled as u32;
+            }
+        }
+    }
+
     let eligible_for_verification = result.success
         && state == RtdlNodeStateEnum::Succeeded as u32
         && !runtime.is_cancelled(&node.plan_id).await;
@@ -235,10 +268,11 @@ pub(crate) async fn execute_call(
             )
             .await;
         let _ = tx
-            .send(Ok(rtdl_events::node_state_from_result(
+            .send(Ok(rtdl_events::node_state(
                 &node,
-                result.clone(),
                 RtdlNodeStateEnum::Verifying as u32,
+                sentinel_detail,
+                Some(result.clone()),
             )))
             .await;
         log_success(call, &result);
@@ -285,16 +319,23 @@ pub(crate) async fn execute_call(
         .record_op_state(&node.plan_id, &node.op_id, state)
         .await;
     let _ = tx
-        .send(Ok(rtdl_events::node_state_from_result(
+        .send(Ok(rtdl_events::node_state(
             &node,
-            result.clone(),
             state,
+            sentinel_detail,
+            Some(result.clone()),
         )))
         .await;
     let failed = !result.success;
 
     if result.success {
         log_success(call, &result);
+    } else if postcondition_failed {
+        // Provider error payloads remain in feedback, not in the process log.
+        warn!(
+            "[executor] '{}' failed: Sentinel rejected completion",
+            call.contract_id
+        );
     } else {
         warn!("[executor] '{}' failed: {}", call.contract_id, result.error);
     }
@@ -377,6 +418,73 @@ mod tests {
 
     fn sentinel_runtime(atlas: &AtlasClient) -> SentinelRuntime {
         SentinelRuntime::new("", atlas.clone()).expect("empty SRDL policy")
+    }
+
+    #[tokio::test]
+    async fn failed_postcondition_blocks_success_and_overlapping_verification() {
+        let address = reserve_address();
+        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{address}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        let runtime = PlanRuntime::default();
+        runtime.register_plan("postcondition-plan").await.unwrap();
+        let contract = "robonix/system/executor/builtin/get_all_plans";
+        let sentinel = SentinelRuntime::new(&format!(
+            "rule post {{ trigger capability \"{contract}\"; require true; ensure false; enforce deny; }}"
+        ), atlas.clone()).unwrap();
+        let target = CapabilityCall {
+            call_id: "postcondition-call".into(),
+            provider_id: "executor".into(),
+            contract_id: contract.into(),
+            args_json: "{}".into(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let execution = execute_call(
+            &target,
+            NodeEventContext {
+                plan_id: "postcondition-plan".into(),
+                node_index: 0,
+                node_kind: RTDL_DO,
+                op_id: "post".into(),
+                description: "check completed call".into(),
+            },
+            tx,
+            atlas,
+            "executor".into(),
+            runtime,
+            sentinel,
+            SentinelIdentity::default(),
+            Arc::new(VerificationPolicy::new(
+                true,
+                vec![VerificationRule {
+                    target_contract_id: contract.into(),
+                    target_provider_id: None,
+                    verifier_provider_id: "missing_verifier".into(),
+                    verifier_args: serde_json::json!({}),
+                }],
+            )),
+        )
+        .await;
+        assert!(execution.failed);
+        assert!(execution.verifier.is_none());
+        let mut terminal = None;
+        while let Some(event) = rx.recv().await {
+            let node = event.unwrap().node_state.unwrap();
+            if let Some(result) = node.leaf_result {
+                terminal = Some((result, node.operator_detail));
+            }
+        }
+        let (result, detail) = terminal.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("postcondition-plan"));
+        assert!(result.error.contains("Sentinel postcondition failed"));
+        assert!(detail.contains("\"ensure\":true"));
+        server.abort();
     }
 
     /// Preserve verifier outcomes and fail closed if its background task cannot finish.

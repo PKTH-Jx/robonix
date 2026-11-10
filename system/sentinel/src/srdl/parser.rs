@@ -58,8 +58,8 @@ fn program(mut input: Tokens<'_>) -> IResult<'_, Program> {
     Ok((input, Program { rules }))
 }
 
-// Parse clauses in any order, requiring unique input names, at least one trigger
-// and requirement, and exactly one enforcement response. References remain unresolved.
+// Clauses may precede their bindings; references remain unresolved here.
+// Rules still require a trigger, a require clause, and one enforcement response.
 fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     let (mut input, (_, name, _)) = (
         match_token(TokenKind::Rule),
@@ -71,9 +71,10 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
     let mut contexts = Vec::new();
     let mut triggers = Vec::new();
     let mut requires = Vec::new();
+    let mut ensures = Vec::new();
     let mut enforce = None;
     let mut input_names = std::collections::BTreeSet::new();
-    // Group clauses by kind so requirements may precede their input declarations.
+    // Preserve order within each clause kind, independently of declaration order.
     while input.tok.first().map(|t| t.kind) != Some(TokenKind::RBrace) {
         match input.tok.first().map(|t| t.kind) {
             Some(TokenKind::Input) => {
@@ -105,6 +106,11 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
                 requires.push(clause);
                 input = rest;
             }
+            Some(TokenKind::Ensure) => {
+                let (rest, clause) = ensure_clause(input)?;
+                ensures.push(clause);
+                input = rest;
+            }
             Some(TokenKind::Enforce) if enforce.is_none() => {
                 let (rest, clause) = enforce_clause(input)?;
                 enforce = Some(clause);
@@ -117,7 +123,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             _ => {
                 return Err(Err::Error(expected(
                     &input,
-                    "input, context, trigger, require, or enforce",
+                    "input, context, trigger, require, ensure, or enforce",
                 )));
             }
         }
@@ -152,6 +158,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             contexts,
             triggers,
             requires,
+            ensures,
             enforce,
         },
     ))
@@ -276,6 +283,7 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Context
         | TokenKind::Trigger
         | TokenKind::Require
+        | TokenKind::Ensure
         | TokenKind::Enforce
         | TokenKind::From
         | TokenKind::Select
@@ -308,7 +316,7 @@ fn string_literal(input: Tokens<'_>) -> IResult<'_, String> {
 }
 
 // Grammar: trigger always | trigger capability "CONTRACT".
-// These alternatives describe dispatch-time checks; the rule consumes the semicolon.
+// Select invocations without assigning condition phases; the rule consumes the semicolon.
 fn trigger_clause(input: Tokens<'_>) -> IResult<'_, TriggerClause> {
     let (input, _) = match_token(TokenKind::Trigger)(input)?;
     match input.tok.first().map(|t| t.kind) {
@@ -320,10 +328,21 @@ fn trigger_clause(input: Tokens<'_>) -> IResult<'_, TriggerClause> {
     }
 }
 
-// Bound the expression's token count before building its potentially deep AST.
-// The enclosing rule consumes the semicolon after expression parsing stops.
-fn require_clause(input: Tokens) -> IResult<RequireClause> {
+fn require_clause(input: Tokens<'_>) -> IResult<'_, RequireClause> {
     let (input, _) = match_token(TokenKind::Require)(input)?;
+    let (input, expression) = condition_expression(input)?;
+    Ok((input, RequireClause { expression }))
+}
+
+fn ensure_clause(input: Tokens<'_>) -> IResult<'_, EnsureClause> {
+    let (input, _) = match_token(TokenKind::Ensure)(input)?;
+    let (input, expression) = condition_expression(input)?;
+    Ok((input, EnsureClause { expression }))
+}
+
+// Bound the token count before allocating a potentially deep condition AST.
+// The enclosing rule consumes the semicolon after expression parsing stops.
+fn condition_expression(input: Tokens<'_>) -> IResult<'_, Expression> {
     let count = input
         .tok
         .iter()
@@ -332,8 +351,7 @@ fn require_clause(input: Tokens) -> IResult<RequireClause> {
     if count > 1024 {
         return Err(Err::Failure(at(&input, ErrorKind::ExpressionTooLong(1024))));
     }
-    let (input, expression) = expression(input, 0, 0)?;
-    Ok((input, RequireClause { expression }))
+    expression(input, 0, 0)
 }
 
 // Grammar: enforce (allow | deny | pend) [report "TEXT"].
@@ -412,7 +430,7 @@ fn number_literal(input: Tokens<'_>) -> IResult<'_, f64> {
     Ok((input, value))
 }
 
-// Filters accept signed numeric constants directly; requirements represent unary minus
+// Filters accept signed numeric constants directly; condition clauses represent unary minus
 // as an expression node. Strings use the same escape decoding as other clauses.
 fn literal(input: Tokens<'_>) -> IResult<'_, Literal> {
     match input.tok.first().map(|token| token.kind) {

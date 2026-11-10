@@ -1,10 +1,17 @@
 //! Enforcement decisions and structured feedback for completed rule checks.
 
+use serde::{Deserialize, Serialize};
+
 use super::evaluator::{self, RuleResult};
-use crate::{
-    Effect,
-    srdl::ast::{EnforceBehavior, Rule},
-};
+use crate::srdl::ast::{EnforceBehavior, Rule};
+
+/// Capability-call decision returned by SRDL enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    Allow,
+    Deny,
+}
 
 /// An enforcement failure, separate from an input or requirement evaluation failure.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -16,9 +23,11 @@ pub enum Error {
 /// One rule's check and violation response, retained for feedback to the caller.
 #[derive(Debug)]
 pub struct RuleReport {
+    /// Whether these outcomes belong to postconditions rather than preconditions.
+    pub ensure: bool,
     /// The SRDL rule that produced this feedback.
     pub rule: String,
-    /// Requirement values in declaration order, or the failure that prevented calculation.
+    /// Predicate values in clause order, or the failure that prevented calculation.
     pub evaluation: Result<RuleResult, evaluator::Error>,
     /// The violation decision or enforcement failure; absent when enforce was not applied.
     pub enforcement: Option<Result<Effect, Error>>,
@@ -33,6 +42,22 @@ pub struct EnforcementResult {
     pub effect: Effect,
     /// All supplied rule results, in the caller's declaration order.
     pub reports: Vec<RuleReport>,
+}
+
+impl EnforcementResult {
+    /// Fail closed when the pool cannot produce the requested decision.
+    pub(super) fn failure(message: &'static str, ensure: bool) -> Self {
+        Self {
+            effect: Effect::Deny,
+            reports: vec![RuleReport {
+                rule: "sentinel".into(),
+                evaluation: Err(evaluator::Error::Pool(message)),
+                enforcement: None,
+                message: None,
+                ensure,
+            }],
+        }
+    }
 }
 
 /// Interprets enforce declarations without controlling execution or sending feedback.
@@ -64,6 +89,7 @@ impl Enforcer {
             }
             // Keep later feedback even after a denial so the caller sees every matched rule.
             reports.push(RuleReport {
+                ensure: false,
                 rule: rule.name.0.clone(),
                 evaluation,
                 enforcement,

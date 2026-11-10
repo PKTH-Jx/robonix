@@ -520,6 +520,7 @@ fn selects_keyword_named_fields_at_every_path_position() {
         "input",
         "trigger",
         "require",
+        "ensure",
         "enforce",
         "from",
         "select",
@@ -738,6 +739,24 @@ fn distinguishes_numeric_comparison_and_limit_errors() {
             .kind,
         ErrorKind::ExpressionTooDeep(128)
     );
+}
+
+#[test]
+fn applies_condition_syntax_and_limits_to_postconditions() {
+    for (expression, expected) in [
+        ("a < b < c".into(), ErrorKind::ChainedComparison),
+        (
+            vec!["a"; 600].join(" + "),
+            ErrorKind::ExpressionTooLong(1024),
+        ),
+        (
+            format!("{}a", "!".repeat(200)),
+            ErrorKind::ExpressionTooDeep(128),
+        ),
+    ] {
+        let source = format!("trigger always; require true; ensure {expression}; enforce deny;");
+        assert_eq!(rule(&source).unwrap_err().kind, expected);
+    }
 }
 
 #[test]

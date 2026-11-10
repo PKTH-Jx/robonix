@@ -42,12 +42,14 @@ pub enum Error {
 /// The cancellation future stops acquisition but allows cleanup to finish. Callers
 /// must keep polling this function until it returns; None means acquisition was cancelled.
 /// Connection and cleanup have fixed timeouts; the caller controls the overall acquisition deadline.
+/// Receipt notifies the scheduler before cleanup, while completion still waits for disconnect.
 pub async fn acquire(
     atlas: &AtlasClient,
     provider: &pb::CapabilityProvider,
     capability: &str,
     consumer_id: &str,
     cancelled: impl Future<Output = ()>,
+    received: impl FnOnce(Instant),
 ) -> Option<Result<Response, Error>> {
     let transport = match select_transport(provider, capability) {
         Ok(transport) => transport,
@@ -66,13 +68,13 @@ pub async fn acquire(
         Err(_) => return Some(Err(Error::TimedOut("Atlas connection"))),
     };
     let result = match transport {
-        pb::Transport::Mcp => mcp::acquire(&endpoint, capability, cancelled)
+        pb::Transport::Mcp => mcp::acquire(&endpoint, capability, cancelled, received)
             .await
             .map(|result| result.map_err(Error::Mcp)),
         pb::Transport::Grpc => tokio::select! {
             biased;
             _ = cancelled => None,
-            result = grpc::acquire(&endpoint, capability) => Some(result.map_err(Error::Grpc)),
+            result = grpc::acquire(&endpoint, capability, received) => Some(result.map_err(Error::Grpc)),
         },
         _ => unreachable!(),
     };

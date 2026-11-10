@@ -42,8 +42,14 @@ read-only unauthenticated query in either mode.
 
 Every `do` call runs the SRDL interpreter before dispatch. Rules are loaded
 and type-checked at startup; missing or invalid files stop startup. An empty
-file allows calls by default. Denials and check failures stop dispatch;
+file allows calls by default. The Sentinel pool worker starts during policy
+loading, before Executor accepts requests. Denials and check failures stop dispatch;
 node events carry the structured feedback in `operator_detail`.
+
+Matched `ensure` clauses acquire fresh inputs after successful synchronous or
+asynchronous execution. Their enforcement decision gates success, dependent work,
+and optional result verification. Rejection preserves the capability output;
+failure or cancellation discards pending checks. Physical effects are not rolled back.
 
 `robonix/system/sentinel/list_rules` and `replace_rules` are retained for
 SRDL rule reading and dynamic loading. Their handlers are not yet implemented.

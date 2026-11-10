@@ -3,9 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::interpreter::adapter::InputValue;
-use crate::srdl::ast::{
-    BinaryOperator, Expression, InputType, Literal, RequireClause, UnaryOperator,
-};
+use crate::srdl::ast::{BinaryOperator, Expression, InputType, Literal, UnaryOperator};
 
 /// Failures in expression calculation, distinct from a false requirement result.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -41,11 +39,11 @@ pub enum Error {
 }
 
 /// Calculate a safety condition; false is a violation, while Err means calculation failed.
-pub fn evaluate_requirement(
-    require: &RequireClause,
+pub(super) fn evaluate_condition(
+    expression: &Expression,
     inputs: &BTreeMap<String, Arc<InputValue>>,
 ) -> Result<bool, Error> {
-    boolean(evaluate(&require.expression, inputs)?)
+    boolean(evaluate(expression, inputs)?)
 }
 
 /// Recursively calculate an expression without mutating inputs or performing I/O.
@@ -155,7 +153,7 @@ mod tests {
     use super::*;
     use crate::srdl::parse;
 
-    fn requirement(source: &str) -> RequireClause {
+    fn condition(source: &str) -> Expression {
         parse(&format!(
             "rule r {{ trigger always; require {source}; enforce deny; }}"
         ))
@@ -164,6 +162,7 @@ mod tests {
         .remove(0)
         .requires
         .remove(0)
+        .expression
     }
 
     fn inputs() -> BTreeMap<String, Arc<InputValue>> {
@@ -208,7 +207,7 @@ mod tests {
             ("false || ready", Boolean(true)),
         ] {
             assert_eq!(
-                evaluate(&requirement(source).expression, &inputs).unwrap(),
+                evaluate(&condition(source), &inputs).unwrap(),
                 expected,
                 "{source}"
             );
@@ -225,16 +224,16 @@ mod tests {
             ("true && ready", true),
         ] {
             assert_eq!(
-                evaluate_requirement(&requirement(source), &inputs).unwrap(),
+                evaluate_condition(&condition(source), &inputs).unwrap(),
                 expected
             );
         }
         assert_eq!(
-            evaluate_requirement(&requirement("true && (1 / 0 > 0)"), &inputs),
+            evaluate_condition(&condition("true && (1 / 0 > 0)"), &inputs),
             Err(Error::DivisionByZero)
         );
         assert_eq!(
-            evaluate_requirement(&requirement("false || missing"), &inputs),
+            evaluate_condition(&condition("false || missing"), &inputs),
             Err(Error::UnknownInput("missing".into()))
         );
     }
@@ -289,14 +288,14 @@ mod tests {
             ("label.value", Error::UnsupportedExpression("field access")),
         ] {
             assert_eq!(
-                evaluate(&requirement(source).expression, &inputs),
+                evaluate(&condition(source), &inputs),
                 Err(expected),
                 "{source}"
             );
         }
         inputs.insert("x".into(), Arc::new(InputValue::Number(f64::NAN)));
         assert_eq!(
-            evaluate_requirement(&requirement("x != x"), &inputs),
+            evaluate_condition(&condition("x != x"), &inputs),
             Err(Error::NonFiniteNumber)
         );
         assert_eq!(
@@ -311,21 +310,15 @@ mod tests {
     #[test]
     fn requires_boolean_results_and_preserves_false_as_a_violation() {
         let inputs = inputs();
-        assert_eq!(
-            evaluate_requirement(&requirement("false"), &inputs),
-            Ok(false)
-        );
-        assert_eq!(
-            evaluate_requirement(&requirement("ready"), &inputs),
-            Ok(true)
-        );
+        assert_eq!(evaluate_condition(&condition("false"), &inputs), Ok(false));
+        assert_eq!(evaluate_condition(&condition("ready"), &inputs), Ok(true));
         for (source, actual) in [
             ("x + 1", InputType::Number),
             ("label", InputType::String),
             ("0 || ready", InputType::Number),
         ] {
             assert_eq!(
-                evaluate_requirement(&requirement(source), &inputs),
+                evaluate_condition(&condition(source), &inputs),
                 Err(Error::ExpectedBoolean(actual))
             );
         }

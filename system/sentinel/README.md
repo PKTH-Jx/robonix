@@ -1,29 +1,26 @@
 # Sentinel - capability-call policy
 
-Sentinel provides the transport-independent rule model and policy evaluation
-for capability calls. Executor evaluates the active rules immediately before
-dispatching each RTDL `do` node.
+Sentinel evaluates SRDL safety rules for capability calls. Executor checks
+`require` before dispatch and `ensure` after successful execution, before accepting
+success or starting dependent work. Denials and check failures reject the call;
+unmatched calls are allowed.
 
-SRDL rules match exact capability IDs or `always`, bind trusted call context
-and capability inputs, and evaluate requirements before enforcement. Any
-deny or check failure rejects the call; no matching rules allows it.
+The Adapter binds context, acquires inputs, and returns a complete dataset after
+checking freshness. The evaluator calculates predicates atomically. A shared pool
+retains pending postconditions and schedules ready datasets in FIFO order;
+input fetching uses rounds ordered by deadline.
 
-Runtime checks log matched rules, bound input and context values, requirement
-results, and the final decision at Info level. Evaluation failures use Warn.
-A `check_id` correlates concurrent checks. Executor writes these `[sentinel]`
-records to its log.
+Construct `SrdlInterpreter` inside Tokio. Use `begin` to check preconditions and
+retain the returned `CallChecks`; call `ensure` after successful execution, or
+drop the handle on failure or cancellation. Each condition group acquires fresh
+inputs while retaining the original call context. Rules still require `require`;
+`keep` and dynamic rule loading are not implemented.
 
-String values and provider error payloads are omitted. A background writer keeps
-log I/O off the evaluation path; its 1024-record queue drops records when full and
-reports the dropped count when the writer resumes. Queued records may be lost
-when the process exits.
+Runtime logs correlate checks using `check_id` and omit string values and provider
+error payloads.
 
-Executor loads SRDL once at startup. The `list_rules` and `replace_rules`
-capabilities are retained for SRDL reading and dynamic loading; their
-handlers are not yet implemented.
+Run the tests from the repository root:
 
-Run the policy tests from the repository root:
-
-```bash
+```sh
 cargo test -p robonix-sentinel
 ```

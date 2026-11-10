@@ -42,6 +42,8 @@ pub enum TokenKind {
     Trigger,
     #[token("require")]
     Require,
+    #[token("ensure")]
+    Ensure,
     #[token("enforce")]
     Enforce,
 

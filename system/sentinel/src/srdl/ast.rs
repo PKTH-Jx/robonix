@@ -16,10 +16,12 @@ pub struct Rule {
     pub inputs: Vec<InputClause>,
     /// Bindings to the Executor's immutable context for this capability call.
     pub contexts: Vec<ContextClause>,
-    /// Alternative events; any matching trigger makes the rule applicable.
+    /// Alternative capability selectors; any match makes the rule applicable.
     pub triggers: Vec<TriggerClause>,
-    /// Required safety conditions; all must hold for the rule to pass.
+    /// Preconditions evaluated before capability dispatch.
     pub requires: Vec<RequireClause>,
+    /// Postconditions checked before accepting the capability's reported success.
+    pub ensures: Vec<EnsureClause>,
     /// The response declared for a violated safety condition.
     pub enforce: EnforceClause,
 }
@@ -89,19 +91,26 @@ pub enum SelectStep {
     },
 }
 
-/// One alternative for checking a rule before capability dispatch.
+/// Selects the capability invocations to which a rule applies.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TriggerClause {
-    /// Apply before every capability call, without scheduling background checks.
+    /// Match every capability invocation, without scheduling checks itself.
     Always,
     /// Apply when the call's contract ID exactly equals the declared string.
     Capability(String),
 }
 
-/// One unevaluated safety condition; static type checking is a separate AST pass.
+/// An unevaluated precondition for admitting a capability call.
 #[derive(Debug)]
 pub struct RequireClause {
-    /// The required safety condition; false indicates a violation when the rule applies.
+    /// The Boolean condition checked before dispatch; false invokes the declared enforcement.
+    pub expression: Expression,
+}
+
+/// An unevaluated postcondition for accepting a capability's reported success.
+#[derive(Debug)]
+pub struct EnsureClause {
+    /// The expression to check before accepting successful completion.
     pub expression: Expression,
 }
 

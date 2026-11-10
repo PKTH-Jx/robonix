@@ -2,16 +2,20 @@
 
 use std::collections::BTreeMap;
 
-use super::visitor::{Visitor, walk_rule};
-use crate::srdl::ast::*;
+use crate::srdl::{
+    ast::*,
+    visitor::{Visitor, walk_rule},
+};
 
-/// A static type error located by rule and, when applicable, requirement number.
+/// A static type error located by rule and the affected precondition or postcondition.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TypeError {
     /// The rule containing the invalid declaration or expression.
     pub rule: String,
-    /// The one-based requirement number; None identifies a binding declaration error.
+    /// The one-based precondition index; None for bindings and postconditions.
     pub requirement: Option<usize>,
+    /// The one-based postcondition index; None for bindings and preconditions.
+    pub ensure: Option<usize>,
     /// The failed type constraint.
     pub kind: TypeErrorKind,
 }
@@ -21,6 +25,9 @@ impl std::fmt::Display for TypeError {
         write!(f, "rule '{}'", self.rule)?;
         if let Some(requirement) = self.requirement {
             write!(f, ", require #{requirement}")?;
+        }
+        if let Some(ensure) = self.ensure {
+            write!(f, ", ensure #{ensure}")?;
         }
         write!(f, ": {}", self.kind)
     }
@@ -37,6 +44,8 @@ pub enum TypeErrorKind {
     UnknownBinding(String),
     #[error("require must be boolean, found {0:?}")]
     NonBooleanRequire(InputType),
+    #[error("ensure must be boolean, found {0:?}")]
+    NonBooleanEnsure(InputType),
     #[error("unary operator {operator:?} does not accept {operand:?}")]
     InvalidUnary {
         /// The prefix operation being checked.
@@ -64,8 +73,10 @@ pub struct TypeChecker {
     bindings: BTreeMap<String, InputType>,
     /// The rule name used in diagnostics.
     rule: String,
-    /// The requirement currently being checked, if declarations are complete.
+    /// The current precondition index, cleared when checking postconditions.
     requirement: Option<usize>,
+    /// The current postcondition index, cleared when checking preconditions.
+    ensure: Option<usize>,
 }
 
 impl TypeChecker {
@@ -78,6 +89,7 @@ impl TypeChecker {
         TypeError {
             rule: self.rule.clone(),
             requirement: self.requirement,
+            ensure: self.ensure,
             kind,
         }
     }
@@ -158,6 +170,7 @@ impl<'ast> Visitor<'ast> for TypeChecker {
         self.bindings.clear();
         self.rule.clone_from(&rule.name.0);
         self.requirement = None;
+        self.ensure = None;
         walk_rule(self, rule)
     }
 
@@ -170,10 +183,21 @@ impl<'ast> Visitor<'ast> for TypeChecker {
     }
 
     fn visit_require(&mut self, require: &RequireClause) -> Result<(), TypeError> {
+        self.ensure = None;
         self.requirement = Some(self.requirement.unwrap_or(0) + 1);
         let actual = self.infer_expression(&require.expression)?;
         if actual != InputType::Boolean {
             return Err(self.error(TypeErrorKind::NonBooleanRequire(actual)));
+        }
+        Ok(())
+    }
+
+    fn visit_ensure(&mut self, ensure: &EnsureClause) -> Result<(), TypeError> {
+        self.requirement = None;
+        self.ensure = Some(self.ensure.unwrap_or(0) + 1);
+        let actual = self.infer_expression(&ensure.expression)?;
+        if actual != InputType::Boolean {
+            return Err(self.error(TypeErrorKind::NonBooleanEnsure(actual)));
         }
         Ok(())
     }
@@ -293,10 +317,65 @@ mod tests {
     }
 
     #[test]
+    fn checks_postcondition_types_and_bindings_independent_of_source_order() {
+        let source = |expression| {
+            format!(
+                r#"rule typed {{
+                ensure {expression};
+                require true;
+                trigger always;
+                context boolean ready = arguments.ready;
+                input from "source" select number x, string label;
+                enforce deny;
+            }}"#
+            )
+        };
+        for expression in ["ready", "x > 0 && label = \"held\"", "false"] {
+            TypeChecker::check(&parse(&source(expression)).unwrap()).unwrap();
+        }
+        for (expression, expected) in [
+            ("x", TypeErrorKind::NonBooleanEnsure(InputType::Number)),
+            ("label", TypeErrorKind::NonBooleanEnsure(InputType::String)),
+            ("missing", TypeErrorKind::UnknownBinding("missing".into())),
+            (
+                "ready + x > 0",
+                TypeErrorKind::InvalidBinary {
+                    operator: BinaryOperator::Add,
+                    left: InputType::Boolean,
+                    right: InputType::Number,
+                },
+            ),
+        ] {
+            let error = TypeChecker::check(&parse(&source(expression)).unwrap()).unwrap_err();
+            assert_eq!(error.kind, expected, "{expression}");
+            assert_eq!(error.requirement, None);
+            assert_eq!(error.ensure, Some(1));
+            assert!(error.to_string().starts_with("rule 'typed', ensure #1:"));
+        }
+    }
+
+    #[test]
+    fn numbers_postconditions_separately_and_resets_between_rules() {
+        let program = parse(
+            "rule first { trigger always; require true; ensure true; enforce deny; }
+             rule second { trigger always; require true; require false;
+                 ensure true; ensure missing; enforce deny; }",
+        )
+        .unwrap();
+        let error = TypeChecker::check(&program).unwrap_err();
+        assert_eq!(error.requirement, None);
+        assert_eq!(error.ensure, Some(2));
+        assert_eq!(
+            error.to_string(),
+            "rule 'second', ensure #2: unknown binding 'missing'"
+        );
+    }
+
+    #[test]
     fn isolates_rule_scopes_and_reports_requirement_number() {
         let first = r#"rule first { trigger always;
             input from "source" select number x = value maxage 1;
-            require x > 0; enforce deny; }"#;
+            require x > 0; ensure true; enforce deny; }"#;
         let second = "rule second { trigger always; require true; require x > 0; enforce deny; }";
         let program = parse(&format!("{first} {second}")).unwrap();
         assert_eq!(
@@ -304,6 +383,7 @@ mod tests {
             TypeError {
                 rule: "second".into(),
                 requirement: Some(2),
+                ensure: None,
                 kind: TypeErrorKind::UnknownBinding("x".into()),
             }
         );
@@ -370,6 +450,7 @@ mod tests {
             TypeError {
                 rule: "duplicate".into(),
                 requirement: None,
+                ensure: None,
                 kind: TypeErrorKind::DuplicateBinding("x".into()),
             }
         );

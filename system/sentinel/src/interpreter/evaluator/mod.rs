@@ -1,32 +1,37 @@
-//! Dependency-driven rule evaluation with synchronous expressions and input freshness checks.
+//! Invocation admission and atomic SRDL condition evaluation.
 
 pub mod expression;
+mod pool;
 
-mod context;
-mod dependencies;
-mod freshness;
+pub use super::adapter::ContextError;
 
-pub use context::Error as ContextError;
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-
-use futures::{Stream, StreamExt};
 use robonix_scribe::Level;
 use serde_json::Value;
-use tokio::time::{Instant, sleep_until};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
-use super::adapter::{AcquiredInput, InputAdapter, InputError, InputValue};
-use super::logging;
-use crate::srdl::ast::Rule;
-use dependencies::DependencyPlan;
-use freshness::Freshness;
+use self::pool::Pool;
+use super::{
+    NEXT_CHECK_ID,
+    adapter::{InputAdapter, InputError, Prepared},
+    enforcer::{Effect, EnforcementResult},
+    logging,
+};
+use crate::srdl::ast::{Program, Rule};
 
-const FIRST_INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPACITY: usize = 256;
+type CallKey = (String, String);
 
-/// Completed requirement values, in source declaration order.
+const RULE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Predicate results for one active clause group, in source declaration order.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuleResult {
-    /// True means the corresponding requirement holds for the acquired inputs.
+    /// True means the corresponding require or ensure expression holds.
     pub requirements: Vec<bool>,
 }
 
@@ -48,6 +53,8 @@ impl RuleResult {
 /// Failures that prevent a rule result, distinct from a false requirement.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Pool(&'static str),
     #[error(transparent)]
     Input(#[from] InputError),
     #[error("rule '{rule}', context '{binding}': {source}")]
@@ -60,19 +67,21 @@ pub enum Error {
         #[source]
         source: ContextError,
     },
-    #[error("rule '{rule}', require #{requirement}: {source}")]
+    #[error("rule '{rule}', {clause} #{requirement}: {source}")]
     Expression {
         /// The rule whose requirement could not be calculated.
         rule: String,
-        /// The one-based requirement index.
+        /// The condition keyword identifying preconditions or postconditions.
+        clause: &'static str,
+        /// The one-based index within that clause group.
         requirement: usize,
         /// The arithmetic, value or expression failure.
         #[source]
         source: expression::Error,
     },
-    #[error("rule '{rule}': first input timed out")]
-    FirstInputTimeout {
-        /// The rule still waiting for its first input result.
+    #[error("rule '{rule}': overall check timed out")]
+    Timeout {
+        /// The rule that exhausted its fixed activation budget.
         rule: String,
     },
     #[error("rule '{rule}', input '{input}': data exceeded maxage")]
@@ -103,149 +112,182 @@ pub enum Error {
     },
 }
 
-/// Evaluates one applicable rule while the Adapter acquires its input groups.
+/// Invocation lifecycle notifications serialized by the pool worker.
+enum Command {
+    /// Match rules, check `require`, and retain `ensure` clauses for successful completion.
+    Begin {
+        /// Plan and call IDs locating this invocation's rule entries.
+        key: CallKey,
+        /// Generation distinguishing this invocation from later reuse of its IDs.
+        check_id: u64,
+        /// Capability contract ID used for the single trigger-matching pass.
+        capability: String,
+        /// Atlas consumer identity used to acquire rule inputs.
+        consumer: Arc<str>,
+        /// Trusted arguments and identity shared by precondition and postcondition preparation.
+        context: Arc<Value>,
+        /// Owner-drop notification that cancels active and retained checks.
+        cancel: watch::Receiver<()>,
+        /// Returns the combined precondition decision before capability dispatch.
+        reply: oneshot::Sender<EnforcementResult>,
+        /// Admission slot retained until the invocation's cancellation watcher is retired.
+        permit: OwnedSemaphorePermit,
+    },
+    /// Report successful capability execution and activate the retained `ensure` checks.
+    Complete {
+        /// Plan and call IDs identifying the retained invocation.
+        key: CallKey,
+        /// Rejects completion notifications belonging to an earlier reuse of those IDs.
+        check_id: u64,
+        /// Returns the combined postcondition decision before execution success is accepted.
+        reply: oneshot::Sender<EnforcementResult>,
+    },
+}
+
+/// Retains the matched postconditions and cancels pool work when its owner drops it.
+pub struct CallChecks {
+    /// Invocation identity supplied by Executor.
+    key: CallKey,
+    /// Generation that binds completion to the original precondition check.
+    check_id: u64,
+    /// Bounded delivery of the successful completion notification.
+    sender: mpsc::Sender<Command>,
+    /// Dropping this sender cancels outstanding acquisition and pending entries.
+    _cancel: watch::Sender<()>,
+}
+
+impl CallChecks {
+    /// Check the retained postconditions using new observations after successful execution.
+    pub async fn ensure(self) -> EnforcementResult {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .sender
+            .send(Command::Complete {
+                key: self.key.clone(),
+                check_id: self.check_id,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return EnforcementResult::failure("Sentinel check pool stopped", true);
+        }
+        receive.await.unwrap_or_else(|_| {
+            EnforcementResult::failure("Sentinel postcondition check stopped", true)
+        })
+    }
+}
+
+/// Invocation admission and atomic predicate calculation through a shared pool worker.
 pub struct RuleEvaluator {
-    /// Input acquisition shared across evaluations, including its concurrency limit.
-    adapter: InputAdapter,
+    /// Delivers invocation notifications to the worker started during construction.
+    sender: mpsc::Sender<Command>,
+    /// Backpressure bounds active calls and their retained postconditions.
+    permits: Arc<Semaphore>,
 }
 
 impl RuleEvaluator {
-    pub(super) fn new(adapter: InputAdapter) -> Self {
-        Self { adapter }
+    pub(in crate::interpreter) fn new(adapter: InputAdapter, program: Arc<Program>) -> Self {
+        let (sender, receive) = mpsc::channel(CAPACITY);
+        tokio::spawn(async move {
+            Pool::new(&program, &adapter).run(receive).await;
+        });
+        Self {
+            sender,
+            permits: Arc::new(Semaphore::new(CAPACITY)),
+        }
     }
 
-    /// Calculate a rule result without matching triggers or executing enforce.
-    /// Any failure drops the input stream so the Adapter can cancel and clean up.
-    /// Context must be the Executor's trusted snapshot for this call, not provider data.
-    pub(super) async fn evaluate(
+    /// Wait for the combined precondition decision and return ownership of retained checks.
+    /// Dropping that ownership cancels work independently of command-channel capacity.
+    pub(in crate::interpreter) async fn begin(
         &self,
+        plan_id: &str,
+        call_id: &str,
+        capability: &str,
+        consumer: &str,
+        context: &Value,
+    ) -> (EnforcementResult, Option<CallChecks>) {
+        // Admission precedes enqueueing so retained calls and cancellation watchers share a bound.
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("private admission semaphore stays open");
+        let key = (plan_id.to_owned(), call_id.to_owned());
+        let check_id = NEXT_CHECK_ID.fetch_add(1, Ordering::Relaxed);
+        let (cancel, cancelled) = watch::channel(());
+        let handle = CallChecks {
+            key: key.clone(),
+            check_id,
+            sender: self.sender.clone(),
+            _cancel: cancel,
+        };
+        let (reply, receive) = oneshot::channel();
+        let command = Command::Begin {
+            key,
+            check_id,
+            capability: capability.to_owned(),
+            consumer: Arc::from(consumer),
+            context: Arc::new(context.clone()),
+            cancel: cancelled,
+            reply,
+            permit,
+        };
+        if self.sender.send(command).await.is_err() {
+            return (
+                EnforcementResult::failure("Sentinel check pool stopped", false),
+                None,
+            );
+        }
+        let result = receive.await.unwrap_or_else(|_| {
+            EnforcementResult::failure("Sentinel precondition check stopped", false)
+        });
+        let handle = (result.effect == Effect::Allow).then_some(handle);
+        (result, handle)
+    }
+
+    /// Evaluate one clause group synchronously against this snapshot.
+    pub(super) fn evaluate(
         check_id: u64,
         rule: &Rule,
-        consumer_id: &str,
-        context: &Value,
+        ensure: bool,
+        prepared: &Prepared,
     ) -> Result<RuleResult, Error> {
-        evaluate_inputs(
-            check_id,
-            context,
-            rule,
-            self.adapter.acquire(rule, consumer_id),
-        )
-        .await
-    }
-}
-
-async fn evaluate_inputs<'ast>(
-    check_id: u64,
-    context: &Value,
-    rule: &'ast Rule,
-    inputs: impl Stream<Item = Result<AcquiredInput<'ast>, InputError>>,
-) -> Result<RuleResult, Error> {
-    // SrdlInterpreter validates the immutable program before any rule is evaluated.
-    let mut values = context::bind(rule, context)?;
-    let mut plan = DependencyPlan::new(rule);
-    // Context is ready at the start and never participates in input acquisition deadlines.
-    for (name, value) in &values {
-        logging::log(
-            Level::Info,
-            format!(
-                "[sentinel] check_id={check_id} rule={:?} context={name:?} value={:?}",
-                rule.name.0,
-                logging::value(value)
-            ),
-        );
-        plan.arrived(name);
-    }
-    let mut freshness = Freshness::new(rule, Instant::now(), FIRST_INPUT_TIMEOUT)?;
-    evaluate_ready(check_id, rule, &mut plan, &values, &freshness)?;
-    tokio::pin!(inputs);
-    loop {
-        freshness.check(Instant::now())?;
-        let deadline = freshness.next_deadline();
-        let item = tokio::select! {
-            item = inputs.next() => item,
-            _ = async {
-                match deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => continue,
-        };
-        // A deadline and an input can become ready together; expiry must not depend on select order.
-        freshness.check(Instant::now())?;
-        let Some(item) = item else {
-            if !freshness.complete() {
-                return Err(Error::IncompleteInputs {
-                    rule: rule.name.0.clone(),
-                });
-            }
-            let requirements = plan
-                .requirements
-                .into_iter()
-                .map(|state| state.result)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| Error::IncompleteInputs {
-                    rule: rule.name.0.clone(),
-                })?;
-            return Ok(RuleResult { requirements });
-        };
-        let acquired = item?;
-        for selected in acquired.fields {
-            let name = selected.field.name.0.as_str();
-            logging::log(
-                Level::Info,
-                format!(
-                    "[sentinel] check_id={check_id} rule={:?} input={name:?} source={:?} value={:?} age_s={:?} maxage_s={:?}",
-                    rule.name.0,
-                    acquired.input.capability,
-                    logging::value(&selected.value),
-                    Instant::now()
-                        .checked_duration_since(acquired.acquired_at)
-                        .map(|age| age.as_secs_f64()),
-                    selected.field.maxage
-                ),
+        let clause = if ensure { "ensure" } else { "require" };
+        let expressions = rule
+            .requires
+            .iter()
+            .filter(|_| !ensure)
+            .map(|c| &c.expression)
+            .chain(
+                rule.ensures
+                    .iter()
+                    .filter(|_| ensure)
+                    .map(|c| &c.expression),
             );
-            if let std::collections::btree_map::Entry::Vacant(entry) = values.entry(name.to_owned())
-            {
-                freshness.record(name, acquired.acquired_at, Instant::now())?;
-                entry.insert(Arc::new(selected.value));
-                plan.arrived(name);
-            }
-        }
-        freshness.check(Instant::now())?;
-        evaluate_ready(check_id, rule, &mut plan, &values, &freshness)?;
-    }
-}
-
-fn evaluate_ready(
-    check_id: u64,
-    rule: &Rule,
-    plan: &mut DependencyPlan<'_>,
-    values: &BTreeMap<String, Arc<InputValue>>,
-    freshness: &Freshness<'_>,
-) -> Result<(), Error> {
-    for (index, state) in plan.requirements.iter_mut().enumerate() {
-        if state.remaining == 0 && state.result.is_none() {
-            freshness.check(Instant::now())?;
-            let result = expression::evaluate_requirement(&rule.requires[index], values).map_err(
-                |source| Error::Expression {
-                    rule: rule.name.0.clone(),
-                    requirement: index + 1,
-                    source,
-                },
-            )?;
-            state.result = Some(result);
+        let mut requirements = Vec::new();
+        for (index, expression) in expressions.enumerate() {
+            let result =
+                expression::evaluate_condition(expression, &prepared.values).map_err(|source| {
+                    Error::Expression {
+                        rule: rule.name.0.clone(),
+                        clause,
+                        requirement: index + 1,
+                        source,
+                    }
+                })?;
             logging::log(
                 Level::Info,
                 format!(
-                    "[sentinel] check_id={check_id} rule={:?} require={} result={result}",
+                    "[sentinel] check_id={check_id} rule={:?} {clause}={} result={result}",
                     rule.name.0,
                     index + 1
                 ),
             );
+            requirements.push(result);
         }
+        Ok(RuleResult { requirements })
     }
-    Ok(())
 }
-
-#[cfg(test)]
-mod tests;

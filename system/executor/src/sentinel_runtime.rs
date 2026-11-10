@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! Static SRDL policy loading, trusted call context and dispatch checks.
+//! SRDL policy loading and invocation-bound checks with trusted call context.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
+use crate::pb::pilot::CapabilityCall;
 use anyhow::{Context, Result};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_scribe::warn;
-use robonix_sentinel::interpreter::{SrdlInterpreter, enforcer::EnforcementResult};
+use robonix_sentinel::interpreter::{CallChecks, SrdlInterpreter, enforcer::EnforcementResult};
 use serde_json::{Map, Value};
 use tonic::{Request, Response, Status};
 
@@ -39,7 +40,7 @@ pub struct SentinelIdentity {
 /// Immutable SRDL policy and shared Atlas acquisition resources for all active plans.
 #[derive(Clone)]
 pub struct SentinelRuntime {
-    /// Shared interpreter; each check owns its context and rule evaluation state.
+    /// Shared interpreter with one pool for all admitted invocations.
     interpreter: Arc<SrdlInterpreter>,
 }
 
@@ -61,26 +62,35 @@ impl SentinelRuntime {
         })
     }
 
-    pub async fn check(
+    pub async fn begin(
         &self,
-        consumer_id: &str,
-        contract_id: &str,
-        args_json: &str,
+        plan_id: &str,
+        call: &CapabilityCall,
         identity: &SentinelIdentity,
-    ) -> Result<EnforcementResult, serde_json::Error> {
+    ) -> Result<(EnforcementResult, Option<CallChecks>), serde_json::Error> {
+        let context = Self::context(&call.args_json, identity)?;
+        Ok(self
+            .interpreter
+            .begin(
+                plan_id,
+                &call.call_id,
+                &call.contract_id,
+                SENTINEL_PROVIDER_ID,
+                &context,
+            )
+            .await)
+    }
+
+    fn context(args_json: &str, identity: &SentinelIdentity) -> Result<Value, serde_json::Error> {
         let arguments: Map<String, Value> = serde_json::from_str(args_json)?;
-        let context = serde_json::json!({
+        Ok(serde_json::json!({
             "arguments": arguments,
             "identity": {
                 "known": identity.known,
                 "user_id": if identity.known && !identity.user_id.is_empty() { Some(&identity.user_id) } else { None },
                 "roles": if identity.known { identity.roles.clone() } else { Vec::new() },
             },
-        });
-        Ok(self
-            .interpreter
-            .check(contract_id, consumer_id, &context)
-            .await)
+        }))
     }
 }
 
@@ -99,7 +109,7 @@ pub fn feedback(result: &EnforcementResult) -> Value {
                 Some(Err(error)) => (None, Some(error.to_string())),
                 None => (None, None),
             };
-            serde_json::json!({"rule":report.rule, "requirements":requirements,
+            serde_json::json!({"rule":report.rule, "ensure":report.ensure, "requirements":requirements,
             "violations":violations, "enforcement":enforcement, "report":report.message,
             "evaluation_error":evaluation_error, "enforcement_error":enforcement_error})
         })
@@ -196,7 +206,7 @@ impl RobonixSystemSentinelReplaceRules for SentinelServiceImpl {
 mod tests {
     use super::*;
     use robonix_atlas::service::{AtlasRegistry, serve_atlas};
-    use robonix_sentinel::Effect;
+    use robonix_sentinel::interpreter::enforcer::Effect;
 
     #[tokio::test]
     async fn loaded_rules_use_trusted_context_and_preserve_failure_feedback() {
@@ -240,10 +250,13 @@ mod tests {
             };
             let args = serde_json::json!({"permitted":permitted,"identity":{"user_id":"alice"}})
                 .to_string();
-            let decision = runtime
-                .check("sentinel", "move", &args, &identity)
-                .await
-                .unwrap();
+            let call = CapabilityCall {
+                call_id: "move".into(),
+                provider_id: "robot".into(),
+                contract_id: "move".into(),
+                args_json: args,
+            };
+            let (decision, _) = runtime.begin("plan", &call, &identity).await.unwrap();
             assert_eq!(decision.effect, effect);
             let report = &feedback(&decision)["reports"][0];
             if !known {
@@ -255,19 +268,18 @@ mod tests {
             }
         }
         let anonymous = SentinelIdentity::default();
-        let unmatched = runtime
-            .check("sentinel", "other", "{}", &anonymous)
-            .await
-            .unwrap();
+        let mut call = CapabilityCall {
+            call_id: "other".into(),
+            provider_id: "robot".into(),
+            contract_id: "other".into(),
+            args_json: "{}".into(),
+        };
+        let (unmatched, _) = runtime.begin("plan", &call, &anonymous).await.unwrap();
         assert_eq!(unmatched.effect, Effect::Allow);
         assert!(unmatched.reports.is_empty());
         for invalid in ["{", "[]", "null"] {
-            assert!(
-                runtime
-                    .check("sentinel", "move", invalid, &anonymous)
-                    .await
-                    .is_err()
-            );
+            call.args_json = invalid.into();
+            assert!(runtime.begin("plan", &call, &anonymous).await.is_err());
         }
         std::fs::remove_file(path).unwrap();
         server.abort();

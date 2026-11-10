@@ -1,8 +1,9 @@
-//! SRDL syntax trees, parsing and source-located diagnostics.
+//! SRDL syntax trees, parsing, traversal and source-located diagnostics.
 
 pub mod ast;
 mod lexer;
 mod parser;
+pub mod visitor;
 
 /// One SRDL error with a source range and a human-readable location.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

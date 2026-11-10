@@ -672,3 +672,78 @@ print("PASS shipped Webots SRDL seed allowed and blocked real write_file calls")
 PYDEMO
 
 echo "PASS Keystone, Liaison, Pilot, Sentinel, and Executor are connected"
+
+# Postconditions gate completion after the first write has physically happened.
+kill "$EXECUTOR_PID"
+wait "$EXECUTOR_PID" 2>/dev/null || true
+cat >"$WORK/ensure.srdl" <<'RULES'
+rule write_checks {
+    trigger capability "robonix/system/executor/builtin/write_file";
+    context boolean permitted = arguments.permitted;
+    context boolean accepted = arguments.accepted;
+    require permitted;
+    ensure accepted;
+    enforce deny report "Write postcondition was not satisfied";
+}
+rule additional_write_check {
+    trigger capability "robonix/system/executor/builtin/write_file";
+    require true;
+    ensure true;
+    enforce deny;
+}
+RULES
+ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
+  --atlas "$ATLAS_ADDR" --listen "$EXECUTOR_ADDR" \
+  --sentinel-listen "$SENTINEL_ADDR" --sentinel-rules "$WORK/ensure.srdl" \
+  --require-keystone false --id executor >"$EXECUTOR_LOG" 2>&1 &
+EXECUTOR_PID=$!
+wait_for_port "$EXECUTOR_ADDR" "$EXECUTOR_PID"
+PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYENSURE'
+import json
+import pathlib
+import sys
+import grpc
+import executor_pb2
+import pilot_pb2
+import robonix_contracts_pb2_grpc as contracts
+
+with grpc.insecure_channel(sys.argv[1]) as channel:
+    execute = contracts.RobonixSystemExecutorExecuteStub(channel)
+    streamed = contracts.RobonixSystemExecutorExecuteStreamStub(channel)
+    for use_stream in (False, True):
+        for permitted, accepted in ((False, True), (True, False), (True, True)):
+            name = f"ensure-{use_stream}-{permitted}-{accepted}"
+            paths = [f"{name}-first.txt", f"{name}-next.txt"]
+            leaves = [pilot_pb2.RtdlNode(
+                node_kind=2, op_id=f"write-{index}", description="write test evidence",
+                call=pilot_pb2.CapabilityCall(call_id=f"{name}:{index}", provider_id="executor",
+                    contract_id="robonix/system/executor/builtin/write_file",
+                    args_json=json.dumps({"path":path,"content":"executed",
+                        "permitted":permitted if index == 0 else True,
+                        "accepted":accepted if index == 0 else True})))
+                for index, path in enumerate(paths)]
+            root = pilot_pb2.RtdlNode(node_kind=0, op_id="sequence", description="check dependent execution")
+            if use_stream:
+                requests = [executor_pb2.ExecuteStreamInput(message_kind=0, plan_id=name),
+                    executor_pb2.ExecuteStreamInput(message_kind=1, node_index=0, node=root)]
+                requests.extend(executor_pb2.ExecuteStreamInput(message_kind=1, node_index=index,
+                    has_parent=True, parent_index=0, node=node) for index, node in enumerate(leaves, 1))
+                requests.extend([executor_pb2.ExecuteStreamInput(message_kind=2, node_index=0),
+                    executor_pb2.ExecuteStreamInput(message_kind=3)])
+                events = list(streamed.ExecuteStream(iter(requests), timeout=10))
+            else:
+                root.children.extend([1, 2])
+                events = list(execute.Execute(pilot_pb2.Plan(plan_id=name, nodes=[root, *leaves]), timeout=10))
+            assert (pathlib.Path(sys.argv[2]) / paths[0]).exists() == permitted
+            assert (pathlib.Path(sys.argv[2]) / paths[1]).exists() == (permitted and accepted)
+            nodes = [event.node_state for event in events if event.HasField("node_state")]
+            first = next(node for node in nodes if node.op_id == "write-0" and node.HasField("leaf_result"))
+            assert first.leaf_result.success == (permitted and accepted), first
+            if permitted and not accepted:
+                assert "Sentinel postcondition failed" in first.leaf_result.error
+                reports = json.loads(first.operator_detail)["reports"]
+                assert len(reports) == 2 and all(report["ensure"] for report in reports)
+            final = next(event.plan_complete for event in events if event.HasField("plan_complete"))
+            assert final.any_failed == (not (permitted and accepted))
+print("PASS require/ensure gated real writes and dependent execution on complete and streamed plans")
+PYENSURE

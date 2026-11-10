@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: MulanPSL-2.0
+
 //! Read-only AST traversal with fallible hooks.
 
-use crate::srdl::ast::*;
+use super::ast::*;
 
 /// Override individual hooks and use walk functions to visit their children.
 pub trait Visitor<'ast> {
@@ -38,6 +40,10 @@ pub trait Visitor<'ast> {
         walk_require(self, require)
     }
 
+    fn visit_ensure(&mut self, ensure: &'ast EnsureClause) -> Result<(), Self::Error> {
+        walk_ensure(self, ensure)
+    }
+
     fn visit_enforce(&mut self, _enforce: &'ast EnforceClause) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -73,7 +79,7 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     for trigger in &rule.triggers {
         visitor.visit_trigger(trigger)?;
     }
-    // All bindings are visited before requirements, independently of source order.
+    // Both condition kinds need the complete binding scope, regardless of source order.
     for input in &rule.inputs {
         visitor.visit_input(input)?;
     }
@@ -82,6 +88,9 @@ pub fn walk_rule<'ast, V: Visitor<'ast> + ?Sized>(
     }
     for require in &rule.requires {
         visitor.visit_require(require)?;
+    }
+    for ensure in &rule.ensures {
+        visitor.visit_ensure(ensure)?;
     }
     visitor.visit_enforce(&rule.enforce)
 }
@@ -136,6 +145,14 @@ pub fn walk_require<'ast, V: Visitor<'ast> + ?Sized>(
     require: &'ast RequireClause,
 ) -> Result<(), V::Error> {
     visitor.visit_expression(&require.expression)?;
+    Ok(())
+}
+
+pub fn walk_ensure<'ast, V: Visitor<'ast> + ?Sized>(
+    visitor: &mut V,
+    ensure: &'ast EnsureClause,
+) -> Result<(), V::Error> {
+    visitor.visit_expression(&ensure.expression)?;
     Ok(())
 }
 
@@ -211,6 +228,7 @@ mod tests {
         let program = parse(
             r#"
             rule r {
+                ensure user = "alice";
                 require !ready && f(reading + 1, target.value);
                 enforce deny;
                 context string user = identity.user_id;
@@ -225,7 +243,7 @@ mod tests {
         visitor.visit_program(&program).unwrap();
         assert_eq!(
             visitor.events.join(" "),
-            "id:r trigger id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value enforce"
+            "id:r trigger id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:ready id:f id:reading literal id:target id:value id:user literal enforce"
         );
     }
 
@@ -236,5 +254,16 @@ mod tests {
         let mut visitor = Recorder::default();
         assert_eq!(visitor.visit_program(&program), Err("stopped"));
         assert_eq!(visitor.events, ["id:r", "trigger", "id:stop_here"]);
+        let program = parse(
+            "rule r { trigger always; require true; ensure stop_here;
+                ensure skipped; enforce deny; }",
+        )
+        .unwrap();
+        let mut visitor = Recorder::default();
+        assert_eq!(visitor.visit_program(&program), Err("stopped"));
+        assert_eq!(
+            visitor.events,
+            ["id:r", "trigger", "literal", "id:stop_here"]
+        );
     }
 }

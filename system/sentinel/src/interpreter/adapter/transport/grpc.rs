@@ -1,6 +1,7 @@
 //! Typed gRPC acquisition for the supported system snapshot contracts.
 
 use anyhow::{Context, Result, bail};
+use tokio::time::Instant;
 use tonic::transport::Endpoint;
 
 use super::{CONTROL_TIMEOUT, Response};
@@ -21,7 +22,11 @@ pub(super) fn supports(capability: &str) -> bool {
 
 /// Call one supported snapshot RPC with an empty request, preserving its response structure.
 /// Source timestamps, TTL and stale flags remain data; this layer does not interpret them.
-pub(super) async fn acquire(endpoint: &str, capability: &str) -> Result<Response> {
+pub(super) async fn acquire(
+    endpoint: &str,
+    capability: &str,
+    received: impl FnOnce(Instant),
+) -> Result<Response> {
     use pb::contracts::{
         robonix_system_scene_get_robot_context_client::RobonixSystemSceneGetRobotContextClient,
         robonix_system_soma_get_health_client::RobonixSystemSomaGetHealthClient,
@@ -47,18 +52,21 @@ pub(super) async fn acquire(endpoint: &str, capability: &str) -> Result<Response
                 .get_health(pb::soma::GetHealthRequest {})
                 .await
                 .context("Soma GetHealth")?,
+            received,
         ),
         VITALS => decode(
             RobonixSystemVitalsGetClient::new(channel)
                 .get_vitals(pb::vitals::GetVitalsRequest {})
                 .await
                 .context("Vitals Get")?,
+            received,
         ),
         SCENE => decode(
             RobonixSystemSceneGetRobotContextClient::new(channel)
                 .get_robot_context(pb::semantic_map::GetRobotContextRequest {})
                 .await
                 .context("Scene GetRobotContext")?,
+            received,
         ),
         _ => unreachable!(),
     }
@@ -66,8 +74,12 @@ pub(super) async fn acquire(endpoint: &str, capability: &str) -> Result<Response
 
 /// Timestamp receipt before JSON conversion so decoding cannot refresh the data's age.
 /// Retain snapshot wrappers and arrays; absent optional messages serialize as null.
-fn decode<T: serde::Serialize>(response: tonic::Response<T>) -> Result<Response> {
+fn decode<T: serde::Serialize>(
+    response: tonic::Response<T>,
+    received: impl FnOnce(Instant),
+) -> Result<Response> {
     let acquired_at = tokio::time::Instant::now();
+    received(acquired_at);
     let value = serde_json::to_value(response.into_inner()).context("serialize gRPC response")?;
     Ok(Response { value, acquired_at })
 }
@@ -189,7 +201,7 @@ mod tests {
         let mut snapshots = Vec::new();
         for capability in [SOMA, VITALS, SCENE] {
             let started = Instant::now();
-            let response = timeout(CONTROL_TIMEOUT, acquire(&endpoint, capability))
+            let response = timeout(CONTROL_TIMEOUT, acquire(&endpoint, capability, |_| {}))
                 .await
                 .unwrap()
                 .unwrap();
@@ -209,13 +221,13 @@ mod tests {
             serde_json::json!(["room"])
         );
         fail_scene.store(true, Ordering::SeqCst);
-        let error = timeout(CONTROL_TIMEOUT, acquire(&endpoint, SCENE))
+        let error = timeout(CONTROL_TIMEOUT, acquire(&endpoint, SCENE, |_| {}))
             .await
             .unwrap()
             .unwrap_err();
         assert!(format!("{error:#}").contains("scene unavailable"));
         assert!(
-            acquire("not an endpoint", "unknown/capability")
+            acquire("not an endpoint", "unknown/capability", |_| {})
                 .await
                 .unwrap_err()
                 .to_string()
