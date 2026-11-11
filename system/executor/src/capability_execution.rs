@@ -99,6 +99,10 @@ pub(crate) async fn execute_call(
         result = sentinel.check(&node.plan_id, call, &identity, TriggerTiming::Before) => Some(result),
     };
     let cancelled = checked.is_none() || runtime.is_cancelled(&node.plan_id).await;
+    let admission_id = checked
+        .as_ref()
+        .and_then(|value| value.as_ref().ok())
+        .and_then(|value| value.admission_id);
     let (allow, feedback) = match checked {
         Some(Ok(result)) => (
             result.effect == Effect::Allow,
@@ -111,6 +115,7 @@ pub(crate) async fn execute_call(
         None => (false, serde_json::json!({"cancelled":true})),
     };
     if cancelled || !allow {
+        sentinel.finish(&node.plan_id, call, admission_id);
         let state = if cancelled {
             RtdlNodeStateEnum::Canceled
         } else {
@@ -220,6 +225,8 @@ pub(crate) async fn execute_call(
         }
     };
 
+    // Release on every execution outcome so failures cannot leave stale exclusions.
+    sentinel.finish(&node.plan_id, call, admission_id);
     let mut sentinel_detail = String::new();
     if result.success && state == RtdlNodeStateEnum::Succeeded as u32 {
         let checked = tokio::select! {
@@ -426,7 +433,7 @@ mod tests {
             runtime.register_plan("postcondition-plan").await.unwrap();
             let contract = format!("robonix/system/executor/builtin/{name}");
             let sentinel = SentinelRuntime::new(&format!(
-                "trigger post after \"{contract}\"; rule post {{ require {condition}; enforce deny report \"postcondition violated\"; }}"
+                "exclude mutual \"{contract}\" other; trigger post after \"{contract}\"; rule post {{ require {condition}; enforce deny report \"postcondition violated\"; }}"
             ), atlas.clone()).unwrap();
             let target = CapabilityCall {
                 call_id: "postcondition-call".into(),
@@ -448,7 +455,7 @@ mod tests {
                 atlas.clone(),
                 "executor".into(),
                 runtime,
-                sentinel,
+                sentinel.clone(),
                 SentinelIdentity::default(),
                 Arc::new(VerificationPolicy::new(false, Vec::new())),
             )
@@ -477,6 +484,19 @@ mod tests {
                 assert!(node.operator_detail.is_empty());
             }
             assert!(rx.recv().await.is_none());
+            let mut conflicting = target.clone();
+            conflicting.contract_id = "other".into();
+            let next = sentinel
+                .check(
+                    "next",
+                    &conflicting,
+                    &SentinelIdentity::default(),
+                    TriggerTiming::Before,
+                )
+                .await
+                .unwrap();
+            assert_eq!(next.effect, Effect::Allow);
+            sentinel.finish("next", &conflicting, next.admission_id);
         }
         server.abort();
     }

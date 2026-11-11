@@ -751,3 +751,63 @@ with grpc.insecure_channel(sys.argv[1]) as channel:
             assert final.any_failed == (not permitted)
 print("PASS before checks gated writes and after checks reported without blocking dependent execution")
 PYAFTER
+
+# Exclusions span real execution and are released on successful or failed completion.
+kill "$EXECUTOR_PID"
+wait "$EXECUTOR_PID" 2>/dev/null || true
+cat >"$WORK/exclude.srdl" <<'RULES'
+exclude mutual "robonix/system/executor/builtin/run_command" "robonix/system/executor/builtin/write_file";
+RULES
+ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
+  --atlas "$ATLAS_ADDR" --listen "$EXECUTOR_ADDR" \
+  --sentinel-listen "$SENTINEL_ADDR" --sentinel-rules "$WORK/exclude.srdl" \
+  --require-keystone false --id executor >"$EXECUTOR_LOG" 2>&1 &
+EXECUTOR_PID=$!
+wait_for_port "$EXECUTOR_ADDR" "$EXECUTOR_PID"
+PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYEXCLUDE'
+import concurrent.futures
+import json
+import pathlib
+import shlex
+import sys
+import time
+import grpc
+import pilot_pb2
+import robonix_contracts_pb2_grpc as contracts
+
+workspace = pathlib.Path(sys.argv[2])
+with grpc.insecure_channel(sys.argv[1]) as channel:
+    execute = contracts.RobonixSystemExecutorExecuteStub(channel)
+    def run(plan_id, capability, args):
+        plan = pilot_pb2.Plan(plan_id=plan_id, nodes=[pilot_pb2.RtdlNode(
+            node_kind=2, op_id="call", description="test exclusions",
+            call=pilot_pb2.CapabilityCall(call_id=plan_id, provider_id="executor",
+                contract_id=f"robonix/system/executor/builtin/{capability}", args_json=json.dumps(args)))])
+        events = list(execute.Execute(plan, timeout=10))
+        return next(event.node_state.leaf_result for event in events
+            if event.HasField("node_state") and event.node_state.HasField("leaf_result"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as workers:
+        marker = workspace / "exclude-started"
+        release = workspace / "exclude-release"
+        running = workers.submit(run, "hold", "run_command",
+            {"command":f"touch {shlex.quote(str(marker))}; while ! test -e {shlex.quote(str(release))}; do sleep 0.05; done"})
+        path = "exclude-write.txt"
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists():
+                assert time.monotonic() < deadline, "command did not start"
+                time.sleep(0.01)
+            denied = run("blocked", "write_file", {"path":path,"content":"blocked"})
+            assert not denied.success and "replan required" in denied.error, denied
+            assert not (workspace / path).exists()
+        finally:
+            release.touch()
+        assert running.result().success
+        allowed = run("released", "write_file", {"path":path,"content":"allowed"})
+        assert allowed.success and (workspace / path).exists(), allowed
+        failed = run("failed", "run_command", {})
+        assert not failed.success
+        after_failure = run("after-failure", "write_file", {"path":path,"content":"after failure"})
+        assert after_failure.success, after_failure
+print("PASS exclusions blocked concurrent plans without rules and released after success/failure")
+PYEXCLUDE

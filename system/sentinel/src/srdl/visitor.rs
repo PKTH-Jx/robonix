@@ -36,6 +36,10 @@ pub trait Visitor<'ast> {
         walk_trigger(self, trigger)
     }
 
+    fn visit_exclude(&mut self, _exclude: &'ast ExcludeClause) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn visit_require(&mut self, require: &'ast RequireClause) -> Result<(), Self::Error> {
         walk_require(self, require)
     }
@@ -66,6 +70,9 @@ pub fn walk_program<'ast, V: Visitor<'ast> + ?Sized>(
     }
     for trigger in &program.triggers {
         visitor.visit_trigger(trigger)?;
+    }
+    for exclude in &program.excludes {
+        visitor.visit_exclude(exclude)?;
     }
     Ok(())
 }
@@ -216,6 +223,11 @@ mod tests {
             self.events.push("enforce".into());
             Ok(())
         }
+
+        fn visit_exclude(&mut self, _exclude: &ExcludeClause) -> Result<(), Self::Error> {
+            self.events.push("exclude".into());
+            Ok(())
+        }
     }
 
     #[test]
@@ -231,6 +243,7 @@ mod tests {
                     boolean ready maxage 2;
             }
             trigger r before always;
+            exclude mutual A B;
         "#,
         )
         .unwrap();
@@ -238,7 +251,7 @@ mod tests {
         visitor.visit_program(&program).unwrap();
         assert_eq!(
             visitor.events.join(" "),
-            "id:r id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:user literal id:ready id:f id:reading literal id:target id:value enforce trigger id:r"
+            "id:r id:reading id:items id:id literal id:value id:ready id:user id:identity id:user_id id:user literal id:ready id:f id:reading literal id:target id:value enforce trigger id:r exclude"
         );
     }
 

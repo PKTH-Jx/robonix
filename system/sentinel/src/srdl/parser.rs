@@ -50,6 +50,7 @@ pub fn parse_srdl(input: Tokens<'_>) -> Result<Program, Error> {
 fn program(mut input: Tokens<'_>) -> IResult<'_, Program> {
     let mut rules = Vec::new();
     let mut triggers = Vec::new();
+    let mut excludes = Vec::new();
     // Preserve declaration errors instead of replacing them with trailing-input errors.
     while !input.tok.is_empty() {
         match input.tok[0].kind {
@@ -63,10 +64,22 @@ fn program(mut input: Tokens<'_>) -> IResult<'_, Program> {
                 triggers.push(clause);
                 (input, _) = match_token(TokenKind::Semicolon)(rest)?;
             }
-            _ => return Err(Err::Error(expected(&input, "rule or trigger"))),
+            TokenKind::Exclude => {
+                let (rest, clause) = exclude_clause(input)?;
+                excludes.push(clause);
+                (input, _) = match_token(TokenKind::Semicolon)(rest)?;
+            }
+            _ => return Err(Err::Error(expected(&input, "rule, trigger, or exclude"))),
         }
     }
-    Ok((input, Program { rules, triggers }))
+    Ok((
+        input,
+        Program {
+            rules,
+            triggers,
+            excludes,
+        },
+    ))
 }
 
 // Clauses may precede their bindings; references remain unresolved here.
@@ -273,6 +286,8 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Input
         | TokenKind::Context
         | TokenKind::Trigger
+        | TokenKind::Exclude
+        | TokenKind::Mutual
         | TokenKind::Require
         | TokenKind::Before
         | TokenKind::After
@@ -343,11 +358,31 @@ fn one_or_list<'a, T>(
 fn trigger_target(input: Tokens<'_>) -> IResult<'_, TriggerTarget> {
     match input.tok.first().map(|t| t.kind) {
         Some(TokenKind::Always) => Ok((input.take_from(1), TriggerTarget::Always)),
-        Some(TokenKind::StringLiteral) => {
-            map(string_literal, TriggerTarget::Capability).parse(input)
-        }
-        _ => map(identifier, |name| TriggerTarget::Capability(name.0)).parse(input),
+        _ => map(capability_id, TriggerTarget::Capability).parse(input),
     }
+}
+
+fn capability_id(input: Tokens<'_>) -> IResult<'_, String> {
+    if input.tok.first().map(|token| token.kind) == Some(TokenKind::StringLiteral) {
+        string_literal(input)
+    } else {
+        map(identifier, |name| name.0).parse(input)
+    }
+}
+
+fn exclude_clause(input: Tokens<'_>) -> IResult<'_, ExcludeClause> {
+    let (input, _) = match_token(TokenKind::Exclude)(input)?;
+    let mutual = input.tok.first().map(|token| token.kind) == Some(TokenKind::Mutual);
+    let input = if mutual { input.take_from(1) } else { input };
+    let (input, (source, target)) = (capability_id, capability_id).parse(input)?;
+    Ok((
+        input,
+        ExcludeClause {
+            source,
+            target,
+            mutual,
+        },
+    ))
 }
 
 fn require_clause(input: Tokens<'_>) -> IResult<'_, RequireClause> {
@@ -422,6 +457,8 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
     match token.kind {
         // Contextual keywords remain available as binding and field names.
         TokenKind::Identifier
+        | TokenKind::Exclude
+        | TokenKind::Mutual
         | TokenKind::Context
         | TokenKind::Always
         | TokenKind::Before

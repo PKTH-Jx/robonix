@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod enforcer;
 pub mod evaluator;
+mod exclusion;
 mod logging;
 pub mod trigger_matcher;
 pub mod type_checker;
@@ -15,8 +16,9 @@ use serde_json::Value;
 
 use self::{
     adapter::InputAdapter,
-    enforcer::EnforcementResult,
+    enforcer::{Effect, EnforcementResult},
     evaluator::RuleEvaluator,
+    exclusion::ExclusionProcessor,
     type_checker::{TypeChecker, TypeError},
 };
 use crate::srdl::{self, ast::TriggerTiming};
@@ -36,6 +38,8 @@ pub enum LoadError {
 pub struct SrdlInterpreter {
     /// Evaluates matched rules using the Adapter's shared acquisition concurrency limit.
     evaluator: RuleEvaluator,
+    /// Capability lifetime restrictions, independent of the rule pool.
+    exclusions: ExclusionProcessor,
 }
 
 impl SrdlInterpreter {
@@ -46,11 +50,12 @@ impl SrdlInterpreter {
         TypeChecker::check(&program)?;
         let adapter = InputAdapter::new(client);
         Ok(Self {
+            exclusions: ExclusionProcessor::new(&program.excludes),
             evaluator: RuleEvaluator::new(adapter, std::sync::Arc::new(program)),
         })
     }
 
-    /// Check one lifecycle event without retaining state between events.
+    /// Rules are independent per event; before checks also commit exclusion admission.
     pub async fn check(
         &self,
         plan_id: &str,
@@ -60,9 +65,37 @@ impl SrdlInterpreter {
         context: &Value,
         timing: TriggerTiming,
     ) -> EnforcementResult {
-        self.evaluator
+        // Check exclusions first
+        let admission = if timing == TriggerTiming::Before {
+            match self.exclusions.begin(plan_id, call_id, capability) {
+                Ok(admission) => admission,
+                Err(error) => return EnforcementResult::error(error, timing),
+            }
+        } else {
+            None
+        };
+        let mut decision = self
+            .evaluator
             .check(plan_id, call_id, capability, consumer_id, context, timing)
-            .await
+            .await;
+        // If the rule evaluation passed, enforce the exclusion admission decision.
+        if let Some(admission) = admission {
+            match admission.enforce(decision.effect == Effect::Allow) {
+                Ok(id) => decision.admission_id = id,
+                Err(error) => {
+                    decision.effect = Effect::Deny;
+                    decision
+                        .reports
+                        .extend(EnforcementResult::error(error, timing).reports);
+                }
+            }
+        }
+        decision
+    }
+
+    /// Release restrictions when the caller reports completion, including failure or cancellation.
+    pub fn finish(&self, plan_id: &str, call_id: &str, admission_id: u64) {
+        self.exclusions.finish(plan_id, call_id, admission_id);
     }
 
     /// Keep precondition and postcondition reports correlated without logging bound strings.

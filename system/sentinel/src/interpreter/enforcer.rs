@@ -38,6 +38,8 @@ pub struct RuleReport {
 /// Combined decision and rule feedback for one capability call.
 #[derive(Debug)]
 pub struct EnforcementResult {
+    /// Identifies a committed exclusion admission for an eventual completion notification.
+    pub admission_id: Option<u64>,
     /// Before checks may deny admission; after checks always allow and report their results.
     pub effect: Effect,
     /// All supplied rule results, in the caller's declaration order.
@@ -47,7 +49,12 @@ pub struct EnforcementResult {
 impl EnforcementResult {
     /// Pool failures deny admission but cannot change a completed execution's result.
     pub(super) fn failure(message: &'static str, timing: TriggerTiming) -> Self {
+        Self::error(evaluator::Error::Pool(message), timing)
+    }
+
+    pub(super) fn error(error: evaluator::Error, timing: TriggerTiming) -> Self {
         Self {
+            admission_id: None,
             effect: if timing == TriggerTiming::Before {
                 Effect::Deny
             } else {
@@ -55,7 +62,7 @@ impl EnforcementResult {
             },
             reports: vec![RuleReport {
                 rule: "sentinel".into(),
-                evaluation: Err(evaluator::Error::Pool(message)),
+                evaluation: Err(error),
                 enforcement: None,
                 message: None,
                 timing,
@@ -107,7 +114,11 @@ impl Enforcer {
                 message,
             });
         }
-        EnforcementResult { effect, reports }
+        EnforcementResult {
+            effect,
+            reports,
+            admission_id: None,
+        }
     }
 }
 

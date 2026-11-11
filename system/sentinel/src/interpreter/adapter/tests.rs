@@ -702,6 +702,85 @@ async fn pool_checks_events_independently_with_fresh_inputs() {
 }
 
 #[tokio::test]
+async fn exclusions_apply_without_rules_and_after_checks_do_not_release_them() {
+    use crate::interpreter::SrdlInterpreter;
+    let fixture = AtlasFixture::new().await;
+    let source = r#"exclude mutual A B;
+        trigger report after A;
+        rule report { require false; enforce deny report "observed violation"; }"#;
+    let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
+    let a = interpreter
+        .check("p", "a", "A", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(a.effect, Effect::Allow);
+    assert!(a.reports.is_empty());
+    let id = a.admission_id.unwrap();
+    let after = interpreter
+        .check("p", "a", "A", "test", &Value::Null, TriggerTiming::After)
+        .await;
+    assert_eq!(after.effect, Effect::Allow);
+    assert_eq!(
+        after.reports[0].message.as_deref(),
+        Some("observed violation")
+    );
+    let blocked = interpreter
+        .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(blocked.effect, Effect::Deny);
+    assert!(
+        blocked.reports[0]
+            .evaluation
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("replan required")
+    );
+    interpreter.finish("p", "a", id);
+    let b = interpreter
+        .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(b.effect, Effect::Allow);
+    interpreter.finish("q", "b", b.admission_id.unwrap());
+}
+
+#[tokio::test]
+async fn conflicting_arrival_invalidates_an_in_flight_rule_check() {
+    use crate::interpreter::SrdlInterpreter;
+    let mut fixture = AtlasFixture::new().await;
+    let entered = fixture.serve_mcp().await;
+    let source = r#"exclude mutual A B; trigger slow before A;
+        rule slow { input from "sensor/slow" select boolean ready; require ready; enforce deny; }"#;
+    let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
+    let mut first =
+        Box::pin(interpreter.check("p", "a", "A", "test", &Value::Null, TriggerTiming::Before));
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = &mut first => panic!("slow check finished before the conflicting arrival"),
+        }
+    })
+    .await
+    .unwrap();
+    let second = interpreter
+        .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(second.effect, Effect::Deny);
+    let first = timeout(Duration::from_secs(7), first).await.unwrap();
+    assert_eq!(first.effect, Effect::Deny);
+    assert!(
+        first
+            .reports
+            .iter()
+            .any(|report| matches!(report.evaluation, Err(Error::Exclusion { .. })))
+    );
+    let retry = interpreter
+        .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(retry.effect, Effect::Allow);
+    interpreter.finish("q", "b", retry.admission_id.unwrap());
+}
+
+#[tokio::test]
 async fn each_timing_cancels_acquisition_when_its_check_future_is_dropped() {
     use crate::interpreter::SrdlInterpreter;
     let mut fixture = AtlasFixture::new().await;

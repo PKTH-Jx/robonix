@@ -7,6 +7,19 @@ pub struct Program {
     pub rules: Vec<Rule>,
     /// Top-level associations selecting which rules apply to capability calls.
     pub triggers: Vec<TriggerClause>,
+    /// Directed capability restrictions, independent of predicate rules.
+    pub excludes: Vec<ExcludeClause>,
+}
+
+/// A directed exclusion, optionally expanded in both directions when loading.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExcludeClause {
+    /// Admitting this contract forbids new calls to the target contract.
+    pub source: String,
+    /// Contract forbidden while a source invocation remains admitted.
+    pub target: String,
+    /// Also forbid the source while a target invocation remains admitted.
+    pub mutual: bool,
 }
 
 /// A rule in the SRDL language.

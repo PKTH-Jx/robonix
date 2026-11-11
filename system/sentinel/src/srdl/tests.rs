@@ -76,6 +76,40 @@ fn parses_test_srdl() {
 }
 
 #[test]
+fn parses_exclusions_and_rejects_malformed_declarations() {
+    let program = parse(r#"exclude A B; exclude mutual "robot/A" "robot/B";"#).unwrap();
+    assert_eq!(
+        program.excludes,
+        [
+            super::ast::ExcludeClause {
+                source: "A".into(),
+                target: "B".into(),
+                mutual: false
+            },
+            super::ast::ExcludeClause {
+                source: "robot/A".into(),
+                target: "robot/B".into(),
+                mutual: true
+            },
+        ]
+    );
+    for source in [
+        "exclude;",
+        "exclude A;",
+        "exclude A B",
+        "exclude mutual A;",
+        "exclude A B C;",
+        "exclude [A] B;",
+        "exclude mutual A [B];",
+        "exclude 1 B;",
+        "exclude A B;;",
+        "rule r { exclude A B; require true; enforce deny; }",
+    ] {
+        assert!(parse(source).is_err(), "{source}");
+    }
+}
+
+#[test]
 fn preserves_precedence_and_left_associativity() {
     assert_eq!(
         condition("a || b && !c = -2 + 3 * 4").unwrap(),
@@ -593,6 +627,8 @@ fn rejects_invalid_enforcement_behaviors_and_reports() {
 #[test]
 fn selects_keyword_named_fields_at_every_path_position() {
     for keyword in [
+        "exclude",
+        "mutual",
         "rule",
         "input",
         "trigger",

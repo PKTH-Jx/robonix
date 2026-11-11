@@ -40,6 +40,10 @@ pub enum TokenKind {
     Context,
     #[token("trigger")]
     Trigger,
+    #[token("exclude")]
+    Exclude,
+    #[token("mutual")]
+    Mutual,
     #[token("require")]
     Require,
     #[token("enforce")]

@@ -53,6 +53,13 @@ impl RuleResult {
 /// Failures that prevent a rule result, distinct from a false requirement.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("capability '{capability}' conflicts with '{conflicting}'; replan required")]
+    Exclusion {
+        /// Contract whose admission was rejected.
+        capability: String,
+        /// Contract responsible for the exclusion conflict.
+        conflicting: String,
+    },
     #[error("{0}")]
     Pool(&'static str),
     #[error(transparent)]

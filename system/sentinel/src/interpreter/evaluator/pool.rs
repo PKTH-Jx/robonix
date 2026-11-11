@@ -184,6 +184,7 @@ impl<'a> Pool<'a> {
         );
         if rules.is_empty() {
             let decision = EnforcementResult {
+                admission_id: None,
                 effect: Effect::Allow,
                 reports: Vec::new(),
             };

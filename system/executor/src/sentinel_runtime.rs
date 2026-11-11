@@ -86,6 +86,13 @@ impl SentinelRuntime {
             .await)
     }
 
+    /// Release admission for a completed call independently of after-rule checking.
+    pub fn finish(&self, plan_id: &str, call: &CapabilityCall, admission_id: Option<u64>) {
+        if let Some(id) = admission_id {
+            self.interpreter.finish(plan_id, &call.call_id, id);
+        }
+    }
+
     fn context(args_json: &str, identity: &SentinelIdentity) -> Result<Value, serde_json::Error> {
         let arguments: Map<String, Value> = serde_json::from_str(args_json)?;
         Ok(serde_json::json!({

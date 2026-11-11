@@ -53,6 +53,12 @@ dependent work, or optional result verification. Failed or cancelled calls skip
 after checks. Both events submit the same check request; Sentinel retains no
 check state while the capability executes.
 
+Sentinel enforces `exclude` declarations across plans, including calls without rules.
+Executor releases admission whenever call handling returns, including failure and
+cancellation, before running after checks. Exclusions follow Executor's call lifecycle;
+a transport error or cancellation result does not confirm that a remote action stopped.
+Admission state is process-local; restart recovery is not implemented.
+
 `robonix/system/sentinel/list_rules` and `replace_rules` are retained for
 SRDL rule reading and dynamic loading. Their handlers are not yet implemented.
 
