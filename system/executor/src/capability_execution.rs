@@ -2,7 +2,7 @@
 // Author: wheatfox <wheatfox17@icloud.com>
 //! Execute one RTDL do node, including async polling and result verification.
 use crate::active_plans::PlanRuntime;
-use crate::dispatch::{async_poll, async_registry};
+use crate::dispatch::{self, leaf_terminal_state};
 use crate::pb::executor::RtdlEvent;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
@@ -67,19 +67,6 @@ struct OverlapVerifier {
     original: CapabilityCallResult,
 }
 
-/// Map a completed leaf call to its RTDL state. Cancellation wins over the
-/// provider result: a command terminated by cancel_plan normally returns
-/// success=false, but that is an expected CANCELED outcome, not a FAILED tool.
-fn leaf_terminal_state(success: bool, cancelled: bool) -> u32 {
-    if cancelled {
-        RtdlNodeStateEnum::Canceled as u32
-    } else if success {
-        RtdlNodeStateEnum::Succeeded as u32
-    } else {
-        RtdlNodeStateEnum::Failed as u32
-    }
-}
-
 /// Dispatch one RTDL `do` node and stream node_state events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_call(
@@ -93,26 +80,27 @@ pub(crate) async fn execute_call(
     identity: SentinelIdentity,
     verification: Arc<VerificationPolicy>,
 ) -> NodeExecution {
-    let checked = tokio::select! {
-        biased;
-        _ = runtime.wait_cancelled(&node.plan_id) => None,
-        result = sentinel.check(&node.plan_id, call, &identity, TriggerTiming::Before) => Some(result),
-    };
-    let cancelled = checked.is_none() || runtime.is_cancelled(&node.plan_id).await;
-    let admission_id = checked
-        .as_ref()
-        .and_then(|value| value.as_ref().ok())
-        .and_then(|value| value.admission_id);
+    let checked = sentinel
+        .check(
+            &node,
+            call,
+            &identity,
+            TriggerTiming::Before,
+            &runtime,
+            &provider_id,
+        )
+        .await;
+    let cancelled = runtime.is_cancelled(&node.plan_id).await;
+    let admission_id = checked.as_ref().ok().and_then(|value| value.admission_id);
     let (allow, feedback) = match checked {
-        Some(Ok(result)) => (
+        Ok(result) => (
             result.effect == Effect::Allow,
             sentinel_runtime::feedback(&result),
         ),
-        Some(Err(error)) => (
+        Err(error) => (
             false,
             serde_json::json!({"effect":"deny", "context_error":error.to_string()}),
         ),
-        None => (false, serde_json::json!({"cancelled":true})),
     };
     if cancelled || !allow {
         sentinel.finish(&node.plan_id, call, admission_id);
@@ -186,67 +174,36 @@ pub(crate) async fn execute_call(
             .await;
     }
 
-    let async_group = if call.provider_id == provider_id {
-        Ok(None)
-    } else {
-        async_registry::resolve_async_group(&mut atlas, &call.provider_id, &call.contract_id).await
-    };
+    let (mut result, mut state) =
+        dispatch::run_until_terminal(call, &provider_id, &mut atlas, &runtime, &node).await;
 
-    // Discovery and feedback delivery may yield after the Sentinel decision.
-    let async_group = if runtime.is_cancelled(&node.plan_id).await {
-        Err("cancelled before capability dispatch".to_owned())
-    } else {
-        async_group
-    };
-
-    let (mut result, mut state) = match async_group {
-        Err(error) => {
-            let r = CapabilityCallResult {
-                call_id: call.call_id.clone(),
-                provider_id: call.provider_id.clone(),
-                contract_id: call.contract_id.clone(),
-                success: false,
-                output: String::new(),
-                error,
-            };
-            (r, RtdlNodeStateEnum::Failed as u32)
-        }
-        Ok(Some(group)) => {
-            async_poll::run_until_terminal(call, &group, &provider_id, &mut atlas, &node, &runtime)
-                .await
-        }
-        Ok(None) => {
-            let r =
-                crate::dispatch::dispatch(call, &provider_id, &mut atlas, &runtime, &node.plan_id)
-                    .await;
-            let cancelled = runtime.is_cancelled(&node.plan_id).await;
-            let state = leaf_terminal_state(r.success, cancelled);
-            (r, state)
-        }
-    };
-
-    // Release on every execution outcome so failures cannot leave stale exclusions.
     sentinel.finish(&node.plan_id, call, admission_id);
     let mut sentinel_detail = String::new();
     if result.success && state == RtdlNodeStateEnum::Succeeded as u32 {
-        let checked = tokio::select! {
-            biased;
-            _ = runtime.wait_cancelled(&node.plan_id) => None,
-            result = sentinel.check(&node.plan_id, call, &identity, TriggerTiming::After) => Some(result),
-        };
-        match checked {
-            Some(Ok(checked)) => {
-                if !checked.reports.is_empty() {
-                    sentinel_detail = sentinel_runtime::feedback(&checked).to_string();
+        let checked = sentinel
+            .check(
+                &node,
+                call,
+                &identity,
+                TriggerTiming::After,
+                &runtime,
+                &provider_id,
+            )
+            .await;
+        if runtime.is_cancelled(&node.plan_id).await {
+            result.success = false;
+            result.error = "cancelled during Sentinel postcondition check".into();
+            state = RtdlNodeStateEnum::Canceled as u32;
+        } else {
+            match checked {
+                Ok(checked) => {
+                    if !checked.reports.is_empty() {
+                        sentinel_detail = sentinel_runtime::feedback(&checked).to_string();
+                    }
                 }
-            }
-            Some(Err(error)) => {
-                sentinel_detail = serde_json::json!({"effect":"allow", "timing":"after", "context_error":error.to_string()}).to_string();
-            }
-            None => {
-                result.success = false;
-                result.error = "cancelled during Sentinel postcondition check".into();
-                state = RtdlNodeStateEnum::Canceled as u32;
+                Err(error) => {
+                    sentinel_detail = serde_json::json!({"effect":"allow", "timing":"after", "context_error":error.to_string()}).to_string();
+                }
             }
         }
     }
@@ -433,7 +390,7 @@ mod tests {
             runtime.register_plan("postcondition-plan").await.unwrap();
             let contract = format!("robonix/system/executor/builtin/{name}");
             let sentinel = SentinelRuntime::new(&format!(
-                "exclude mutual \"{contract}\" other; trigger post after \"{contract}\"; rule post {{ require {condition}; enforce deny report \"postcondition violated\"; }}"
+                "exclude mutual \"{contract}\" other; trigger post after \"{contract}\"; rule post {{ require {condition}; enforce report \"postcondition violated\"; }}"
             ), atlas.clone()).unwrap();
             let target = CapabilityCall {
                 call_id: "postcondition-call".into(),
@@ -473,9 +430,19 @@ mod tests {
                 assert_eq!(detail["effect"], "allow");
                 let report = &detail["reports"][0];
                 assert_eq!(report["timing"], "after");
-                assert!(report["enforcement"].is_null());
+                assert_eq!(
+                    report["enforcement"],
+                    if condition == "false" {
+                        serde_json::json!("allow")
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
                 if condition == "false" {
-                    assert_eq!(report["report"], "postcondition violated");
+                    assert_eq!(
+                        detail["messages"],
+                        serde_json::json!(["postcondition violated"])
+                    );
                     assert_eq!(report["violations"], serde_json::json!([1]));
                 } else {
                     assert!(report["evaluation_error"].is_string());
@@ -488,10 +455,18 @@ mod tests {
             conflicting.contract_id = "other".into();
             let next = sentinel
                 .check(
-                    "next",
+                    &NodeEventContext {
+                        plan_id: "next".into(),
+                        node_index: 0,
+                        node_kind: RTDL_DO,
+                        op_id: "next".into(),
+                        description: "check released exclusion".into(),
+                    },
                     &conflicting,
                     &SentinelIdentity::default(),
                     TriggerTiming::Before,
+                    &PlanRuntime::default(),
+                    "executor",
                 )
                 .await
                 .unwrap();

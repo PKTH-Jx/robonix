@@ -6,6 +6,7 @@ mod pool;
 pub use super::adapter::ContextError;
 
 use std::{
+    collections::BTreeMap,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -18,7 +19,6 @@ use self::pool::Pool;
 use super::{
     NEXT_CHECK_ID,
     adapter::{InputAdapter, InputError, Prepared},
-    enforcer::EnforcementResult,
     logging,
 };
 use crate::srdl::ast::{Program, Rule, TriggerTiming};
@@ -27,6 +27,14 @@ const CAPACITY: usize = 256;
 type CallKey = (String, String, TriggerTiming);
 
 const RULE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Completed requirement checks handed back before any hook executes.
+pub(super) struct Evaluation {
+    /// Correlates input evaluation with the later enforcement log.
+    pub check_id: u64,
+    /// Source indices keep rule results in declaration order.
+    pub rules: BTreeMap<usize, Result<RuleResult, Error>>,
+}
 
 /// Predicate results for one triggered rule, in source declaration order.
 #[derive(Debug, PartialEq, Eq)]
@@ -126,13 +134,13 @@ struct Check {
     /// Contract used to select rules for this event.
     capability: String,
     /// Atlas consumer identity used to acquire inputs.
-    consumer: Arc<str>,
+    consumer: String,
     /// Trusted call arguments and identity for this event's conditions.
     context: Arc<Value>,
     /// Dropping the submitting future cancels acquisition and releases metadata.
     cancel: watch::Receiver<()>,
-    /// Delivers this event's combined enforcement result and reports.
-    reply: oneshot::Sender<EnforcementResult>,
+    /// Delivers requirement results without retaining the pool during hook execution.
+    reply: oneshot::Sender<Result<Evaluation, Error>>,
     /// Bounds active checks until their cancellation watcher is retired.
     permit: OwnedSemaphorePermit,
 }
@@ -146,7 +154,7 @@ pub struct RuleEvaluator {
 }
 
 impl RuleEvaluator {
-    pub(in crate::interpreter) fn new(adapter: InputAdapter, program: Arc<Program>) -> Self {
+    pub(in crate::interpreter) fn new(adapter: InputAdapter, program: Program) -> Self {
         let (sender, receive) = mpsc::channel(CAPACITY);
         tokio::spawn(async move {
             Pool::new(&program, &adapter).run(receive).await;
@@ -166,7 +174,7 @@ impl RuleEvaluator {
         consumer: &str,
         context: &Value,
         timing: TriggerTiming,
-    ) -> EnforcementResult {
+    ) -> Result<Evaluation, Error> {
         let permit = self
             .permits
             .clone()
@@ -181,18 +189,18 @@ impl RuleEvaluator {
             key: (plan_id.to_owned(), call_id.to_owned(), timing),
             check_id,
             capability: capability.to_owned(),
-            consumer: Arc::from(consumer),
+            consumer: consumer.to_owned(),
             context: Arc::new(context.clone()),
             cancel,
             reply,
             permit,
         };
         if self.sender.send(check).await.is_err() {
-            return EnforcementResult::failure("Sentinel check pool stopped", timing);
+            return Err(Error::Pool("Sentinel check pool stopped"));
         }
         receive
             .await
-            .unwrap_or_else(|_| EnforcementResult::failure("Sentinel rule check stopped", timing))
+            .unwrap_or_else(|_| Err(Error::Pool("Sentinel rule check stopped")))
     }
 
     /// Evaluate all conditions synchronously against this snapshot.

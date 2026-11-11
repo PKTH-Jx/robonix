@@ -130,7 +130,7 @@ pathlib.Path(sys.argv[2]).write_text(f'''trigger require_admin_user before "robo
 rule require_admin_user {{
     context string user = identity.user_id;
     require user = {json.dumps(admin_id)};
-    enforce deny report "Only the configured user may list the test workspace";
+    enforce deny, report "Only the configured user may list the test workspace";
 }}
 ''')
 PYRULE
@@ -682,16 +682,16 @@ trigger [write_after, additional_write_check] after "robonix/system/executor/bui
 rule write_before {
     context boolean permitted = arguments.permitted;
     require permitted;
-    enforce deny report "Write was not permitted";
+    enforce deny, report "Write was not permitted";
 }
 rule write_after {
     context boolean accepted = arguments.accepted;
     require accepted;
-    enforce deny report "Write postcondition was not satisfied";
+    enforce allow, report "Write postcondition was not satisfied";
 }
 rule additional_write_check {
     require true;
-    enforce deny;
+    enforce allow;
 }
 RULES
 ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
@@ -743,14 +743,99 @@ with grpc.insecure_channel(sys.argv[1]) as channel:
             assert first.leaf_result.success == permitted, first
             if permitted and not accepted:
                 assert first.leaf_result.success and not first.leaf_result.error
-                reports = json.loads(first.operator_detail)["reports"]
+                detail = json.loads(first.operator_detail)
+                reports = detail["reports"]
                 assert len(reports) == 2 and all(report["timing"] == "after" for report in reports)
-                assert reports[0]["report"] == "Write postcondition was not satisfied"
-                assert all(report["enforcement"] is None for report in reports)
+                assert detail["messages"] == ["Write postcondition was not satisfied"]
+                assert reports[0]["enforcement"] == "allow"
+                assert reports[1]["enforcement"] is None
             final = next(event.plan_complete for event in events if event.HasField("plan_complete"))
             assert final.any_failed == (not permitted)
 print("PASS before checks gated writes and after checks reported without blocking dependent execution")
 PYAFTER
+
+# Capability hooks run through Executor before admission and after successful writes.
+kill "$EXECUTOR_PID"
+wait "$EXECUTOR_PID" 2>/dev/null || true
+cat >"$WORK/hooks.srdl" <<'RULES'
+trigger [deny_write, call_before, fail_hook, allow_write] before "robonix/system/executor/builtin/write_file";
+trigger call_after after "robonix/system/executor/builtin/write_file";
+rule deny_write {
+    context boolean permitted = arguments.permitted;
+    require permitted;
+    enforce deny, report "write denied";
+}
+rule call_before {
+    require false;
+    enforce call "robonix/system/executor/builtin/get_all_plans", report "before call";
+}
+rule fail_hook {
+    context boolean fail = arguments.fail_hook;
+    require !fail;
+    enforce call "missing/capability", report "failed call";
+}
+rule allow_write {
+    require false;
+    enforce allow, report "allow retains denial";
+}
+rule call_after {
+    require false;
+    enforce call "robonix/system/executor/builtin/get_all_plans", report "after call";
+}
+RULES
+ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \
+  --atlas "$ATLAS_ADDR" --listen "$EXECUTOR_ADDR" \
+  --sentinel-listen "$SENTINEL_ADDR" --sentinel-rules "$WORK/hooks.srdl" \
+  --require-keystone false --id executor >"$EXECUTOR_LOG" 2>&1 &
+EXECUTOR_PID=$!
+wait_for_port "$EXECUTOR_ADDR" "$EXECUTOR_PID"
+PYTHONPATH="$PROTO_GEN${PYTHONPATH:+:$PYTHONPATH}" "$TEST_PYTHON" - "$EXECUTOR_ADDR" "$WORK" <<'PYHOOKS'
+import json
+import pathlib
+import sys
+import grpc
+import executor_pb2
+import pilot_pb2
+import robonix_contracts_pb2_grpc as contracts
+
+with grpc.insecure_channel(sys.argv[1]) as channel:
+    execute = contracts.RobonixSystemExecutorExecuteStub(channel)
+    streamed = contracts.RobonixSystemExecutorExecuteStreamStub(channel)
+    for use_stream in (False, True):
+        for permitted, fail_hook in ((True, False), (False, False), (True, True)):
+            name = f"hooks-{use_stream}-{permitted}-{fail_hook}"
+            path = f"{name}.txt"
+            node = pilot_pb2.RtdlNode(node_kind=2, op_id="write", description="test inherent hooks",
+                call=pilot_pb2.CapabilityCall(call_id=name, provider_id="executor",
+                    contract_id="robonix/system/executor/builtin/write_file",
+                    args_json=json.dumps({"path":path,"content":"executed",
+                        "permitted":permitted,"fail_hook":fail_hook})))
+            if use_stream:
+                requests = [executor_pb2.ExecuteStreamInput(message_kind=0, plan_id=name),
+                    executor_pb2.ExecuteStreamInput(message_kind=1, node_index=0, node=node),
+                    executor_pb2.ExecuteStreamInput(message_kind=3)]
+                events = list(streamed.ExecuteStream(iter(requests), timeout=10))
+            else:
+                events = list(execute.Execute(pilot_pb2.Plan(plan_id=name, nodes=[node]), timeout=10))
+            allowed = permitted and not fail_hook
+            assert (pathlib.Path(sys.argv[2]) / path).exists() == allowed
+            nodes = [event.node_state for event in events if event.HasField("node_state")]
+            terminal = next(node for node in nodes if node.HasField("leaf_result"))
+            assert terminal.leaf_result.success == allowed, terminal
+            details = [json.loads(node.operator_detail) for node in nodes if node.operator_detail]
+            before = details[0]
+            assert before["calls"][0]["success"] is True, before
+            assert before["messages"][-1] == "allow retains denial", before
+            assert before["effect"] == ("allow" if allowed else "deny"), before
+            if fail_hook:
+                assert before["calls"][1]["success"] is False, before
+                assert "found 0" in before["calls"][1]["error"], before
+            if allowed:
+                after = details[-1]
+                assert after["messages"] == ["after call"], after
+                assert after["calls"][0]["success"] is True, after
+print("PASS hook builders retained denial, executed recorded calls, and reported dispatch failures")
+PYHOOKS
 
 # Exclusions span real execution and are released on successful or failed completion.
 kill "$EXECUTOR_PID"

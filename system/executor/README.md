@@ -53,6 +53,19 @@ dependent work, or optional result verification. Failed or cancelled calls skip
 after checks. Both events submit the same check request; Sentinel retains no
 check state while the capability executes.
 
+Sentinel hooks build an admission decision, ordered report messages, and deferred
+capability calls. `SentinelRuntime` executes `call` requests through the same
+builtin/MCP dispatch and async status/cancel handling as plan calls. Calls use
+empty arguments and require exactly one matching MCP provider. Nested calls
+inherit the verified identity and undergo before and after Sentinel checks;
+nesting is limited to eight calls. A hook call failure denies before admission
+and appears in after feedback. Node feedback includes `messages` and `calls`
+with each recorded call's success or error. Report hook text appears only in
+`messages`; per-rule feedback contains evaluation and enforcement details.
+Cancellation interrupts evaluation
+and discovery. Initial hook capability discovery has a 250 ms deadline. Started
+calls use Executor's normal cancellation handling before checking ends.
+
 Sentinel enforces `exclude` declarations across plans, including calls without rules.
 Executor releases admission whenever call handling returns, including failure and
 cancellation, before running after checks. Exclusions follow Executor's call lifecycle;

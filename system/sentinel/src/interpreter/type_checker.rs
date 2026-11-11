@@ -1,6 +1,8 @@
 //! Static checks for trigger references and binding types, without resolving source schemas.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+
+use super::enforcer::hooks;
 
 use crate::srdl::{
     ast::*,
@@ -37,6 +39,15 @@ pub enum TypeErrorKind {
     DuplicateRule(String),
     #[error("trigger references unknown rule '{0}'")]
     UnknownRule(String),
+    #[error("hook '{hook}' is not valid for {timing:?} triggers")]
+    InvalidHookTiming {
+        /// Built-in response whose timing constraint was violated.
+        hook: &'static str,
+        /// Trigger lifecycle event incompatible with the hook.
+        timing: TriggerTiming,
+    },
+    #[error("{0}")]
+    InvalidHook(String),
     #[error("duplicate binding '{0}'")]
     DuplicateBinding(String),
     #[error("unknown binding '{0}'")]
@@ -162,9 +173,9 @@ impl<'ast> Visitor<'ast> for TypeChecker {
 
     fn visit_program(&mut self, program: &Program) -> Result<(), TypeError> {
         self.requirement = None;
-        let mut names = BTreeSet::new();
+        let mut names = BTreeMap::new();
         for rule in &program.rules {
-            if !names.insert(&rule.name.0) {
+            if names.insert(&rule.name.0, rule).is_some() {
                 self.rule.clone_from(&rule.name.0);
                 return Err(self.error(TypeErrorKind::DuplicateRule(rule.name.0.clone())));
             }
@@ -172,9 +183,18 @@ impl<'ast> Visitor<'ast> for TypeChecker {
         // Resolve after collecting all definitions so triggers may precede their rules.
         for trigger in &program.triggers {
             for name in &trigger.rules {
-                if !names.contains(&name.0) {
+                let Some(rule) = names.get(&name.0) else {
                     self.rule.clone_from(&name.0);
                     return Err(self.error(TypeErrorKind::UnknownRule(name.0.clone())));
+                };
+                for hook in hooks::bind(&rule.enforce) {
+                    if !hook.timings().contains(&trigger.timing) {
+                        self.rule.clone_from(&name.0);
+                        return Err(self.error(TypeErrorKind::InvalidHookTiming {
+                            hook: hook.name(),
+                            timing: trigger.timing,
+                        }));
+                    }
                 }
             }
         }
@@ -186,6 +206,15 @@ impl<'ast> Visitor<'ast> for TypeChecker {
         self.rule.clone_from(&rule.name.0);
         self.requirement = None;
         walk_rule(self, rule)
+    }
+
+    fn visit_enforce(&mut self, enforce: &EnforceClause) -> Result<(), TypeError> {
+        self.requirement = None;
+        for hook in hooks::bind(enforce) {
+            hook.validate()
+                .map_err(|error| self.error(TypeErrorKind::InvalidHook(error.to_string())))?;
+        }
+        Ok(())
     }
 
     fn visit_input_field(&mut self, input: &InputField) -> Result<(), TypeError> {
@@ -365,9 +394,49 @@ mod tests {
             ("1", false),
         ] {
             let program = parse(&format!(
-                "trigger r after capA; rule r {{ context boolean ready = arguments.ready; require {condition}; enforce deny; }}"
+                "trigger r after capA; rule r {{ context boolean ready = arguments.ready; require {condition}; enforce allow; }}"
             )).unwrap();
             assert_eq!(TypeChecker::check(&program).is_ok(), valid, "{condition}");
+        }
+    }
+
+    #[test]
+    fn validates_hook_arguments_and_every_trigger_binding() {
+        for source in [
+            "trigger r after A; rule r { require true; enforce deny; }",
+            "trigger r before A; trigger r after B; rule r { require true; enforce deny; }",
+            "rule r { require true; enforce deny; } trigger [r] after always;",
+            "trigger r after A; rule r { require true; enforce allow, report \"bad timing\", deny; }",
+        ] {
+            let error = TypeChecker::check(&parse(source).unwrap()).unwrap_err();
+            assert_eq!(error.rule, "r");
+            assert_eq!(error.requirement, None);
+            assert_eq!(
+                error.kind,
+                TypeErrorKind::InvalidHookTiming {
+                    hook: "deny",
+                    timing: TriggerTiming::After,
+                }
+            );
+        }
+        for behavior in [
+            "allow",
+            r#"call "robot/stop""#,
+            r#"report "observed", call "robot/stop", allow"#,
+        ] {
+            TypeChecker::check(&parse(&format!(
+                "trigger r before A; trigger r after B; rule r {{ require false; enforce {behavior}; }}"
+            )).unwrap()).unwrap();
+        }
+        for behavior in [r#"call """#, r#"call "  ""#] {
+            assert!(matches!(
+                TypeChecker::check(
+                    &parse(&format!("rule r {{ require false; enforce {behavior}; }}")).unwrap()
+                )
+                .unwrap_err()
+                .kind,
+                TypeErrorKind::InvalidHook(_)
+            ));
         }
     }
 

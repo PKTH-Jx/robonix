@@ -57,7 +57,7 @@ fn parses_test_srdl() {
             rule.requires[0].expression,
             binary(B::Lte, name("velocity"), number(limit))
         );
-        assert_eq!(rule.enforce.behavior, EnforceBehavior::Deny);
+        assert_eq!(rule.enforce.hooks[0], EnforceBehavior::Deny);
     }
     assert!(matches!(
         program.triggers[0].capabilities[0],
@@ -576,29 +576,32 @@ fn contextual_keywords_remain_usable_as_names() {
 }
 
 #[test]
-fn parses_enforcement_behaviors_with_optional_reports() {
-    for (keyword, behavior) in [
-        ("allow", EnforceBehavior::Allow),
-        ("deny", EnforceBehavior::Deny),
-        ("pend", EnforceBehavior::Pend),
+fn parses_ordered_enforcement_hooks() {
+    for (source, hooks) in [
+        ("allow", vec![EnforceBehavior::Allow]),
+        ("deny", vec![EnforceBehavior::Deny]),
+        (
+            r#"call "robot/stop""#,
+            vec![EnforceBehavior::Call("robot/stop".into())],
+        ),
+        (r#"report """#, vec![EnforceBehavior::Report("".into())]),
+        (
+            r#"deny, report "等待\n\"用户\"\u0041", allow, call "robot/stop", report "done""#,
+            vec![
+                EnforceBehavior::Deny,
+                EnforceBehavior::Report("等待\n\"用户\"A".into()),
+                EnforceBehavior::Allow,
+                EnforceBehavior::Call("robot/stop".into()),
+                EnforceBehavior::Report("done".into()),
+            ],
+        ),
     ] {
-        for (suffix, expected) in [
-            ("", None),
-            (r#" report """#, Some("")),
-            (r#" report "等待\n\"用户\"\u0041""#, Some("等待\n\"用户\"A")),
-        ] {
-            let program = parse(&format!(
-                "rule response {{ enforce {keyword}{suffix}; require false; }}"
-            ))
-            .unwrap();
-            assert_eq!(
-                program.rules[0].enforce,
-                EnforceClause {
-                    behavior,
-                    report: expected.map(str::to_owned),
-                }
-            );
-        }
+        assert_eq!(
+            rule(&format!("require false; enforce {source};"))
+                .unwrap()
+                .enforce,
+            EnforceClause { hooks }
+        );
     }
 }
 
@@ -606,9 +609,20 @@ fn parses_enforcement_behaviors_with_optional_reports() {
 fn rejects_invalid_enforcement_behaviors_and_reports() {
     for clause in [
         "enforce;",
+        "enforce pend;",
+        "enforce ,allow;",
+        "enforce allow,;",
+        "enforce allow,,deny;",
+        "enforce allow, report;",
+        "enforce deny, report 1;",
+        "enforce deny, report message;",
         "enforce stop;",
         "enforce deny_extra;",
         "enforce allow deny;",
+        "enforce call;",
+        "enforce call robot;",
+        "enforce call 1;",
+        r#"enforce call "robot/stop" "extra";"#,
         r#"enforce "allow";"#,
         "enforce deny report;",
         "enforce deny report 1;",
@@ -645,6 +659,7 @@ fn selects_keyword_named_fields_at_every_path_position() {
         "allow",
         "deny",
         "pend",
+        "call",
         "report",
         "true",
         "false",
@@ -799,7 +814,7 @@ fn distinguishes_duplicate_and_missing_clauses() {
 
 #[test]
 fn retains_report_and_argument_failures() {
-    let source = "rule r { require true; enforce deny report 1; }";
+    let source = "rule r { require true; enforce deny, report 1; }";
     let error = parse(source).unwrap_err();
     assert_eq!(
         error.kind,
@@ -809,7 +824,7 @@ fn retains_report_and_argument_failures() {
         }
     );
     assert_eq!(error.span.start, source.find('1').unwrap());
-    let source = r#"rule r { require true; enforce deny report "\uD800"; }"#;
+    let source = r#"rule r { require true; enforce deny, report "\uD800"; }"#;
     let error = parse(source).unwrap_err();
     assert_eq!(error.kind, ErrorKind::InvalidString);
     assert_eq!(&source[error.span], r#""\uD800""#);

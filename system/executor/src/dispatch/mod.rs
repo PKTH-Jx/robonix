@@ -36,8 +36,10 @@ use tonic::Request;
 use tonic::transport::Endpoint;
 
 use crate::pb::lifecycle::{DriverRequest, DriverResponse};
+use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::plan_runtime::PlanRuntime;
+use crate::rtdl_events::NodeEventContext;
 use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use robonix_scribe::{debug, info};
@@ -47,6 +49,58 @@ const DRIVER_ACTIVATE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEPLOY_CONSUMER_ID: &str = "com.robonix.executor.skill_activate";
 
 static ACTIVATED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Map a completed leaf call to its RTDL state. Cancellation wins over the
+/// provider result: a command terminated by cancel_plan normally returns
+/// success=false, but that is an expected CANCELED outcome, not a FAILED tool.
+pub(crate) fn leaf_terminal_state(success: bool, cancelled: bool) -> u32 {
+    if cancelled {
+        RtdlNodeStateEnum::Canceled as u32
+    } else if success {
+        RtdlNodeStateEnum::Succeeded as u32
+    } else {
+        RtdlNodeStateEnum::Failed as u32
+    }
+}
+
+/// Dispatch and track completion consistently for plan calls and Sentinel hooks.
+pub async fn run_until_terminal(
+    call: &CapabilityCall,
+    self_provider_id: &str,
+    atlas: &mut AtlasClient,
+    runtime: &PlanRuntime,
+    node: &NodeEventContext,
+) -> (CapabilityCallResult, u32) {
+    let group = if call.provider_id == self_provider_id {
+        Ok(None)
+    } else {
+        tokio::select! {
+            biased;
+            _ = runtime.wait_cancelled(&node.plan_id) => {
+                Err("cancelled before capability dispatch".to_owned())
+            }
+            group = async_registry::resolve_async_group(atlas, &call.provider_id, &call.contract_id) => group,
+        }
+    };
+    let group = if runtime.is_cancelled(&node.plan_id).await {
+        Err("cancelled before capability dispatch".to_owned())
+    } else {
+        group
+    };
+    match group {
+        Err(error) => (error_result(call, error), RtdlNodeStateEnum::Failed as u32),
+        Ok(Some(group)) => {
+            async_poll::run_until_terminal(call, &group, self_provider_id, atlas, node, runtime)
+                .await
+        }
+        Ok(None) => {
+            let result = dispatch(call, self_provider_id, atlas, runtime, &node.plan_id).await;
+            let state =
+                leaf_terminal_state(result.success, runtime.is_cancelled(&node.plan_id).await);
+            (result, state)
+        }
+    }
+}
 
 fn mark_activated(provider_id: &str) -> bool {
     let mut g = ACTIVATED.lock().expect("ACTIVATED poisoned");

@@ -139,24 +139,24 @@ pub struct RequireClause {
     pub expression: Expression,
 }
 
-/// The rule's single response when a safety requirement is violated.
+/// Ordered inherent hooks applied when a safety requirement is violated.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EnforceClause {
-    /// The declared disposition when a safety requirement is violated.
-    pub behavior: EnforceBehavior,
-    /// Optional static report text, with string escapes decoded during parsing.
-    pub report: Option<String>,
+    /// Nonempty sequence of hooks, retained in source declaration order.
+    pub hooks: Vec<EnforceBehavior>,
 }
 
-/// A declared violation response; the experimental Enforcer supports allow and deny.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One inherent hook declaration, bound to its implementation when rules load.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnforceBehavior {
     /// Permit the capability call despite the violated requirement.
     Allow,
     /// Reject the capability call.
     Deny,
-    /// Wait for user intervention before proceeding.
-    Pend,
+    /// Invoke this capability with empty arguments when a requirement is violated.
+    Call(String),
+    /// Append decoded static text to the enforcement feedback.
+    Report(String),
 }
 
 /// An unevaluated SRDL condition or operand.

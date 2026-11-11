@@ -4,5 +4,5 @@ trigger protect_demo_file before "robonix/system/executor/builtin/write_file";
 rule protect_demo_file {
     context string path = arguments.path;
     require path != "protected.txt";
-    enforce deny report "The demo blocks writing protected.txt through write_file";
+    enforce deny, report "The demo blocks writing protected.txt through write_file";
 }

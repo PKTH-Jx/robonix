@@ -70,10 +70,10 @@ pub enum TokenKind {
     Allow,
     #[token("deny")]
     Deny,
-    #[token("pend")]
-    Pend,
     #[token("report")]
     Report,
+    #[token("call")]
+    Call,
 
     // Operators
     #[token("=")]

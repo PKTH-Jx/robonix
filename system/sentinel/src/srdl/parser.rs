@@ -298,7 +298,7 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Always
         | TokenKind::Allow
         | TokenKind::Deny
-        | TokenKind::Pend
+        | TokenKind::Call
         | TokenKind::Report => Ok((rest, Identifier(token.text().to_owned()))),
         _ => Err(Err::Error(expected(&input, "a select field name"))),
     }
@@ -405,25 +405,39 @@ fn condition_expression(input: Tokens<'_>) -> IResult<'_, Expression> {
     expression(input, 0, 0)
 }
 
-// Grammar: enforce (allow | deny | pend) [report "TEXT"].
-// Reports are static strings; disposition and user intervention are deferred to runtime.
+// Grammar: enforce HOOK [, HOOK ...]; capability IDs and reports are quoted strings.
 fn enforce_clause(input: Tokens<'_>) -> IResult<'_, EnforceClause> {
-    let (input, _) = match_token(TokenKind::Enforce)(input)?;
-    let behavior = match input.tok.first().map(|t| t.kind) {
-        Some(TokenKind::Allow) => EnforceBehavior::Allow,
-        Some(TokenKind::Deny) => EnforceBehavior::Deny,
-        Some(TokenKind::Pend) => EnforceBehavior::Pend,
-        _ => return Err(Err::Error(expected(&input, "'allow', 'deny', or 'pend'"))),
-    };
-    let input = input.take_from(1);
-    // Once report is present, keep a malformed report's error instead of backtracking.
-    let (input, report) = if input.tok.first().map(|t| t.kind) == Some(TokenKind::Report) {
-        let (input, report) = string_literal(input.take_from(1))?;
-        (input, Some(report))
-    } else {
-        (input, None)
-    };
-    Ok((input, EnforceClause { behavior, report }))
+    let (mut input, _) = match_token(TokenKind::Enforce)(input)?;
+    let mut hooks = Vec::new();
+    loop {
+        let (rest, hook) = enforce_hook(input)?;
+        hooks.push(hook);
+        input = rest;
+        if input.tok.first().map(|token| token.kind) != Some(TokenKind::Comma) {
+            break;
+        }
+        input = input.take_from(1);
+    }
+    Ok((input, EnforceClause { hooks }))
+}
+
+fn enforce_hook(input: Tokens<'_>) -> IResult<'_, EnforceBehavior> {
+    match input.tok.first().map(|t| t.kind) {
+        Some(TokenKind::Allow) => Ok((input.take_from(1), EnforceBehavior::Allow)),
+        Some(TokenKind::Deny) => Ok((input.take_from(1), EnforceBehavior::Deny)),
+        Some(TokenKind::Call) => {
+            let (rest, capability) = string_literal(input.take_from(1))?;
+            Ok((rest, EnforceBehavior::Call(capability)))
+        }
+        Some(TokenKind::Report) => {
+            let (rest, message) = string_literal(input.take_from(1))?;
+            Ok((rest, EnforceBehavior::Report(message)))
+        }
+        _ => Err(Err::Error(expected(
+            &input,
+            "'allow', 'deny', 'call', or 'report'",
+        ))),
+    }
 }
 
 fn match_token(kind: TokenKind) -> impl FnMut(Tokens<'_>) -> IResult<'_, Tokens<'_>> {
@@ -465,7 +479,7 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
         | TokenKind::After
         | TokenKind::Allow
         | TokenKind::Deny
-        | TokenKind::Pend
+        | TokenKind::Call
         | TokenKind::Report => Ok((rest, Identifier(token.text().to_string()))),
         _ => Err(Err::Error(expected(&input, "an identifier"))),
     }

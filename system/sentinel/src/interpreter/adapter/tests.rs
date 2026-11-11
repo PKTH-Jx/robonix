@@ -283,12 +283,12 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
             context string user = identity.user_id;
             input from "sensor/value" select number x = reading, boolean ready = ready;
             require user = "alice" && ready && x > 0;
-            enforce deny report "unused";
+            enforce deny, report "unused";
         }
         rule violation {
             input from "sensor/value" select number x = reading;
             require x < 0;
-            enforce deny report "blocked";
+            enforce deny, report "blocked";
         }
         rule ignored {
             context string missing = unknown.field;
@@ -322,7 +322,6 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     );
     assert!(result.reports[0].evaluation.as_ref().unwrap().passed());
     assert!(result.reports[0].enforcement.is_none());
-    assert!(result.reports[0].message.is_none());
     assert_eq!(
         result.reports[1]
             .evaluation
@@ -332,7 +331,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         [1]
     );
     assert_eq!(result.reports[1].enforcement, Some(Ok(Effect::Deny)));
-    assert_eq!(result.reports[1].message.as_deref(), Some("blocked"));
+    assert_eq!(result.messages, ["blocked"]);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
     let unmatched = interpreter
         .check(
@@ -352,7 +351,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         r#"trigger failure before always;
         rule failure {
         input from "sensor/missing" select number x;
-        require x > 0; enforce allow report "unused";
+        require x > 0; enforce allow, report "unused";
     }"#,
         fixture.adapter.atlas.clone(),
     )
@@ -376,7 +375,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         }))
     ));
     assert!(result.reports[0].enforcement.is_none());
-    assert!(result.reports[0].message.is_none());
+    assert!(result.messages.is_empty());
     assert!(fixture.channels_empty().await);
 
     let demo = SrdlInterpreter::new(
@@ -625,11 +624,11 @@ async fn pool_checks_events_independently_with_fresh_inputs() {
         trigger measured before "robot/pick";
         rule measured {
             input from "sensor/value" select number x = reading maxage 1;
-            require x = 42; enforce deny;
+            require x = 42; enforce allow;
         }
         rule contextual {
             context boolean ready = arguments.ready;
-            require ready; enforce deny report "not ready";
+            require ready; enforce allow, report "not ready";
         }
     "#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
@@ -647,13 +646,13 @@ async fn pool_checks_events_independently_with_fresh_inputs() {
         .await;
     assert_eq!(after.effect, Effect::Allow);
     assert_eq!(after.reports.len(), 2);
-    assert_eq!(after.reports[1].message.as_deref(), Some("not ready"));
-    assert!(
-        after
-            .reports
-            .iter()
-            .all(|r| r.timing == TriggerTiming::After && r.enforcement.is_none())
-    );
+    assert_eq!(after.messages, ["not ready"]);
+    assert!(after.reports.iter().all(|r| {
+        r.timing == TriggerTiming::After
+            && r.enforcement
+                .as_ref()
+                .is_none_or(|effect| matches!(effect, Ok(Effect::Allow)))
+    }));
     let (before, after) = tokio::join!(
         interpreter.check(
             "p",
@@ -701,13 +700,131 @@ async fn pool_checks_events_independently_with_fresh_inputs() {
     assert!(unmatched.reports.is_empty());
 }
 
+/// Holds capability execution open so another check can exercise the same pool.
+struct BlockingHook {
+    /// Signals that requirement evaluation has already reached hook execution.
+    entered: tokio::sync::Notify,
+    /// Releases the hook after the unrelated check completes.
+    release: tokio::sync::Notify,
+}
+
+#[tonic::async_trait]
+impl crate::interpreter::enforcer::HookRuntime for BlockingHook {
+    async fn call(&self, _: &str) -> Result<(), crate::interpreter::enforcer::Error> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn slow_hooks_release_the_evaluator_pool_before_execution() {
+    use crate::interpreter::{CheckContext, SrdlInterpreter};
+    let fixture = AtlasFixture::new().await;
+    let interpreter = SrdlInterpreter::new(
+        r#"
+        trigger slow before A;
+        trigger fast before B;
+        rule slow { require false; enforce call "robot/stop"; }
+        rule fast { require false; enforce deny; }
+    "#,
+        fixture.adapter.atlas.clone(),
+    )
+    .unwrap();
+    let runtime = BlockingHook {
+        entered: Default::default(),
+        release: Default::default(),
+    };
+    let context = CheckContext {
+        plan_id: "p",
+        call_id: "slow",
+        capability: "A",
+        consumer_id: "test",
+        values: &Value::Null,
+        timing: TriggerTiming::Before,
+    };
+    let slow = interpreter.check_with_runtime(&context, &runtime);
+    let fast = async {
+        runtime.entered.notified().await;
+        let decision = timeout(
+            Duration::from_secs(1),
+            interpreter.check(
+                "p",
+                "fast",
+                "B",
+                "test",
+                &Value::Null,
+                TriggerTiming::Before,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.effect, Effect::Deny);
+        runtime.release.notify_one();
+    };
+    let (slow, ()) = tokio::join!(slow, fast);
+    assert_eq!(slow.effect, Effect::Allow);
+}
+
+#[tokio::test]
+async fn admission_conflicts_during_hooks_preserve_completed_call_feedback() {
+    use crate::interpreter::{CheckContext, SrdlInterpreter};
+    let fixture = AtlasFixture::new().await;
+    let interpreter = SrdlInterpreter::new(
+        r#"exclude mutual A B; trigger guard before A;
+        rule guard { require false; enforce call "robot/stop", report "stop requested"; }"#,
+        fixture.adapter.atlas.clone(),
+    )
+    .unwrap();
+    let runtime = BlockingHook {
+        entered: Default::default(),
+        release: Default::default(),
+    };
+    let context = CheckContext {
+        plan_id: "p",
+        call_id: "a",
+        capability: "A",
+        consumer_id: "test",
+        values: &Value::Null,
+        timing: TriggerTiming::Before,
+    };
+    let first = interpreter.check_with_runtime(&context, &runtime);
+    let conflict = async {
+        runtime.entered.notified().await;
+        let blocked = interpreter
+            .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+            .await;
+        assert_eq!(blocked.effect, Effect::Deny);
+        runtime.release.notify_one();
+    };
+    let (result, ()) = timeout(Duration::from_secs(1), async {
+        tokio::join!(first, conflict)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.effect, Effect::Deny);
+    assert!(result.admission_id.is_none());
+    assert_eq!(result.messages, ["stop requested"]);
+    assert_eq!(result.calls[0].result, Some(Ok(())));
+    assert_eq!(result.reports.len(), 2);
+    assert!(matches!(
+        result.reports[1].evaluation,
+        Err(crate::interpreter::evaluator::Error::Exclusion { .. })
+    ));
+    let admitted = interpreter
+        .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
+        .await;
+    assert_eq!(admitted.effect, Effect::Allow);
+    interpreter.finish("q", "b", admitted.admission_id.unwrap());
+}
+
 #[tokio::test]
 async fn exclusions_apply_without_rules_and_after_checks_do_not_release_them() {
     use crate::interpreter::SrdlInterpreter;
     let fixture = AtlasFixture::new().await;
     let source = r#"exclude mutual A B;
         trigger report after A;
-        rule report { require false; enforce deny report "observed violation"; }"#;
+        rule report { require false; enforce report "observed violation"; }"#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
     let a = interpreter
         .check("p", "a", "A", "test", &Value::Null, TriggerTiming::Before)
@@ -719,10 +836,7 @@ async fn exclusions_apply_without_rules_and_after_checks_do_not_release_them() {
         .check("p", "a", "A", "test", &Value::Null, TriggerTiming::After)
         .await;
     assert_eq!(after.effect, Effect::Allow);
-    assert_eq!(
-        after.reports[0].message.as_deref(),
-        Some("observed violation")
-    );
+    assert_eq!(after.messages, ["observed violation"]);
     let blocked = interpreter
         .check("q", "b", "B", "test", &Value::Null, TriggerTiming::Before)
         .await;
@@ -788,7 +902,7 @@ async fn each_timing_cancels_acquisition_when_its_check_future_is_dropped() {
     let source = r#"trigger hold before always; trigger hold after always;
         rule hold {
             input from "sensor/slow" select boolean ready;
-            require ready; enforce deny;
+            require ready; enforce allow;
         }"#;
     let interpreter = SrdlInterpreter::new(source, fixture.adapter.atlas.clone()).unwrap();
     for timing in [TriggerTiming::Before, TriggerTiming::After] {
@@ -865,7 +979,7 @@ async fn prepare_inputs<'a>(
 
 fn rule(inputs: &str, requirements: &str) -> Rule {
     parse(&format!(
-        "rule r {{ {inputs} {requirements} enforce pend; }}"
+        "rule r {{ {inputs} {requirements} enforce allow; }}"
     ))
     .unwrap()
     .rules

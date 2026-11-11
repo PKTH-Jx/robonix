@@ -73,7 +73,8 @@ impl ExclusionProcessor {
             .contains(&(source.to_owned(), target.to_owned()))
     }
 
-    /// Pending conflicts invalidate both calls; committed calls apply only outgoing edges.
+    /// Reserve a call before rule evaluation, then let Admission::commit recheck conflicts.
+    /// Conflicting pending checks invalidate each other before either may commit.
     pub(super) fn begin(
         &self,
         plan_id: &str,
@@ -84,6 +85,7 @@ impl ExclusionProcessor {
             return Ok(None);
         }
         let key = (plan_id.to_owned(), call_id.to_owned());
+        // Keep conflict detection and reservation atomic across concurrent checks.
         let mut state = self.state.lock().unwrap();
         if state.calls.contains_key(&key) {
             return Err(Error::Pool(
@@ -91,12 +93,15 @@ impl ExclusionProcessor {
             ));
         }
         let mut conflict = None;
+        // Committed calls apply outgoing exclusions. Pending calls check both directions
+        // so finishing rule evaluation first cannot let either conflicting call proceed.
         for call in state.calls.values_mut() {
             if self.excludes(&call.capability, capability)
                 || (!call.committed && self.excludes(capability, &call.capability))
             {
                 conflict = Some(call.capability.clone());
                 if !call.committed {
+                    // Mark every pending conflict; its commit must fail when it resumes.
                     call.conflict = Some(capability.to_owned());
                 }
             }
@@ -113,11 +118,13 @@ impl ExclusionProcessor {
                 conflicting,
             });
         }
+        // Bound both pending checks and admitted executions retained by this processor.
         if state.calls.len() >= CAPACITY {
             return Err(Error::Pool(
                 "Sentinel exclusion admission capacity exhausted",
             ));
         }
+        // Distinguish this reservation from later reuse of the same plan and call IDs.
         state.next_id += 1;
         let id = state.next_id;
         state.calls.insert(
@@ -129,6 +136,7 @@ impl ExclusionProcessor {
                 conflict: None,
             },
         );
+        // The guard removes this reservation on drop unless admission is committed.
         Ok(Some(Admission {
             processor: self,
             key,
@@ -151,8 +159,8 @@ impl ExclusionProcessor {
 }
 
 impl Admission<'_> {
-    /// Recheck and record permission atomically after asynchronous rule checking.
-    pub(super) fn enforce(&self, allow: bool) -> Result<Option<u64>, Error> {
+    /// Recheck conflicts and commit admission only when the accumulated decision allows it.
+    pub(super) fn commit(&self, allow: bool) -> Result<Option<u64>, Error> {
         let mut state = self.processor.state.lock().unwrap();
         let call = &state.calls[&self.key];
         let conflicting = call.conflict.clone();
@@ -203,11 +211,11 @@ mod tests {
         );
         assert_eq!(processor.relations.len(), 1);
         let b = processor.begin("p", "b", "B").unwrap().unwrap();
-        let b_id = b.enforce(true).unwrap().unwrap();
+        let b_id = b.commit(true).unwrap().unwrap();
         let a1 = processor.begin("p", "a1", "A").unwrap().unwrap();
-        let id1 = a1.enforce(true).unwrap().unwrap();
+        let id1 = a1.commit(true).unwrap().unwrap();
         let a2 = processor.begin("q", "a2", "A").unwrap().unwrap();
-        let id2 = a2.enforce(true).unwrap().unwrap();
+        let id2 = a2.commit(true).unwrap().unwrap();
         assert!(matches!(
             processor.begin("q", "b", "B"),
             Err(Error::Exclusion { .. })
@@ -231,20 +239,17 @@ mod tests {
                 processor.begin("q", "b", target),
                 Err(Error::Exclusion { .. })
             ));
-            assert!(matches!(
-                pending.enforce(true),
-                Err(Error::Exclusion { .. })
-            ));
+            assert!(matches!(pending.commit(true), Err(Error::Exclusion { .. })));
             drop(pending);
             let cancelled = processor.begin("p", "a", source).unwrap().unwrap();
             drop(cancelled);
             let admitted = processor.begin("q", "b", target).unwrap().unwrap();
-            let old = admitted.enforce(true).unwrap().unwrap();
+            let old = admitted.commit(true).unwrap().unwrap();
             drop(admitted);
             assert!(processor.begin("p", "a", source).is_err());
             processor.finish("q", "b", old);
             let reused = processor.begin("q", "b", target).unwrap().unwrap();
-            let current = reused.enforce(true).unwrap().unwrap();
+            let current = reused.commit(true).unwrap().unwrap();
             processor.finish("q", "b", old);
             assert!(processor.begin("p", "a", source).is_err());
             processor.finish("q", "b", current);
@@ -261,7 +266,7 @@ mod tests {
                 .begin("p", &index.to_string(), "A")
                 .unwrap()
                 .unwrap();
-            last = admission.enforce(true).unwrap().unwrap();
+            last = admission.commit(true).unwrap().unwrap();
         }
         assert!(matches!(
             processor.begin("q", "extra", "A"),

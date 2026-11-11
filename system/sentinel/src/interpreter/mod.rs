@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use self::{
     adapter::InputAdapter,
-    enforcer::{Effect, EnforcementResult},
+    enforcer::{Effect, EnforcementBuilder, EnforcementResult, Enforcer, HookRuntime},
     evaluator::RuleEvaluator,
     exclusion::ExclusionProcessor,
     type_checker::{TypeChecker, TypeError},
@@ -24,6 +24,22 @@ use self::{
 use crate::srdl::{self, ast::TriggerTiming};
 
 static NEXT_CHECK_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Trusted invocation data for SRDL rule evaluation, exclusions, and enforcement.
+pub struct CheckContext<'a> {
+    /// Plan containing the capability invocation.
+    pub plan_id: &'a str,
+    /// Call identity used for cancellation and feedback correlation.
+    pub call_id: &'a str,
+    /// Contract whose requirements are being checked.
+    pub capability: &'a str,
+    /// Atlas consumer used for acquiring rule inputs.
+    pub consumer_id: &'a str,
+    /// Immutable arguments and verified identity supplied by the embedding runtime.
+    pub values: &'a Value,
+    /// Lifecycle event that selected these rules.
+    pub timing: TriggerTiming,
+}
 
 /// A source or static type failure that prevents a rule set from becoming executable.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +56,8 @@ pub struct SrdlInterpreter {
     evaluator: RuleEvaluator,
     /// Capability lifetime restrictions, independent of the rule pool.
     exclusions: ExclusionProcessor,
+    /// Bound built-ins executed in the submitting task after the pool finishes evaluation.
+    enforcer: Enforcer,
 }
 
 impl SrdlInterpreter {
@@ -51,7 +69,8 @@ impl SrdlInterpreter {
         let adapter = InputAdapter::new(client);
         Ok(Self {
             exclusions: ExclusionProcessor::new(&program.excludes),
-            evaluator: RuleEvaluator::new(adapter, std::sync::Arc::new(program)),
+            enforcer: Enforcer::new(&program),
+            evaluator: RuleEvaluator::new(adapter, program),
         })
     }
 
@@ -65,30 +84,83 @@ impl SrdlInterpreter {
         context: &Value,
         timing: TriggerTiming,
     ) -> EnforcementResult {
-        // Check exclusions first
+        self.check_with_runtime(
+            &CheckContext {
+                plan_id,
+                call_id,
+                capability,
+                consumer_id,
+                values: context,
+                timing,
+            },
+            &(),
+        )
+        .await
+    }
+
+    /// Evaluate requirements and run hooks with operations supplied by the embedding runtime.
+    pub async fn check_with_runtime(
+        &self,
+        context: &CheckContext<'_>,
+        runtime: &dyn HookRuntime,
+    ) -> EnforcementResult {
+        let CheckContext {
+            plan_id,
+            call_id,
+            capability,
+            consumer_id,
+            values,
+            timing,
+        } = *context;
+        let mut builder = EnforcementBuilder::default();
+        // 1. Reserve exclusion admission before any asynchronous work.
         let admission = if timing == TriggerTiming::Before {
             match self.exclusions.begin(plan_id, call_id, capability) {
                 Ok(admission) => admission,
-                Err(error) => return EnforcementResult::error(error, timing),
+                Err(error) => {
+                    builder.error(error, timing);
+                    return builder.finish(None);
+                }
             }
         } else {
             None
         };
-        let mut decision = self
-            .evaluator
-            .check(plan_id, call_id, capability, consumer_id, context, timing)
-            .await;
-        // If the rule evaluation passed, enforce the exclusion admission decision.
-        if let Some(admission) = admission {
-            match admission.enforce(decision.effect == Effect::Allow) {
-                Ok(id) => decision.admission_id = id,
+        // 2. Evaluate matched rules with cancellation support.
+        let evaluated = tokio::select! {
+            biased;
+            _ = runtime.cancelled() => Err(evaluator::Error::Pool("Sentinel check cancelled")),
+            result = self.evaluator.check(plan_id, call_id, capability, consumer_id, values, timing) => result,
+        };
+        let check_id = match evaluated {
+            Ok(evaluation) => {
+                // 3. Accumulate violated rules' hooks in definition order.
+                self.enforcer
+                    .enforce(evaluation.rules, timing, &mut builder);
+                // 4. Execute every recorded call, including after denial.
+                runtime.execute(&mut builder, timing).await;
+                Some(evaluation.check_id)
+            }
+            Err(error) => {
+                builder.error(error, timing);
+                None
+            }
+        };
+        // 5. Recheck exclusions and commit admission using the accumulated decision.
+        let admission_id = if let Some(admission) = admission {
+            match admission.commit(builder.effect() == Effect::Allow) {
+                Ok(id) => id,
                 Err(error) => {
-                    decision.effect = Effect::Deny;
-                    decision
-                        .reports
-                        .extend(EnforcementResult::error(error, timing).reports);
+                    builder.error(error, timing);
+                    None
                 }
             }
+        } else {
+            None
+        };
+        // 6. Finalize once, then log and return the completed result.
+        let decision = builder.finish(admission_id);
+        if let Some(check_id) = check_id {
+            Self::log_decision(check_id, &decision);
         }
         decision
     }
@@ -105,7 +177,7 @@ impl SrdlInterpreter {
                 Ok(result) => logging::log(
                     Level::Info,
                     format!(
-                        "[sentinel] check_id={check_id} rule={:?} timing={:?} result={} requirements={:?} enforcement={:?} report={:?}",
+                        "[sentinel] check_id={check_id} rule={:?} timing={:?} result={} requirements={:?} enforcement={:?}",
                         report.rule,
                         report.timing,
                         if result.passed() {
@@ -114,8 +186,10 @@ impl SrdlInterpreter {
                             "violated"
                         },
                         result.requirements,
-                        report.enforcement,
-                        report.message
+                        report
+                            .enforcement
+                            .as_ref()
+                            .map(|result| result.as_ref().map_err(|_| "hook execution failed"))
                     ),
                 ),
                 Err(error) => logging::log(
@@ -132,8 +206,8 @@ impl SrdlInterpreter {
         logging::log(
             Level::Info,
             format!(
-                "[sentinel] check_id={check_id} decision={:?}",
-                decision.effect
+                "[sentinel] check_id={check_id} decision={:?} messages={:?}",
+                decision.effect, decision.messages
             ),
         );
     }

@@ -18,11 +18,10 @@ use tokio::{
     time::Instant,
 };
 
-use super::{CallKey, Check, Error, RULE_TIMEOUT, RuleEvaluator, RuleResult};
+use super::{CallKey, Check, Error, Evaluation, RULE_TIMEOUT, RuleEvaluator, RuleResult};
 use crate::{
     interpreter::{
         adapter::{Deadline, InputAdapter, Prepared},
-        enforcer::{Effect, EnforcementResult, Enforcer},
         trigger_matcher::TriggerMatcher,
     },
     srdl::ast::Program,
@@ -31,18 +30,8 @@ use crate::{
 const MAX_FRESHNESS_RETRIES: usize = 2;
 type RuleKey = (CallKey, usize);
 
-/// Processing state of one rule's preconditions or postconditions.
-#[derive(Clone, Copy)]
-enum Status {
-    Waiting,
-    Evaluating,
-    Enforcing,
-}
-
-/// Processing state retained for a matching rule until its applicable checks finish.
+/// Acquisition cancellation and freshness retained until a matching rule finishes.
 struct RuleEntry {
-    /// Current stage of this independently triggered check.
-    status: Status,
     /// Cancels acquisition while preserving the Adapter's connection cleanup.
     acquisition: Option<AbortHandle>,
     /// Retained deadlines keep early results valid through combined enforcement.
@@ -56,15 +45,15 @@ struct Invocation {
     /// Distinguishes late responses from a later reuse of the same call key.
     check_id: u64,
     /// Atlas identity used for acquiring rule inputs.
-    consumer: Arc<str>,
+    consumer: String,
     /// Trusted arguments and identity for this check.
     context: Arc<Value>,
     /// Source indices of rules selected for this check.
     rules: Vec<usize>,
     /// Completed results ordered by their rule's source index.
     results: BTreeMap<usize, Result<RuleResult, Error>>,
-    /// Delivers this check's combined decision and reports exactly once.
-    reply: oneshot::Sender<EnforcementResult>,
+    /// Delivers this check's requirement results exactly once.
+    reply: oneshot::Sender<Result<Evaluation, Error>>,
     /// Detects owner drop before a queued cancellation notification is processed.
     owner: watch::Receiver<()>,
     /// Retires the cancellation watcher together with the invocation.
@@ -129,7 +118,6 @@ impl<'a> Pool<'a> {
                     if let Some(result) = result
                         && self.current(&result.key.0, result.check_id)
                         && let Some(entry) = self.rules.get_mut(&result.key) {
-                                entry.status = Status::Evaluating;
                                 entry.acquisition = None;
                                 self.ready.push_back(result);
                     }
@@ -183,13 +171,10 @@ impl<'a> Pool<'a> {
             ),
         );
         if rules.is_empty() {
-            let decision = EnforcementResult {
-                admission_id: None,
-                effect: Effect::Allow,
-                reports: Vec::new(),
-            };
-            super::super::SrdlInterpreter::log_decision(check_id, &decision);
-            let _ = reply.send(decision);
+            let _ = reply.send(Ok(Evaluation {
+                check_id,
+                rules: BTreeMap::new(),
+            }));
             return;
         }
         if self
@@ -200,10 +185,9 @@ impl<'a> Pool<'a> {
             self.remove(&key);
         }
         if self.calls.contains_key(&key) {
-            let _ = reply.send(EnforcementResult::failure(
+            let _ = reply.send(Err(Error::Pool(
                 "Capability event already has active Sentinel checks",
-                key.2,
-            ));
+            )));
             return;
         }
         let (cancellation, registration) = AbortHandle::new_pair();
@@ -258,12 +242,10 @@ impl<'a> Pool<'a> {
             let key = (key.clone(), index);
             let (abort, registration) = AbortHandle::new_pair();
             let entry = self.rules.entry(key.clone()).or_insert(RuleEntry {
-                status: Status::Waiting,
                 acquisition: None,
                 freshness: None,
                 retries: 0,
             });
-            entry.status = Status::Waiting;
             entry.freshness = None;
             entry.acquisition = Some(abort);
             self.acquiring.push(
@@ -342,17 +324,15 @@ impl<'a> Pool<'a> {
             self.acquire(&ready.key.0, vec![ready.key.1]);
             return;
         }
-        let entry = self.rules.get_mut(&ready.key).unwrap();
-        entry.status = Status::Enforcing;
         let call = self.calls.get_mut(&ready.key.0).unwrap();
         call.results.insert(ready.key.1, result);
         if call.results.len() == call.rules.len() {
-            self.enforce(&ready.key.0);
+            self.finish_check(&ready.key.0);
         }
     }
 
-    /// Combine every matched rule, rechecking snapshots that finished before slower rules.
-    fn enforce(&mut self, key: &CallKey) {
+    /// Recheck freshness before returning combined results or scheduling retries.
+    fn finish_check(&mut self, key: &CallKey) {
         let results = std::mem::take(&mut self.calls.get_mut(key).unwrap().results);
         let mut completed = BTreeMap::new();
         let mut retries = Vec::new();
@@ -377,14 +357,11 @@ impl<'a> Pool<'a> {
             self.acquire(key, retries);
             return;
         }
-        let decision = Enforcer::enforce(
-            completed
-                .into_iter()
-                .map(|(index, result)| (&self.program.rules[index], result)),
-            key.2,
-        );
-        super::super::SrdlInterpreter::log_decision(call.check_id, &decision);
-        let _ = self.remove(key).reply.send(decision);
+        let check_id = call.check_id;
+        let _ = self.remove(key).reply.send(Ok(Evaluation {
+            check_id,
+            rules: completed,
+        }));
     }
 
     /// Abort acquisition and retire the watcher even if its caller never polls the reply.
@@ -405,274 +382,5 @@ impl<'a> Pool<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::srdl::ast::TriggerTiming;
-    use robonix_atlas::{
-        client::AtlasClient,
-        service::{AtlasRegistry, serve_atlas},
-    };
-    use tokio::{
-        sync::Semaphore,
-        time::{Duration, timeout},
-    };
-
-    async fn adapter() -> (InputAdapter, tokio::task::JoinHandle<anyhow::Result<()>>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
-        let atlas = AtlasClient::connect_with_retry(
-            format!("http://{address}"),
-            50,
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
-        (InputAdapter::new(atlas), server)
-    }
-
-    fn snapshot(rule: &crate::srdl::ast::Rule, overall: Instant) -> Prepared {
-        let mut deadline = Deadline::new(overall);
-        let mut values = BTreeMap::new();
-        for field in rule.inputs.iter().flat_map(|input| &input.fields) {
-            deadline.record(
-                Instant::now(),
-                field.maxage.map(Duration::from_secs_f64),
-                Arc::from(field.name.0.as_str()),
-            );
-            values.insert(
-                field.name.0.clone(),
-                Arc::new(crate::interpreter::adapter::InputValue::Number(1.0)),
-            );
-        }
-        Prepared { values, deadline }
-    }
-
-    #[tokio::test]
-    async fn queued_expiry_retries_before_evaluating_predicates() {
-        let (adapter, server) = adapter().await;
-        tokio::time::pause();
-        let program = crate::srdl::parse(
-            r#"trigger a before always;
-            rule a {
-            input from "sensor/a" select number x maxage 1;
-            require x / 0 > 0; enforce deny; }"#,
-        )
-        .unwrap();
-        let mut pool = Pool::new(&program, &adapter);
-        let key = ("plan".into(), "call".into(), TriggerTiming::Before);
-        let (_owner, cancel) = watch::channel(());
-        let (reply, receive) = oneshot::channel();
-        pool.check(Check {
-            key: key.clone(),
-            check_id: 1,
-            capability: "robot/pick".into(),
-            consumer: Arc::from("test"),
-            context: Arc::new(Value::Null),
-            cancel,
-            reply,
-            permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-        });
-        pool.acquiring.clear();
-        let overall = pool.calls[&key].deadline;
-        let stale = snapshot(&program.rules[0], overall);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 1,
-            data: Ok(stale),
-        });
-        assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
-        assert!(pool.calls[&key].results.is_empty());
-        pool.acquiring.clear();
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 1,
-            data: Ok(snapshot(&program.rules[0], overall)),
-        });
-        let result = receive.await.unwrap();
-        assert_eq!(result.effect, Effect::Deny);
-        assert!(matches!(
-            result.reports[0].evaluation,
-            Err(Error::Expression {
-                source: super::super::expression::Error::DivisionByZero,
-                ..
-            })
-        ));
-        assert!(pool.calls.is_empty());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn retries_expired_results_at_the_combined_decision_and_bounds_attempts() {
-        let (adapter, server) = adapter().await;
-        tokio::time::pause();
-        let program = crate::srdl::parse(
-            r#"
-            trigger [a, b] before always;
-            trigger [a, b] after always;
-            rule a { input from "sensor/a" select number x maxage 1;
-                require x > 0; enforce deny; }
-            rule b { input from "sensor/b" select number x;
-                require x > 0; enforce deny; }
-        "#,
-        )
-        .unwrap();
-        let mut pool = Pool::new(&program, &adapter);
-        let key = ("plan".into(), "call".into(), TriggerTiming::Before);
-        let (_owner, cancel) = watch::channel(());
-        let (reply, receive) = oneshot::channel();
-        pool.check(Check {
-            key: key.clone(),
-            check_id: 1,
-            capability: "robot/pick".into(),
-            consumer: Arc::from("test"),
-            context: Arc::new(Value::Null),
-            cancel,
-            reply,
-            permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-        });
-        // Supply timestamped snapshots directly so network latency cannot affect expiry.
-        pool.acquiring.clear();
-        let deadline = pool.calls[&key].deadline;
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 1,
-            data: Ok(snapshot(&program.rules[0], deadline)),
-        });
-        tokio::time::advance(Duration::from_secs(2)).await;
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 1),
-            check_id: 1,
-            data: Ok(snapshot(&program.rules[1], deadline)),
-        });
-        assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
-        assert_eq!(pool.calls[&key].results.len(), 1);
-        assert_eq!(pool.calls[&key].deadline, deadline);
-        pool.acquiring.clear();
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 1,
-            data: Ok(snapshot(&program.rules[0], deadline)),
-        });
-        assert_eq!(receive.await.unwrap().effect, Effect::Allow);
-        assert!(pool.rules.is_empty());
-        assert!(pool.calls.is_empty());
-
-        let key = ("plan".into(), "call".into(), TriggerTiming::After);
-        let (_after_owner, cancel) = watch::channel(());
-        let (reply, receive) = oneshot::channel();
-        pool.check(Check {
-            key: key.clone(),
-            check_id: 2,
-            capability: "robot/pick".into(),
-            consumer: Arc::from("test"),
-            context: Arc::new(Value::Null),
-            cancel,
-            reply,
-            permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-        });
-        assert!(pool.calls[&key].deadline > deadline);
-        assert_eq!(pool.rules[&(key.clone(), 0)].retries, 0);
-        pool.acquiring.clear();
-        let deadline = pool.calls[&key].deadline;
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 1),
-            check_id: 2,
-            data: Ok(snapshot(&program.rules[1], deadline)),
-        });
-        for attempt in 0..=MAX_FRESHNESS_RETRIES {
-            pool.evaluate(ReadyCheck {
-                key: (key.clone(), 0),
-                check_id: 2,
-                data: Err(Error::Expired {
-                    rule: "a".into(),
-                    input: "x".into(),
-                }),
-            });
-            pool.acquiring.clear();
-            if attempt < MAX_FRESHNESS_RETRIES {
-                assert_eq!(pool.rules[&(key.clone(), 0)].retries, attempt + 1);
-                assert_eq!(pool.calls[&key].deadline, deadline);
-            }
-        }
-        let result = receive.await.unwrap();
-        assert_eq!(result.effect, Effect::Allow);
-        assert_eq!(result.reports[0].timing, TriggerTiming::After);
-        assert!(matches!(
-            result.reports[0].evaluation,
-            Err(Error::Expired { .. })
-        ));
-        assert!(pool.calls.is_empty());
-        assert!(pool.rules.is_empty());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn cancelled_reuse_ignores_old_work_and_releases_capacity_after_checks() {
-        let (adapter, server) = adapter().await;
-        let program = crate::srdl::parse(
-            r#"trigger a before always;
-            rule a { input from "sensor/a" select number x; require x > 0; enforce deny; }"#,
-        )
-        .unwrap();
-        let mut pool = Pool::new(&program, &adapter);
-        let permits = Arc::new(Semaphore::new(2));
-        let key = ("plan".to_owned(), "call".to_owned(), TriggerTiming::Before);
-        let (owner, cancel) = watch::channel(());
-        let (reply, old_receive) = oneshot::channel();
-        pool.check(Check {
-            key: key.clone(),
-            check_id: 1,
-            capability: "robot/pick".into(),
-            consumer: Arc::from("test"),
-            context: Arc::new(Value::Null),
-            cancel,
-            reply,
-            permit: permits.clone().try_acquire_owned().unwrap(),
-        });
-        pool.acquiring.clear();
-        drop(owner);
-        // Reuse happens before the cancellation stream has been polled.
-        let (_owner, cancel) = watch::channel(());
-        let (reply, receive) = oneshot::channel();
-        pool.check(Check {
-            key: key.clone(),
-            check_id: 2,
-            capability: "robot/pick".into(),
-            consumer: Arc::from("test"),
-            context: Arc::new(Value::Null),
-            cancel,
-            reply,
-            permit: permits.clone().try_acquire_owned().unwrap(),
-        });
-        pool.acquiring.clear();
-        assert!(old_receive.await.is_err());
-        let deadline = pool.calls[&key].deadline;
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 1,
-            data: Ok(snapshot(&program.rules[0], deadline)),
-        });
-        assert!(pool.calls[&key].results.is_empty());
-        pool.evaluate(ReadyCheck {
-            key: (key.clone(), 0),
-            check_id: 2,
-            data: Ok(snapshot(&program.rules[0], deadline)),
-        });
-        assert!(pool.calls.is_empty());
-        assert!(pool.rules.is_empty());
-        // Check completion releases capacity even while its submitting owner is alive.
-        timeout(Duration::from_secs(1), async {
-            while let Some(event) = pool.cancelled.next().await {
-                assert!(event.is_none());
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(permits.available_permits(), 2);
-        assert_eq!(receive.await.unwrap().effect, Effect::Allow);
-        server.abort();
-    }
-}
+#[path = "tests.rs"]
+mod tests;
