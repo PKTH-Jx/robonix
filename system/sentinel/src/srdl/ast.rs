@@ -31,7 +31,7 @@ pub struct Rule {
     pub inputs: Vec<InputClause>,
     /// Bindings to the Executor's immutable context for this capability call.
     pub contexts: Vec<ContextClause>,
-    /// Conditions evaluated whenever a before or after trigger selects this rule.
+    /// Conditions evaluated whenever a lifecycle trigger selects this rule.
     pub requires: Vec<RequireClause>,
     /// The response declared for a violated safety condition.
     pub enforce: EnforceClause,
@@ -103,14 +103,16 @@ pub enum SelectStep {
 }
 
 /// Associates every named rule with every listed capability selector.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct TriggerClause {
     /// Rule names resolved against the complete program when loading SRDL.
     pub rules: Vec<Identifier>,
-    /// Whether matching occurs before dispatch or after successful execution.
+    /// Lifecycle phase in which matching rules are checked.
     pub timing: TriggerTiming,
     /// Alternative selectors; any match applies all named rules to the call.
     pub capabilities: Vec<TriggerTarget>,
+    /// Multiplier of average check duration for while checks; defaults to five.
+    pub interval: f64,
 }
 
 /// The capability lifecycle event that starts an independent rule check.
@@ -121,6 +123,8 @@ pub enum TriggerTiming {
     Before,
     /// Report conditions after successful capability execution.
     After,
+    /// Recheck conditions throughout capability execution.
+    While,
 }
 
 /// A capability selector on the right side of a trigger declaration.
@@ -153,6 +157,8 @@ pub enum EnforceBehavior {
     Allow,
     /// Reject the capability call.
     Deny,
+    /// Cancel the plan containing the capability being checked during execution.
+    Stop,
     /// Invoke this capability with empty arguments when a requirement is violated.
     Call(String),
     /// Append decoded static text to the enforcement feedback.

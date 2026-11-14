@@ -1,4 +1,4 @@
-use super::{EnforcementBuilder, Error};
+use super::{Effect, EnforcementBuilder, Error};
 use crate::srdl::ast::{EnforceBehavior, EnforceClause, TriggerTiming};
 
 /// Executor operations available to inherent hooks without an Executor dependency.
@@ -9,11 +9,22 @@ pub trait HookRuntime: Send + Sync {
 
     /// Attempt every recorded call in order, even after denial or an earlier call failure.
     async fn execute(&self, builder: &mut EnforcementBuilder, timing: TriggerTiming) {
+        let mut stopped = builder.effect() == Effect::Stop;
+        if stopped {
+            self.stop().await;
+        }
         for index in 0..builder.calls().len() {
             let result = self.call(&builder.calls()[index].capability).await;
             builder.complete_call(index, result, timing);
+            if !stopped && builder.effect() == Effect::Stop {
+                self.stop().await;
+                stopped = true;
+            }
         }
     }
+
+    /// Request cancellation of the checked capability's plan before awaiting corrective calls.
+    async fn stop(&self) {}
 
     /// Resolve when the invocation is cancelled; the default never requests cancellation.
     async fn cancelled(&self) {
@@ -37,7 +48,11 @@ pub trait Hook: Send + Sync {
 
     /// Timings the type checker accepts for every trigger bound to this hook's rule.
     fn timings(&self) -> &'static [TriggerTiming] {
-        &[TriggerTiming::Before, TriggerTiming::After]
+        &[
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::While,
+        ]
     }
 
     /// Validate the hook's configuration at load time, before any rule evaluation.
@@ -74,6 +89,23 @@ impl Hook for Deny {
 
     fn execute(&self, builder: &mut EnforcementBuilder) {
         builder.deny();
+    }
+}
+
+/// Cancels the plan when an executing capability no longer meets its conditions.
+struct Stop;
+
+impl Hook for Stop {
+    fn name(&self) -> &'static str {
+        "stop"
+    }
+
+    fn timings(&self) -> &'static [TriggerTiming] {
+        &[TriggerTiming::While]
+    }
+
+    fn execute(&self, builder: &mut EnforcementBuilder) {
+        builder.stop();
     }
 }
 
@@ -122,6 +154,7 @@ fn builtin(behavior: &EnforceBehavior) -> Box<dyn Hook> {
     match behavior {
         EnforceBehavior::Allow => Box::new(Allow),
         EnforceBehavior::Deny => Box::new(Deny),
+        EnforceBehavior::Stop => Box::new(Stop),
         EnforceBehavior::Call(capability) => Box::new(Call {
             capability: capability.clone(),
         }),

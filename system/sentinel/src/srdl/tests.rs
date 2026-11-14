@@ -504,6 +504,32 @@ fn parses_top_level_triggers_with_single_items_and_lists() {
 }
 
 #[test]
+fn parses_while_intervals_and_stop_and_rejects_invalid_intervals() {
+    let program = parse(
+        r#"
+        trigger r while "robot/move";
+        trigger [r] while ["robot/move", "robot/turn"] interval 2.5;
+        rule r { require false; enforce stop, report "unsafe"; }
+    "#,
+    )
+    .unwrap();
+    assert_eq!(program.triggers[0].timing, TriggerTiming::While);
+    assert_eq!(program.triggers[0].interval, 5.0);
+    assert_eq!(program.triggers[1].interval, 2.5);
+    assert_eq!(program.rules[0].enforce.hooks[0], EnforceBehavior::Stop);
+    for clause in [
+        "trigger r before A interval 2;",
+        "trigger r after A interval 2;",
+        "trigger r while A interval 0;",
+        "trigger r while A interval -2;",
+        "trigger r while A interval 1e999;",
+        "trigger r while A interval;",
+    ] {
+        assert!(parse(clause).is_err(), "{clause}");
+    }
+}
+
+#[test]
 fn rejects_invalid_trigger_syntax() {
     for trigger in [
         "trigger;",
@@ -616,7 +642,6 @@ fn rejects_invalid_enforcement_behaviors_and_reports() {
         "enforce allow, report;",
         "enforce deny, report 1;",
         "enforce deny, report message;",
-        "enforce stop;",
         "enforce deny_extra;",
         "enforce allow deny;",
         "enforce call;",

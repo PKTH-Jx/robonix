@@ -2,7 +2,7 @@
 // Author: wheatfox <wheatfox17@icloud.com>
 //! Execute one RTDL do node, including async polling and result verification.
 use crate::active_plans::PlanRuntime;
-use crate::dispatch::{self, leaf_terminal_state};
+use crate::dispatch::leaf_terminal_state;
 use crate::pb::executor::RtdlEvent;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
@@ -12,7 +12,6 @@ use crate::verification::{self, VerificationPolicy};
 use robonix_atlas::client::AtlasClient;
 use robonix_scribe::{info, warn};
 use robonix_sentinel::interpreter::enforcer::Effect;
-use robonix_sentinel::srdl::ast::TriggerTiming;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -80,16 +79,8 @@ pub(crate) async fn execute_call(
     identity: SentinelIdentity,
     verification: Arc<VerificationPolicy>,
 ) -> NodeExecution {
-    let checked = sentinel
-        .check(
-            &node,
-            call,
-            &identity,
-            TriggerTiming::Before,
-            &runtime,
-            &provider_id,
-        )
-        .await;
+    let hooks = sentinel.hooks(&node, &identity, &runtime, &provider_id);
+    let checked = hooks.on_arrival(call).await;
     let cancelled = runtime.is_cancelled(&node.plan_id).await;
     let admission_id = checked.as_ref().ok().and_then(|value| value.admission_id);
     let (allow, feedback) = match checked {
@@ -103,7 +94,11 @@ pub(crate) async fn execute_call(
         ),
     };
     if cancelled || !allow {
-        sentinel.finish(&node.plan_id, call, admission_id);
+        // An allowed arrival can race cancellation before dispatch begins.
+        hooks
+            .on_complete(call, admission_id, false)
+            .await
+            .expect("failed calls do not parse postcondition context");
         let state = if cancelled {
             RtdlNodeStateEnum::Canceled
         } else {
@@ -174,22 +169,12 @@ pub(crate) async fn execute_call(
             .await;
     }
 
-    let (mut result, mut state) =
-        dispatch::run_until_terminal(call, &provider_id, &mut atlas, &runtime, &node).await;
+    let (mut result, mut state, mut sentinel_detail) = hooks.on_execution(call, Some(&tx)).await;
 
-    sentinel.finish(&node.plan_id, call, admission_id);
-    let mut sentinel_detail = String::new();
-    if result.success && state == RtdlNodeStateEnum::Succeeded as u32 {
-        let checked = sentinel
-            .check(
-                &node,
-                call,
-                &identity,
-                TriggerTiming::After,
-                &runtime,
-                &provider_id,
-            )
-            .await;
+    // Completion releases exclusions for every outcome before checking after rules.
+    let succeeded = result.success && state == RtdlNodeStateEnum::Succeeded as u32;
+    let checked = hooks.on_complete(call, admission_id, succeeded).await;
+    if succeeded {
         if runtime.is_cancelled(&node.plan_id).await {
             result.success = false;
             result.error = "cancelled during Sentinel postcondition check".into();
@@ -371,6 +356,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_denial_stays_local_and_while_stop_cancels_the_plan() {
+        let address = reserve_address();
+        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{address}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        let contract = "robonix/system/executor/builtin/run_command";
+        for (timing, hook, expected) in [
+            ("before", "deny", RtdlNodeStateEnum::Failed),
+            ("while", "stop", RtdlNodeStateEnum::Canceled),
+        ] {
+            let cancelled = timing == "while";
+            let runtime = PlanRuntime::default();
+            runtime.register_plan("plan").await.unwrap();
+            let sentinel = SentinelRuntime::new(
+                &format!(
+                    r#"
+                trigger guard {timing} "{contract}";
+                rule guard {{ context boolean ready = arguments.ready;
+                    require ready; enforce {hook}, report "unsafe"; }}
+            "#
+                ),
+                atlas.clone(),
+            )
+            .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let run = |id: &str, ready: bool, command: &str| {
+                let call = CapabilityCall {
+                    call_id: id.into(),
+                    provider_id: "executor".into(),
+                    contract_id: contract.into(),
+                    args_json: serde_json::json!({"command":command, "ready":ready}).to_string(),
+                };
+                let node = NodeEventContext {
+                    plan_id: "plan".into(),
+                    node_index: u32::from(ready),
+                    node_kind: RTDL_DO,
+                    op_id: id.into(),
+                    description: "check cancellation scope".into(),
+                };
+                let (tx, atlas, runtime, sentinel) =
+                    (tx.clone(), atlas.clone(), runtime.clone(), sentinel.clone());
+                async move {
+                    execute_call(
+                        &call,
+                        node,
+                        tx,
+                        atlas,
+                        "executor".into(),
+                        runtime,
+                        sentinel,
+                        SentinelIdentity::default(),
+                        Arc::new(VerificationPolicy::new(false, vec![])),
+                    )
+                    .await
+                }
+            };
+            let (target, sibling) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    run("target", false, "sleep 30"),
+                    run(
+                        "sibling",
+                        true,
+                        if cancelled {
+                            "sleep 30"
+                        } else {
+                            "sleep 0.1; printf sibling"
+                        }
+                    )
+                )
+            })
+            .await
+            .unwrap();
+            assert!(target.failed);
+            assert_eq!(sibling.failed, cancelled);
+            assert_eq!(runtime.is_cancelled("plan").await, cancelled);
+            // A cancelled plan must also reject commands submitted after the stop.
+            let following = run("following", true, "printf following").await;
+            assert_eq!(following.failed, cancelled);
+            drop(tx);
+            let mut states = std::collections::HashMap::new();
+            while let Some(event) = rx.recv().await {
+                let node = event.unwrap().node_state.unwrap();
+                if node.leaf_result.is_some() {
+                    states.insert(node.op_id.clone(), node);
+                }
+            }
+            assert_eq!(states["target"].state, expected as u32);
+            let expected_sibling = if cancelled {
+                RtdlNodeStateEnum::Canceled
+            } else {
+                RtdlNodeStateEnum::Succeeded
+            };
+            assert_eq!(states["sibling"].state, expected_sibling as u32);
+            assert_eq!(states["following"].state, expected_sibling as u32);
+            if cancelled {
+                assert!(
+                    states["following"]
+                        .leaf_result
+                        .as_ref()
+                        .unwrap()
+                        .output
+                        .is_empty()
+                );
+            }
+            let feedback: serde_json::Value =
+                serde_json::from_str(&states["target"].operator_detail).unwrap();
+            assert_eq!(feedback["effect"], hook);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn after_checks_report_violations_and_errors_only_for_successful_calls() {
         let address = reserve_address();
         let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
@@ -454,7 +556,7 @@ mod tests {
             let mut conflicting = target.clone();
             conflicting.contract_id = "other".into();
             let next = sentinel
-                .check(
+                .hooks(
                     &NodeEventContext {
                         plan_id: "next".into(),
                         node_index: 0,
@@ -462,16 +564,30 @@ mod tests {
                         op_id: "next".into(),
                         description: "check released exclusion".into(),
                     },
-                    &conflicting,
                     &SentinelIdentity::default(),
-                    TriggerTiming::Before,
                     &PlanRuntime::default(),
                     "executor",
                 )
+                .on_arrival(&conflicting)
                 .await
                 .unwrap();
             assert_eq!(next.effect, Effect::Allow);
-            sentinel.finish("next", &conflicting, next.admission_id);
+            sentinel
+                .hooks(
+                    &NodeEventContext {
+                        plan_id: "next".into(),
+                        node_index: 0,
+                        node_kind: RTDL_DO,
+                        op_id: "next".into(),
+                        description: "release exclusion".into(),
+                    },
+                    &SentinelIdentity::default(),
+                    &PlanRuntime::default(),
+                    "executor",
+                )
+                .on_complete(&conflicting, next.admission_id, false)
+                .await
+                .unwrap();
         }
         server.abort();
     }

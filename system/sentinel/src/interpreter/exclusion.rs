@@ -7,7 +7,10 @@ use std::{
     sync::Mutex,
 };
 
-use super::evaluator::Error;
+use super::{
+    enforcer::{Effect, EnforcementBuilder},
+    evaluator::Error,
+};
 use crate::srdl::ast::ExcludeClause;
 
 const CAPACITY: usize = 1024;
@@ -19,7 +22,7 @@ struct Call {
     id: u64,
     /// Contract used in directed relation lookups.
     capability: String,
-    /// Permission has been issued and survives cancellation of the check future.
+    /// Permission has been issued and remains until explicit completion.
     committed: bool,
     /// A conflicting arrival invalidated this pending admission.
     conflict: Option<String>,
@@ -35,24 +38,14 @@ struct State {
 }
 
 /// Normalized directed restrictions and the calls currently owning them.
-pub(super) struct ExclusionProcessor {
+pub(super) struct ExclusionChecker {
     /// Mutual declarations expand into two edges; duplicate declarations collapse here.
     relations: BTreeSet<(String, String)>,
     /// Only short admission and completion operations hold this lock.
     state: Mutex<State>,
 }
 
-/// Cancels pending admission on drop without releasing already issued permission.
-pub(super) struct Admission<'a> {
-    /// Processor borrowed for pending-admission cleanup.
-    processor: &'a ExclusionProcessor,
-    /// Executor's plan and call identity.
-    key: CallKey,
-    /// Distinguishes this attempt from later uses of the same identity.
-    id: u64,
-}
-
-impl ExclusionProcessor {
+impl ExclusionChecker {
     pub(super) fn new(clauses: &[ExcludeClause]) -> Self {
         let mut relations = BTreeSet::new();
         for clause in clauses {
@@ -67,30 +60,31 @@ impl ExclusionProcessor {
         }
     }
 
-    /// Check if a source capability excludes a target capability
     fn excludes(&self, source: &str, target: &str) -> bool {
         self.relations
             .contains(&(source.to_owned(), target.to_owned()))
     }
 
-    /// Reserve a call before rule evaluation, then let Admission::commit recheck conflicts.
+    /// Reserve a call before rule evaluation, then recheck conflicts at commit.
     /// Conflicting pending checks invalidate each other before either may commit.
     pub(super) fn begin(
         &self,
         plan_id: &str,
         call_id: &str,
         capability: &str,
-    ) -> Result<Option<Admission<'_>>, Error> {
+        builder: &mut EnforcementBuilder,
+    ) -> Option<u64> {
         if self.relations.is_empty() {
-            return Ok(None);
+            return None;
         }
         let key = (plan_id.to_owned(), call_id.to_owned());
         // Keep conflict detection and reservation atomic across concurrent checks.
         let mut state = self.state.lock().unwrap();
         if state.calls.contains_key(&key) {
-            return Err(Error::Pool(
+            builder.exclusion(Err(Error::Pool(
                 "Capability call already has an exclusion admission",
-            ));
+            )));
+            return None;
         }
         let mut conflict = None;
         // Committed calls apply outgoing exclusions. Pending calls check both directions
@@ -113,22 +107,24 @@ impl ExclusionProcessor {
                     "[sentinel] exclusion denied plan_id={plan_id:?} call_id={call_id:?} capability={capability:?} conflicting={conflicting:?}"
                 ),
             );
-            return Err(Error::Exclusion {
+            builder.exclusion(Err(Error::Exclusion {
                 capability: capability.to_owned(),
                 conflicting,
-            });
+            }));
+            return None;
         }
-        // Bound both pending checks and admitted executions retained by this processor.
+        // Bound both pending checks and admitted executions retained by this checker.
         if state.calls.len() >= CAPACITY {
-            return Err(Error::Pool(
+            builder.exclusion(Err(Error::Pool(
                 "Sentinel exclusion admission capacity exhausted",
-            ));
+            )));
+            return None;
         }
         // Distinguish this reservation from later reuse of the same plan and call IDs.
         state.next_id += 1;
         let id = state.next_id;
         state.calls.insert(
-            key.clone(),
+            key,
             Call {
                 id,
                 capability: capability.to_owned(),
@@ -136,12 +132,42 @@ impl ExclusionProcessor {
                 conflict: None,
             },
         );
-        // The guard removes this reservation on drop unless admission is committed.
-        Ok(Some(Admission {
-            processor: self,
-            key,
-            id,
-        }))
+        Some(id)
+    }
+
+    /// Commit permission or explicitly discard the pending reservation on denial.
+    pub(super) fn commit(
+        &self,
+        plan_id: &str,
+        call_id: &str,
+        id: u64,
+        builder: &mut EnforcementBuilder,
+    ) {
+        let key = (plan_id.to_owned(), call_id.to_owned());
+        let mut state = self.state.lock().unwrap();
+        let call = &state.calls[&key];
+        assert_eq!(call.id, id, "commit must refer to the reserved admission");
+        // Another arrival may have invalidated this reservation during rule or hook execution.
+        if let Some(conflicting) = call.conflict.clone() {
+            super::logging::log(
+                robonix_scribe::Level::Warn,
+                format!(
+                    "[sentinel] exclusion denied plan_id={plan_id:?} call_id={call_id:?} capability={:?} conflicting={conflicting:?}",
+                    call.capability
+                ),
+            );
+            builder.exclusion(Err(Error::Exclusion {
+                capability: call.capability.clone(),
+                conflicting,
+            }));
+        }
+        if builder.effect() == Effect::Allow {
+            state.calls.get_mut(&key).unwrap().committed = true;
+            builder.exclusion(Ok(Some(id)));
+        } else {
+            // No permission escaped to execution, so completion will have nothing to release.
+            state.calls.remove(&key);
+        }
     }
 
     /// Completion must refer to the admission that actually executed, not a reused call ID.
@@ -158,121 +184,93 @@ impl ExclusionProcessor {
     }
 }
 
-impl Admission<'_> {
-    /// Recheck conflicts and commit admission only when the accumulated decision allows it.
-    pub(super) fn commit(&self, allow: bool) -> Result<Option<u64>, Error> {
-        let mut state = self.processor.state.lock().unwrap();
-        let call = &state.calls[&self.key];
-        let conflicting = call.conflict.clone();
-        if let Some(conflicting) = conflicting {
-            super::logging::log(
-                robonix_scribe::Level::Warn,
-                format!(
-                    "[sentinel] exclusion denied plan_id={:?} call_id={:?} capability={:?} conflicting={:?}",
-                    self.key.0, self.key.1, call.capability, conflicting
-                ),
-            );
-            return Err(Error::Exclusion {
-                capability: call.capability.clone(),
-                conflicting,
-            });
-        }
-        if !allow {
-            return Ok(None);
-        }
-        state.calls.get_mut(&self.key).unwrap().committed = true;
-        Ok(Some(self.id))
-    }
-}
-
-impl Drop for Admission<'_> {
-    fn drop(&mut self) {
-        let mut state = self.processor.state.lock().unwrap();
-        if state
-            .calls
-            .get(&self.key)
-            .is_some_and(|call| call.id == self.id && !call.committed)
-        {
-            state.calls.remove(&self.key);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::enforcer::EnforcementResult;
+
+    fn arrive(
+        processor: &ExclusionChecker,
+        plan: &str,
+        call: &str,
+        cap: &str,
+    ) -> EnforcementResult {
+        let mut builder = EnforcementBuilder::default();
+        if let Some(id) = processor.begin(plan, call, cap, &mut builder) {
+            processor.commit(plan, call, id, &mut builder);
+        }
+        builder.finish()
+    }
 
     #[test]
     fn directed_exclusions_follow_admission_order_and_retain_all_owners() {
-        let processor = ExclusionProcessor::new(
+        let processor = ExclusionChecker::new(
             &crate::srdl::parse("exclude A B; exclude A B;")
                 .unwrap()
                 .excludes,
         );
         assert_eq!(processor.relations.len(), 1);
-        let b = processor.begin("p", "b", "B").unwrap().unwrap();
-        let b_id = b.commit(true).unwrap().unwrap();
-        let a1 = processor.begin("p", "a1", "A").unwrap().unwrap();
-        let id1 = a1.commit(true).unwrap().unwrap();
-        let a2 = processor.begin("q", "a2", "A").unwrap().unwrap();
-        let id2 = a2.commit(true).unwrap().unwrap();
-        assert!(matches!(
-            processor.begin("q", "b", "B"),
-            Err(Error::Exclusion { .. })
-        ));
-        drop((a1, a2));
-        processor.finish("p", "a1", id1);
-        assert!(processor.begin("q", "b", "B").is_err());
-        processor.finish("q", "a2", id2);
-        assert!(processor.begin("q", "b", "B").is_ok());
-        processor.finish("p", "b", b_id);
+        let b = arrive(&processor, "p", "b", "B").admission_id.unwrap();
+        let a1 = arrive(&processor, "p", "a1", "A").admission_id.unwrap();
+        let a2 = arrive(&processor, "q", "a2", "A").admission_id.unwrap();
+        assert_eq!(arrive(&processor, "q", "b", "B").effect, Effect::Deny);
+        processor.finish("p", "a1", a1);
+        assert_eq!(arrive(&processor, "q", "b", "B").effect, Effect::Deny);
+        processor.finish("q", "a2", a2);
+        let next = arrive(&processor, "q", "b", "B");
+        assert_eq!(next.effect, Effect::Allow);
+        processor.finish("q", "b", next.admission_id.unwrap());
+        processor.finish("p", "b", b);
         assert!(processor.state.lock().unwrap().calls.is_empty());
     }
 
     #[test]
-    fn mutual_pending_conflicts_reject_both_and_cancelled_checks_leave_no_admission() {
+    fn pending_conflicts_and_denials_release_reservations_explicitly() {
         let processor =
-            ExclusionProcessor::new(&crate::srdl::parse("exclude mutual A B;").unwrap().excludes);
+            ExclusionChecker::new(&crate::srdl::parse("exclude mutual A B;").unwrap().excludes);
         for (source, target) in [("A", "B"), ("B", "A")] {
-            let pending = processor.begin("p", "a", source).unwrap().unwrap();
+            let mut builder = EnforcementBuilder::default();
+            let pending = processor.begin("p", "a", source, &mut builder).unwrap();
+            assert_eq!(arrive(&processor, "q", "b", target).effect, Effect::Deny);
+            processor.commit("p", "a", pending, &mut builder);
+            let denied = builder.finish();
+            assert_eq!(denied.effect, Effect::Deny);
+            assert!(denied.admission_id.is_none());
             assert!(matches!(
-                processor.begin("q", "b", target),
+                denied.reports[0].evaluation,
                 Err(Error::Exclusion { .. })
             ));
-            assert!(matches!(pending.commit(true), Err(Error::Exclusion { .. })));
-            drop(pending);
-            let cancelled = processor.begin("p", "a", source).unwrap().unwrap();
-            drop(cancelled);
-            let admitted = processor.begin("q", "b", target).unwrap().unwrap();
-            let old = admitted.commit(true).unwrap().unwrap();
-            drop(admitted);
-            assert!(processor.begin("p", "a", source).is_err());
+
+            let mut cancelled = EnforcementBuilder::default();
+            let pending = processor.begin("p", "a", source, &mut cancelled).unwrap();
+            cancelled.deny();
+            processor.commit("p", "a", pending, &mut cancelled);
+            assert!(cancelled.finish().admission_id.is_none());
+            let old = arrive(&processor, "q", "b", target).admission_id.unwrap();
+            assert_eq!(arrive(&processor, "p", "a", source).effect, Effect::Deny);
             processor.finish("q", "b", old);
-            let reused = processor.begin("q", "b", target).unwrap().unwrap();
-            let current = reused.commit(true).unwrap().unwrap();
+            let current = arrive(&processor, "q", "b", target).admission_id.unwrap();
             processor.finish("q", "b", old);
-            assert!(processor.begin("p", "a", source).is_err());
+            assert_eq!(arrive(&processor, "p", "a", source).effect, Effect::Deny);
             processor.finish("q", "b", current);
         }
+        assert!(processor.state.lock().unwrap().calls.is_empty());
     }
 
     #[test]
     fn bounds_execution_state_until_confirmed_completion() {
         let processor =
-            ExclusionProcessor::new(&crate::srdl::parse("exclude A B;").unwrap().excludes);
+            ExclusionChecker::new(&crate::srdl::parse("exclude A B;").unwrap().excludes);
         let mut last = 0;
         for index in 0..CAPACITY {
-            let admission = processor
-                .begin("p", &index.to_string(), "A")
-                .unwrap()
+            last = arrive(&processor, "p", &index.to_string(), "A")
+                .admission_id
                 .unwrap();
-            last = admission.commit(true).unwrap().unwrap();
         }
-        assert!(matches!(
-            processor.begin("q", "extra", "A"),
-            Err(Error::Pool(_))
-        ));
+        let denied = arrive(&processor, "q", "extra", "A");
+        assert_eq!(denied.effect, Effect::Deny);
+        assert!(matches!(denied.reports[0].evaluation, Err(Error::Pool(_))));
         processor.finish("p", &(CAPACITY - 1).to_string(), last);
-        assert!(processor.begin("q", "extra", "A").is_ok());
+        assert_eq!(arrive(&processor, "q", "extra", "A").effect, Effect::Allow);
     }
 }

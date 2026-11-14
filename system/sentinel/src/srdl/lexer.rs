@@ -62,6 +62,10 @@ pub enum TokenKind {
     Before,
     #[token("after")]
     After,
+    #[token("while")]
+    While,
+    #[token("interval")]
+    Interval,
     #[token("always")]
     Always,
 
@@ -70,6 +74,8 @@ pub enum TokenKind {
     Allow,
     #[token("deny")]
     Deny,
+    #[token("stop")]
+    Stop,
     #[token("report")]
     Report,
     #[token("call")]

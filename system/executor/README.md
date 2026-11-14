@@ -50,15 +50,31 @@ SRDL `before` triggers check admission. After successful synchronous or asynchro
 execution, `after` triggers match independently and acquire fresh inputs. Their
 violations and check errors appear in feedback without changing execution success,
 dependent work, or optional result verification. Failed or cancelled calls skip
-after checks. Both events submit the same check request; Sentinel retains no
-check state while the capability executes.
+after checks. Arrival, execution, and completion use Sentinel's lifecycle entry
+points and share its input and evaluation queues. Sentinel retains no evaluator state between checks.
+
+SRDL `while` triggers check throughout synchronous and asynchronous execution:
+`trigger safety while "robot/move" interval 5;`. The optional positive factor
+defaults to 5 and multiplies the invocation's average acquisition and evaluation
+time to set each rule's start-to-start interval. Checks never overlap for one
+invocation. Sentinel owns the interval schedule and yields check results to Executor.
+`report` and `call` run once per violated rule until recovery.
+`stop` is valid only for while rules; a violation using it, an unavailable check,
+or a failed corrective call cancels the whole plan so Pilot can replan. Executor
+uses its existing plan-cancellation path: later commands are skipped, active async
+calls receive `/cancel`, and running command process groups are terminated.
+Synchronous calls already in progress may return naturally. Node feedback records
+the rule and `effect: stop`; the checked node finishes as `CANCELED`. Corrective
+calls inherit the plan's cancellation.
 
 Sentinel hooks build an admission decision, ordered report messages, and deferred
 capability calls. `SentinelRuntime` executes `call` requests through the same
 builtin/MCP dispatch and async status/cancel handling as plan calls. Calls use
 empty arguments and require exactly one matching MCP provider. Nested calls
 inherit the verified identity and undergo before and after Sentinel checks;
-nesting is limited to eight calls. A hook call failure denies before admission
+nesting is limited to eight calls. `SentinelRuntime` provides shared policy state
+and creates hook contexts for arrival, execution, and completion checks. The
+interpreter remains internal to the integration. A hook call failure denies before admission
 and appears in after feedback. Node feedback includes `messages` and `calls`
 with each recorded call's success or error. Report hook text appears only in
 `messages`; per-rule feedback contains evaluation and enforcement details.
@@ -67,8 +83,9 @@ and discovery. Initial hook capability discovery has a 250 ms deadline. Started
 calls use Executor's normal cancellation handling before checking ends.
 
 Sentinel enforces `exclude` declarations across plans, including calls without rules.
-Executor releases admission whenever call handling returns, including failure and
-cancellation, before running after checks. Exclusions follow Executor's call lifecycle;
+Executor calls `on_complete` whenever call handling returns, including failure and
+cancellation. Completion explicitly releases admission before running after checks.
+Exclusions follow Executor's call lifecycle;
 a transport error or cancellation result does not confirm that a remote action stopped.
 Admission state is process-local; restart recovery is not implemented.
 

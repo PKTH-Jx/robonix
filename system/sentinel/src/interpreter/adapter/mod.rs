@@ -1,4 +1,4 @@
-//! Input discovery and acquisition scheduling for SRDL rules.
+//! Shared input discovery and acquisition queue for SRDL lifecycle checks.
 
 mod context;
 mod dependencies;

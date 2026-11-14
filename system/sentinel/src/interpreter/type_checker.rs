@@ -1,6 +1,6 @@
 //! Static checks for trigger references and binding types, without resolving source schemas.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::enforcer::hooks;
 
@@ -39,6 +39,13 @@ pub enum TypeErrorKind {
     DuplicateRule(String),
     #[error("trigger references unknown rule '{0}'")]
     UnknownRule(String),
+    #[error("duplicate {timing:?} trigger for capability '{capability}'")]
+    DuplicateTrigger {
+        /// Lifecycle timing for which this rule already has an overlapping declaration.
+        timing: TriggerTiming,
+        /// Contract selected twice, or always when both selectors match every capability.
+        capability: String,
+    },
     #[error("hook '{hook}' is not valid for {timing:?} triggers")]
     InvalidHookTiming {
         /// Built-in response whose timing constraint was violated.
@@ -181,12 +188,34 @@ impl<'ast> Visitor<'ast> for TypeChecker {
             }
         }
         // Resolve after collecting all definitions so triggers may precede their rules.
+        let mut associations = HashMap::<(&str, TriggerTiming), Vec<&TriggerTarget>>::new();
         for trigger in &program.triggers {
             for name in &trigger.rules {
                 let Some(rule) = names.get(&name.0) else {
                     self.rule.clone_from(&name.0);
                     return Err(self.error(TypeErrorKind::UnknownRule(name.0.clone())));
                 };
+                // Lists form rule/capability pairs; always overlaps every specific capability.
+                let targets = associations.entry((&name.0, trigger.timing)).or_default();
+                for target in &trigger.capabilities {
+                    if let Some(previous) = targets.iter().copied().find(|previous| {
+                        *previous == target
+                            || matches!(previous, TriggerTarget::Always)
+                            || matches!(target, TriggerTarget::Always)
+                    }) {
+                        self.rule.clone_from(&name.0);
+                        let capability = match (previous, target) {
+                            (TriggerTarget::Capability(name), _)
+                            | (_, TriggerTarget::Capability(name)) => name.clone(),
+                            _ => "always".into(),
+                        };
+                        return Err(self.error(TypeErrorKind::DuplicateTrigger {
+                            timing: trigger.timing,
+                            capability,
+                        }));
+                    }
+                    targets.push(target);
+                }
                 for hook in hooks::bind(&rule.enforce) {
                     if !hook.timings().contains(&trigger.timing) {
                         self.rule.clone_from(&name.0);
@@ -309,7 +338,7 @@ mod tests {
         let definitions =
             "rule a { require true; enforce deny; } rule b { require true; enforce deny; }";
         let program = parse(&format!(
-            "trigger [b, a, a] before [capA, capB]; {definitions} trigger b before always;"
+            "trigger [b, a] before [capA, capB]; {definitions} trigger b before capC;"
         ))
         .unwrap();
         TypeChecker::check(&program).unwrap();
@@ -339,6 +368,62 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_trigger_associations_at_each_timing() {
+        let definition = "rule r { require true; enforce allow; }";
+        for (keyword, timing) in [
+            ("before", TriggerTiming::Before),
+            ("while", TriggerTiming::While),
+            ("after", TriggerTiming::After),
+        ] {
+            for declarations in [
+                format!("trigger r {keyword} A; trigger r {keyword} A;"),
+                format!("trigger r {keyword} [A, B]; trigger r {keyword} A;"),
+                format!("trigger [r, r] {keyword} A;"),
+                format!("trigger r {keyword} [A, A];"),
+                format!("trigger r {keyword} always; trigger r {keyword} A;"),
+                format!("trigger r {keyword} A; trigger r {keyword} always;"),
+                format!("trigger r {keyword} [always, A];"),
+                format!("trigger r {keyword} always; trigger r {keyword} always;"),
+            ] {
+                let error =
+                    TypeChecker::check(&parse(&format!("{definition} {declarations}")).unwrap())
+                        .unwrap_err();
+                assert_eq!(error.rule, "r");
+                assert!(
+                    matches!(error.kind, TypeErrorKind::DuplicateTrigger { timing: actual, .. } if actual == timing),
+                    "{declarations}"
+                );
+            }
+        }
+        let repeated = parse(&format!(
+            "{definition} trigger r while A interval 5; trigger r while A interval 2;"
+        ))
+        .unwrap();
+        assert_eq!(
+            TypeChecker::check(&repeated).unwrap_err().kind,
+            TypeErrorKind::DuplicateTrigger {
+                timing: TriggerTiming::While,
+                capability: "A".into()
+            }
+        );
+
+        TypeChecker::check(
+            &parse(&format!(
+                r#"
+            {definition}
+            rule s {{ require true; enforce allow; }}
+            trigger [r, s] before [A, B];
+            trigger r after A;
+            trigger r while A interval 5;
+            trigger r while B interval 2;
+        "#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -402,6 +487,20 @@ mod tests {
 
     #[test]
     fn validates_hook_arguments_and_every_trigger_binding() {
+        for source in [
+            "trigger r before A; rule r { require true; enforce stop; }",
+            "trigger r after A; rule r { require true; enforce stop; }",
+            "trigger r while A; rule r { require true; enforce deny; }",
+        ] {
+            assert!(
+                TypeChecker::check(&parse(source).unwrap()).is_err(),
+                "{source}"
+            );
+        }
+        TypeChecker::check(
+            &parse("trigger r while A; rule r { require false; enforce stop; }").unwrap(),
+        )
+        .unwrap();
         for source in [
             "trigger r after A; rule r { require true; enforce deny; }",
             "trigger r before A; trigger r after B; rule r { require true; enforce deny; }",

@@ -21,6 +21,31 @@ async fn adapter() -> (InputAdapter, tokio::task::JoinHandle<anyhow::Result<()>>
     (InputAdapter::new(atlas), server)
 }
 
+fn register(
+    evaluator: &mut RuleEvaluator<'_>,
+    key: &CallKey,
+    check_id: u64,
+    permits: &Arc<Semaphore>,
+) -> (
+    watch::Sender<()>,
+    oneshot::Receiver<Result<Evaluation, Error>>,
+) {
+    let (owner, cancel) = watch::channel(());
+    let (reply, receive) = oneshot::channel();
+    evaluator.register(Check {
+        key: key.clone(),
+        check_id,
+        capability: "robot/pick".into(),
+        rules: None,
+        consumer: "test".into(),
+        context: Arc::new(Value::Null),
+        cancel,
+        reply,
+        permit: permits.clone().try_acquire_owned().unwrap(),
+    });
+    (owner, receive)
+}
+
 fn snapshot(rule: &crate::srdl::ast::Rule, overall: Instant) -> Prepared {
     let mut deadline = Deadline::new(overall);
     let mut values = BTreeMap::new();
@@ -49,33 +74,22 @@ async fn queued_expiry_retries_before_evaluating_predicates() {
         require x / 0 > 0; enforce deny; }"#,
     )
     .unwrap();
-    let mut pool = Pool::new(&program, &adapter);
+    let mut evaluator = RuleEvaluator::new(&program, &adapter);
     let key = ("plan".into(), "call".into(), TriggerTiming::Before);
-    let (_owner, cancel) = watch::channel(());
-    let (reply, receive) = oneshot::channel();
-    pool.check(Check {
-        key: key.clone(),
-        check_id: 1,
-        capability: "robot/pick".into(),
-        consumer: "test".into(),
-        context: Arc::new(Value::Null),
-        cancel,
-        reply,
-        permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-    });
-    pool.acquiring.clear();
-    let overall = pool.calls[&key].deadline;
+    let (_owner, receive) = register(&mut evaluator, &key, 1, &Arc::new(Semaphore::new(1)));
+    evaluator.acquiring.clear();
+    let overall = evaluator.calls[&key].deadline;
     let stale = snapshot(&program.rules[0], overall);
     tokio::time::advance(Duration::from_secs(2)).await;
-    pool.evaluate(ReadyCheck {
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 1,
         data: Ok(stale),
     });
-    assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
-    assert!(pool.calls[&key].results.is_empty());
-    pool.acquiring.clear();
-    pool.evaluate(ReadyCheck {
+    assert_eq!(evaluator.calls[&key].rules[&0].retries, 1);
+    assert!(evaluator.calls[&key].rules[&0].result.is_none());
+    evaluator.acquiring.clear();
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 1,
         data: Ok(snapshot(&program.rules[0], overall)),
@@ -84,11 +98,11 @@ async fn queued_expiry_retries_before_evaluating_predicates() {
     assert!(matches!(
         result.rules[&0],
         Err(Error::Expression {
-            source: super::super::expression::Error::DivisionByZero,
+            source: crate::interpreter::evaluator::expression::Error::DivisionByZero,
             ..
         })
     ));
-    assert!(pool.calls.is_empty());
+    assert!(evaluator.calls.is_empty());
     server.abort();
 }
 
@@ -107,39 +121,29 @@ async fn retries_expired_results_at_the_combined_decision_and_bounds_attempts() 
     "#,
     )
     .unwrap();
-    let mut pool = Pool::new(&program, &adapter);
+    let mut evaluator = RuleEvaluator::new(&program, &adapter);
     let key = ("plan".into(), "call".into(), TriggerTiming::Before);
-    let (_owner, cancel) = watch::channel(());
-    let (reply, receive) = oneshot::channel();
-    pool.check(Check {
-        key: key.clone(),
-        check_id: 1,
-        capability: "robot/pick".into(),
-        consumer: "test".into(),
-        context: Arc::new(Value::Null),
-        cancel,
-        reply,
-        permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-    });
+    let (_owner, receive) = register(&mut evaluator, &key, 1, &Arc::new(Semaphore::new(1)));
     // Supply timestamped snapshots directly so network latency cannot affect expiry.
-    pool.acquiring.clear();
-    let deadline = pool.calls[&key].deadline;
-    pool.evaluate(ReadyCheck {
+    evaluator.acquiring.clear();
+    let deadline = evaluator.calls[&key].deadline;
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 1,
         data: Ok(snapshot(&program.rules[0], deadline)),
     });
     tokio::time::advance(Duration::from_secs(2)).await;
-    pool.evaluate(ReadyCheck {
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 1),
         check_id: 1,
         data: Ok(snapshot(&program.rules[1], deadline)),
     });
-    assert_eq!(pool.rules[&(key.clone(), 0)].retries, 1);
-    assert_eq!(pool.calls[&key].results.len(), 1);
-    assert_eq!(pool.calls[&key].deadline, deadline);
-    pool.acquiring.clear();
-    pool.evaluate(ReadyCheck {
+    assert_eq!(evaluator.calls[&key].rules[&0].retries, 1);
+    assert!(evaluator.calls[&key].rules[&0].result.is_none());
+    assert!(evaluator.calls[&key].rules[&1].result.is_some());
+    assert_eq!(evaluator.calls[&key].deadline, deadline);
+    evaluator.acquiring.clear();
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 1,
         data: Ok(snapshot(&program.rules[0], deadline)),
@@ -153,33 +157,21 @@ async fn retries_expired_results_at_the_combined_decision_and_bounds_attempts() 
             .values()
             .all(|result| result.as_ref().unwrap().passed())
     );
-    assert!(pool.rules.is_empty());
-    assert!(pool.calls.is_empty());
+    assert!(evaluator.calls.is_empty());
 
     let key = ("plan".into(), "call".into(), TriggerTiming::After);
-    let (_after_owner, cancel) = watch::channel(());
-    let (reply, receive) = oneshot::channel();
-    pool.check(Check {
-        key: key.clone(),
-        check_id: 2,
-        capability: "robot/pick".into(),
-        consumer: "test".into(),
-        context: Arc::new(Value::Null),
-        cancel,
-        reply,
-        permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-    });
-    assert!(pool.calls[&key].deadline > deadline);
-    assert_eq!(pool.rules[&(key.clone(), 0)].retries, 0);
-    pool.acquiring.clear();
-    let deadline = pool.calls[&key].deadline;
-    pool.evaluate(ReadyCheck {
+    let (_after_owner, receive) = register(&mut evaluator, &key, 2, &Arc::new(Semaphore::new(1)));
+    assert!(evaluator.calls[&key].deadline > deadline);
+    assert_eq!(evaluator.calls[&key].rules[&0].retries, 0);
+    evaluator.acquiring.clear();
+    let deadline = evaluator.calls[&key].deadline;
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 1),
         check_id: 2,
         data: Ok(snapshot(&program.rules[1], deadline)),
     });
     for attempt in 0..=MAX_FRESHNESS_RETRIES {
-        pool.evaluate(ReadyCheck {
+        evaluator.evaluate(ReadyCheck {
             key: (key.clone(), 0),
             check_id: 2,
             data: Err(Error::Expired {
@@ -187,16 +179,15 @@ async fn retries_expired_results_at_the_combined_decision_and_bounds_attempts() 
                 input: "x".into(),
             }),
         });
-        pool.acquiring.clear();
+        evaluator.acquiring.clear();
         if attempt < MAX_FRESHNESS_RETRIES {
-            assert_eq!(pool.rules[&(key.clone(), 0)].retries, attempt + 1);
-            assert_eq!(pool.calls[&key].deadline, deadline);
+            assert_eq!(evaluator.calls[&key].rules[&0].retries, attempt + 1);
+            assert_eq!(evaluator.calls[&key].deadline, deadline);
         }
     }
     let result = receive.await.unwrap().unwrap();
     assert!(matches!(result.rules[&0], Err(Error::Expired { .. })));
-    assert!(pool.calls.is_empty());
-    assert!(pool.rules.is_empty());
+    assert!(evaluator.calls.is_empty());
     server.abort();
 }
 
@@ -208,55 +199,32 @@ async fn cancelled_reuse_ignores_old_work_and_releases_capacity_after_checks() {
         rule a { input from "sensor/a" select number x; require x > 0; enforce deny; }"#,
     )
     .unwrap();
-    let mut pool = Pool::new(&program, &adapter);
+    let mut evaluator = RuleEvaluator::new(&program, &adapter);
     let permits = Arc::new(Semaphore::new(2));
     let key = ("plan".to_owned(), "call".to_owned(), TriggerTiming::Before);
-    let (owner, cancel) = watch::channel(());
-    let (reply, old_receive) = oneshot::channel();
-    pool.check(Check {
-        key: key.clone(),
-        check_id: 1,
-        capability: "robot/pick".into(),
-        consumer: "test".into(),
-        context: Arc::new(Value::Null),
-        cancel,
-        reply,
-        permit: permits.clone().try_acquire_owned().unwrap(),
-    });
-    pool.acquiring.clear();
+    let (owner, old_receive) = register(&mut evaluator, &key, 1, &permits);
+    evaluator.acquiring.clear();
     drop(owner);
     // Reuse happens before the cancellation stream has been polled.
-    let (_owner, cancel) = watch::channel(());
-    let (reply, receive) = oneshot::channel();
-    pool.check(Check {
-        key: key.clone(),
-        check_id: 2,
-        capability: "robot/pick".into(),
-        consumer: "test".into(),
-        context: Arc::new(Value::Null),
-        cancel,
-        reply,
-        permit: permits.clone().try_acquire_owned().unwrap(),
-    });
-    pool.acquiring.clear();
+    let (_owner, receive) = register(&mut evaluator, &key, 2, &permits);
+    evaluator.acquiring.clear();
     assert!(old_receive.await.is_err());
-    let deadline = pool.calls[&key].deadline;
-    pool.evaluate(ReadyCheck {
+    let deadline = evaluator.calls[&key].deadline;
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 1,
         data: Ok(snapshot(&program.rules[0], deadline)),
     });
-    assert!(pool.calls[&key].results.is_empty());
-    pool.evaluate(ReadyCheck {
+    assert!(evaluator.calls[&key].rules[&0].result.is_none());
+    evaluator.evaluate(ReadyCheck {
         key: (key.clone(), 0),
         check_id: 2,
         data: Ok(snapshot(&program.rules[0], deadline)),
     });
-    assert!(pool.calls.is_empty());
-    assert!(pool.rules.is_empty());
+    assert!(evaluator.calls.is_empty());
     // Check completion releases capacity even while its submitting owner is alive.
     timeout(Duration::from_secs(1), async {
-        while let Some(event) = pool.cancelled.next().await {
+        while let Some(event) = evaluator.cancelled.next().await {
             assert!(event.is_none());
         }
     })

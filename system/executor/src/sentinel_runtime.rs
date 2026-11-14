@@ -2,21 +2,28 @@
 
 //! SRDL policy loading and invocation-bound checks with trusted call context.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use crate::pb::pilot::CapabilityCall;
+use crate::pb::executor::RtdlEvent;
+use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, rtdl_node_state::RtdlNodeStateEnum};
 use crate::{active_plans::PlanRuntime, dispatch, rtdl_events::NodeEventContext};
 use anyhow::{Context, Result};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_scribe::warn;
-use robonix_sentinel::{
-    interpreter::{
-        CheckContext, SrdlInterpreter,
-        enforcer::{Effect, EnforcementResult, Error as HookError, HookRuntime},
-    },
-    srdl::ast::TriggerTiming,
+use robonix_sentinel::interpreter::{
+    CheckContext, SrdlInterpreter,
+    enforcer::{Effect, EnforcementResult, Error as HookError, HookRuntime},
 };
 use serde_json::{Map, Value};
+use tokio::sync::{mpsc::Sender, watch};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use crate::pb::contracts::robonix_system_keystone_get_profile_client::RobonixSystemKeystoneGetProfileClient;
@@ -47,7 +54,7 @@ pub struct SentinelIdentity {
 /// Immutable SRDL policy and shared Atlas acquisition resources for all active plans.
 #[derive(Clone)]
 pub struct SentinelRuntime {
-    /// Shared interpreter with one pool for independent before and after checks.
+    /// Shared interpreter and queues for the complete capability lifecycle.
     interpreter: Arc<SrdlInterpreter>,
     /// Discovery connection cloned for capability hooks without holding shared locks.
     atlas: AtlasClient,
@@ -58,6 +65,7 @@ pub struct SentinelRuntime {
 pub struct SentinelServiceImpl;
 
 impl SentinelRuntime {
+    /// Load a policy snapshot; later file changes do not affect active plans.
     pub fn load(path: &Path, atlas: AtlasClient) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("read Sentinel SRDL '{}'", path.display()))?;
@@ -65,87 +73,42 @@ impl SentinelRuntime {
             .with_context(|| format!("load Sentinel SRDL '{}'", path.display()))
     }
 
+    /// Validate SRDL and start shared check queues; requires an active Tokio runtime.
     pub fn new(source: &str, atlas: AtlasClient) -> Result<Self> {
         Ok(Self {
-            interpreter: Arc::new(SrdlInterpreter::new(source, atlas.clone())?),
+            interpreter: Arc::new(SrdlInterpreter::load(source, atlas.clone())?),
             atlas,
         })
     }
 
-    pub async fn check(
-        &self,
-        node: &NodeEventContext,
-        call: &CapabilityCall,
-        identity: &SentinelIdentity,
-        timing: TriggerTiming,
-        runtime: &PlanRuntime,
-        provider_id: &str,
-    ) -> Result<EnforcementResult, serde_json::Error> {
+    /// Bind checks and corrective calls to this node's verified identity and plan controls.
+    pub(crate) fn hooks<'a>(
+        &'a self,
+        node: &'a NodeEventContext,
+        identity: &'a SentinelIdentity,
+        runtime: &'a PlanRuntime,
+        provider_id: &'a str,
+    ) -> ExecutorHooks<'a> {
         ExecutorHooks {
-            sentinel: self,
+            interpreter: &self.interpreter,
+            atlas: &self.atlas,
             runtime,
             provider_id,
             identity,
             node,
             depth: 0,
-        }
-        .check(call, timing)
-        .await
-    }
-
-    /// Release admission for a completed call independently of after-rule checking.
-    pub fn finish(&self, plan_id: &str, call: &CapabilityCall, admission_id: Option<u64>) {
-        if let Some(id) = admission_id {
-            self.interpreter.finish(plan_id, &call.call_id, id);
+            completed: None,
+            stopped: None,
         }
     }
-
-    fn context(args_json: &str, identity: &SentinelIdentity) -> Result<Value, serde_json::Error> {
-        let arguments: Map<String, Value> = serde_json::from_str(args_json)?;
-        Ok(serde_json::json!({
-            "arguments": arguments,
-            "identity": {
-                "known": identity.known,
-                "user_id": if identity.known && !identity.user_id.is_empty() { Some(&identity.user_id) } else { None },
-                "roles": if identity.known { identity.roles.clone() } else { Vec::new() },
-            },
-        }))
-    }
-}
-
-/// Serialize requirement results, reports and evaluation or enforcement failures.
-pub fn feedback(result: &EnforcementResult) -> Value {
-    let reports: Vec<_> = result
-        .reports
-        .iter()
-        .map(|report| {
-            let (requirements, violations, evaluation_error) = match &report.evaluation {
-                Ok(value) => (Some(&value.requirements), value.failed_requirements(), None),
-                Err(error) => (None, Vec::new(), Some(error.to_string())),
-            };
-            let (enforcement, enforcement_error) = match &report.enforcement {
-                Some(Ok(effect)) => (Some(effect), None),
-                Some(Err(error)) => (None, Some(error.to_string())),
-                None => (None, None),
-            };
-            serde_json::json!({"rule":report.rule, "timing":report.timing, "requirements":requirements,
-            "violations":violations, "enforcement":enforcement,
-            "evaluation_error":evaluation_error, "enforcement_error":enforcement_error})
-        })
-        .collect();
-    let calls: Vec<_> = result.calls.iter().map(|call| serde_json::json!({
-        "capability":call.capability,
-        "rule":result.reports[call.rule].rule,
-        "success":call.result.as_ref().map(Result::is_ok),
-        "error":call.result.as_ref().and_then(|result| result.as_ref().err()).map(ToString::to_string),
-    })).collect();
-    serde_json::json!({"effect":result.effect, "messages":result.messages, "calls":calls, "reports":reports})
 }
 
 /// Invocation-scoped Executor access for hooks, including nested policy checks.
-struct ExecutorHooks<'a> {
-    /// Shared rule set and discovery connection.
-    sentinel: &'a SentinelRuntime,
+pub(crate) struct ExecutorHooks<'a> {
+    /// Shared rule set used directly for lifecycle checks.
+    interpreter: &'a SrdlInterpreter,
+    /// Discovery connection for corrective capability calls.
+    atlas: &'a AtlasClient,
     /// Tracks cancellation and active asynchronous capability executions.
     runtime: &'a PlanRuntime,
     /// Executor identity used for discovery and in-process dispatch.
@@ -156,37 +119,212 @@ struct ExecutorHooks<'a> {
     node: &'a NodeEventContext,
     /// Bounds recursive hook execution when rules trigger other capability calls.
     depth: usize,
+    /// Ends monitoring after capability completion without cancelling the plan.
+    completed: Option<&'a watch::Receiver<bool>>,
+    /// Shares stop feedback across a capability and its corrective calls.
+    stopped: Option<&'a AtomicBool>,
 }
 
 impl ExecutorHooks<'_> {
-    async fn check(
+    /// Reserve exclusions and apply before rules using trusted call context.
+    /// Pass an allowed result's admission ID to `on_complete` for every execution outcome.
+    pub(crate) async fn on_arrival(
         &self,
         call: &CapabilityCall,
-        timing: TriggerTiming,
     ) -> Result<EnforcementResult, serde_json::Error> {
-        let values = SentinelRuntime::context(&call.args_json, self.identity)?;
+        let values = self.values(&call.args_json)?;
         Ok(self
-            .sentinel
             .interpreter
-            .check_with_runtime(
-                &CheckContext {
-                    plan_id: &self.node.plan_id,
-                    call_id: &call.call_id,
-                    capability: &call.contract_id,
-                    consumer_id: SENTINEL_PROVIDER_ID,
-                    values: &values,
-                    timing,
-                },
-                self,
-            )
+            .on_arrival(self.context(call, &values), self)
             .await)
+    }
+
+    /// Execute the capability and drain its while checks before returning.
+    pub(crate) async fn on_execution(
+        &self,
+        call: &CapabilityCall,
+        tx: Option<&Sender<Result<RtdlEvent, Status>>>,
+    ) -> (CapabilityCallResult, u32, String) {
+        let (completed, completion) = watch::channel(false);
+        let requested_stop = AtomicBool::new(false);
+        // A corrective call's stop must remain visible in its caller's feedback.
+        let stopped = self.stopped.unwrap_or(&requested_stop);
+        let hooks = ExecutorHooks {
+            completed: Some(&completion),
+            stopped: Some(stopped),
+            ..*self
+        };
+        let mut atlas = self.atlas.clone();
+        let monitor = hooks.monitor(call, tx);
+        let execute = dispatch::run_until_terminal(
+            call,
+            self.provider_id,
+            &mut atlas,
+            self.runtime,
+            self.node,
+        );
+        tokio::pin!(monitor, execute);
+        let ((mut result, mut state), detail) = tokio::select! {
+            biased;
+            result = &mut execute => {
+                // Let active checks and hooks finish their cleanup before releasing exclusions.
+                if !self.runtime.is_cancelled(&self.node.plan_id).await
+                    && !stopped.load(Ordering::Acquire) {
+                    completed.send_replace(true);
+                }
+                (result, monitor.await)
+            }
+            detail = &mut monitor => (execute.await, detail),
+        };
+        // Plan cancellation also owns a result that races with successful execution.
+        if self.runtime.is_cancelled(&self.node.plan_id).await {
+            state = RtdlNodeStateEnum::Canceled as u32;
+            result.success = false;
+            if stopped.load(Ordering::Acquire) && !detail.is_empty() {
+                result.error = format!("Sentinel stopped plan: {detail}");
+            }
+        }
+        (result, state, detail)
+    }
+
+    /// Release admission for every outcome, then apply after rules only on success.
+    pub(crate) async fn on_complete(
+        &self,
+        call: &CapabilityCall,
+        admission_id: Option<u64>,
+        succeeded: bool,
+    ) -> Result<EnforcementResult, serde_json::Error> {
+        let values = if succeeded {
+            self.values(&call.args_json)
+        } else {
+            Ok(Value::Null)
+        };
+        // Release admission even if context construction prevents postcondition evaluation.
+        let result = self
+            .interpreter
+            .on_complete(
+                self.context(call, values.as_ref().unwrap_or(&Value::Null)),
+                self,
+                admission_id,
+                succeeded && values.is_ok(),
+            )
+            .await;
+        values.map(|_| result)
+    }
+
+    /// Run invocation-local checks and retain their latest enforcement feedback.
+    async fn monitor(
+        &self,
+        call: &CapabilityCall,
+        tx: Option<&Sender<Result<RtdlEvent, Status>>>,
+    ) -> String {
+        let mut detail = String::new();
+        let values = match self.values(&call.args_json) {
+            Ok(values) => values,
+            Err(error) => {
+                self.stop().await;
+                return serde_json::json!({"effect":"stop", "context_error":error.to_string()})
+                    .to_string();
+            }
+        };
+        let checks = self
+            .interpreter
+            .on_execution(self.context(call, &values), self);
+        tokio::pin!(checks);
+        while let Some(result) = checks.next().await {
+            // Execution ending can cancel an in-flight check; discard that check's error.
+            if self.completed.is_some_and(|completed| *completed.borrow())
+                || (self.runtime.is_cancelled(&self.node.plan_id).await
+                    && !self
+                        .stopped
+                        .is_some_and(|stopped| stopped.load(Ordering::Acquire)))
+            {
+                return detail;
+            }
+            if result.effect == Effect::Stop
+                || result
+                    .reports
+                    .iter()
+                    .any(|report| report.enforcement.is_some())
+            {
+                detail = feedback(&result).to_string();
+                if let Some(tx) = tx {
+                    // A slow stream consumer must not delay the next safety check.
+                    match tx.try_send(Ok(crate::rtdl_events::node_state(
+                        self.node,
+                        RtdlNodeStateEnum::Running as u32,
+                        detail.clone(),
+                        None,
+                    ))) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                "[executor] while progress channel full; retaining latest feedback for the terminal event"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return detail,
+                    }
+                }
+            }
+        }
+        detail
+    }
+
+    fn values(&self, args_json: &str) -> Result<Value, serde_json::Error> {
+        let arguments: Map<String, Value> = serde_json::from_str(args_json)?;
+        Ok(serde_json::json!({
+            "arguments": arguments,
+            "identity": {
+                "known": self.identity.known,
+                "user_id": if self.identity.known && !self.identity.user_id.is_empty() { Some(&self.identity.user_id) } else { None },
+                "roles": if self.identity.known { self.identity.roles.clone() } else { Vec::new() },
+            },
+        }))
+    }
+
+    fn context<'a>(&'a self, call: &'a CapabilityCall, values: &'a Value) -> CheckContext<'a> {
+        CheckContext {
+            plan_id: &self.node.plan_id,
+            call_id: &call.call_id,
+            capability: &call.contract_id,
+            consumer_id: SENTINEL_PROVIDER_ID,
+            values,
+        }
     }
 }
 
 #[tonic::async_trait]
 impl HookRuntime for ExecutorHooks<'_> {
+    async fn stop(&self) {
+        if self.runtime.is_cancelled(&self.node.plan_id).await
+            || self.completed.is_some_and(|completed| *completed.borrow())
+        {
+            return;
+        }
+        if let Some(stopped) = self.stopped {
+            stopped.store(true, Ordering::Release);
+        }
+        let mut atlas = self.atlas.clone();
+        // Waiting for this plan to finish here would wait on the check making this request.
+        self.runtime
+            .cancel_plan_control(&self.node.plan_id, 0, self.provider_id, &mut atlas)
+            .await;
+    }
+
     async fn cancelled(&self) {
-        self.runtime.wait_cancelled(&self.node.plan_id).await;
+        let completed = async {
+            match self.completed {
+                Some(completed) => {
+                    let mut completed = completed.clone();
+                    let _ = completed.wait_for(|completed| *completed).await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = self.runtime.wait_cancelled(&self.node.plan_id) => {},
+            () = completed => {},
+        }
     }
 
     async fn call(&self, capability: &str) -> Result<(), HookError> {
@@ -195,7 +333,7 @@ impl HookRuntime for ExecutorHooks<'_> {
                 "capability hook nesting exceeds 8 calls".into(),
             ));
         }
-        let mut atlas = self.sentinel.atlas.clone();
+        let mut atlas = self.atlas.clone();
         let providers = tokio::select! {
             biased;
             _ = self.cancelled() => {
@@ -229,7 +367,7 @@ impl HookRuntime for ExecutorHooks<'_> {
             ..*self
         };
         let before = hooks
-            .check(&call, TriggerTiming::Before)
+            .on_arrival(&call)
             .await
             .map_err(|error| HookError::Runtime(error.to_string()))?;
         if before.effect == Effect::Deny {
@@ -244,26 +382,18 @@ impl HookRuntime for ExecutorHooks<'_> {
                 })
             )));
         }
-        let (result, _) = dispatch::run_until_terminal(
-            &call,
-            self.provider_id,
-            &mut atlas,
-            self.runtime,
-            self.node,
-        )
-        .await;
-        self.sentinel
-            .finish(&self.node.plan_id, &call, before.admission_id);
+        let (result, _, _) = hooks.on_execution(&call, None).await;
+        // Nested corrective calls follow the same explicit completion path as plan calls.
+        let after = hooks
+            .on_complete(&call, before.admission_id, result.success)
+            .await
+            .map_err(|error| HookError::Runtime(error.to_string()))?;
         if !result.success {
             return Err(HookError::Runtime(format!(
                 "hook capability '{capability}' failed: {}",
                 result.error
             )));
         }
-        let after = hooks
-            .check(&call, TriggerTiming::After)
-            .await
-            .map_err(|error| HookError::Runtime(error.to_string()))?;
         if let Some(error) = check_error(&after) {
             return Err(HookError::Runtime(format!(
                 "hook capability after check failed: {error}"
@@ -271,6 +401,35 @@ impl HookRuntime for ExecutorHooks<'_> {
         }
         Ok(())
     }
+}
+
+/// Serialize requirement results, reports and evaluation or enforcement failures.
+pub fn feedback(result: &EnforcementResult) -> Value {
+    let reports: Vec<_> = result
+        .reports
+        .iter()
+        .map(|report| {
+            let (requirements, violations, evaluation_error) = match &report.evaluation {
+                Ok(value) => (Some(&value.requirements), value.failed_requirements(), None),
+                Err(error) => (None, Vec::new(), Some(error.to_string())),
+            };
+            let (enforcement, enforcement_error) = match &report.enforcement {
+                Some(Ok(effect)) => (Some(effect), None),
+                Some(Err(error)) => (None, Some(error.to_string())),
+                None => (None, None),
+            };
+            serde_json::json!({"rule":report.rule, "timing":report.timing, "requirements":requirements,
+            "violations":violations, "enforcement":enforcement,
+            "evaluation_error":evaluation_error, "enforcement_error":enforcement_error})
+        })
+        .collect();
+    let calls: Vec<_> = result.calls.iter().map(|call| serde_json::json!({
+        "capability":call.capability,
+        "rule":result.reports[call.rule].rule,
+        "success":call.result.as_ref().map(Result::is_ok),
+        "error":call.result.as_ref().and_then(|result| result.as_ref().err()).map(ToString::to_string),
+    })).collect();
+    serde_json::json!({"effect":result.effect, "messages":result.messages, "calls":calls, "reports":reports})
 }
 
 fn check_error(result: &EnforcementResult) -> Option<String> {
@@ -381,28 +540,109 @@ mod tests {
     use robonix_atlas::service::{AtlasRegistry, serve_atlas};
     use robonix_sentinel::interpreter::enforcer::Effect;
 
+    fn reserve_address() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    async fn start_atlas() -> (AtlasClient, tokio::task::JoinHandle<Result<()>>) {
+        let address = reserve_address();
+        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{address}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        (atlas, server)
+    }
+
+    fn node(plan_id: &str) -> NodeEventContext {
+        NodeEventContext {
+            plan_id: plan_id.into(),
+            node_index: 0,
+            node_kind: 2,
+            op_id: "test".into(),
+            description: "check hook execution".into(),
+        }
+    }
+
+    fn call(capability: &str) -> CapabilityCall {
+        CapabilityCall {
+            call_id: capability.into(),
+            provider_id: "executor".into(),
+            contract_id: capability.into(),
+            args_json: "{}".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitoring_cancels_only_on_stop_despite_full_progress_channel() {
+        let (atlas, server) = start_atlas().await;
+        for (source, command, stopped) in [
+            (
+                r#"
+            trigger [report, halt] while "robonix/system/executor/builtin/run_command";
+            rule report { require false; enforce report "unsafe"; }
+            rule halt { require false; enforce stop; }
+        "#,
+                "sleep 30",
+                true,
+            ),
+            ("", "printf complete", false),
+        ] {
+            let sentinel = SentinelRuntime::new(source, atlas.clone()).unwrap();
+            let runtime = PlanRuntime::default();
+            runtime.register_plan("plan").await.unwrap();
+            let node = node("plan");
+            let call = CapabilityCall {
+                args_json: serde_json::json!({"command":command}).to_string(),
+                ..call("robonix/system/executor/builtin/run_command")
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(RtdlEvent::default())).unwrap();
+            let (result, state, detail) = tokio::time::timeout(
+                Duration::from_secs(3),
+                sentinel
+                    .hooks(&node, &SentinelIdentity::default(), &runtime, "executor")
+                    .on_execution(&call, Some(&tx)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.success, !stopped);
+            assert_eq!(
+                state,
+                if stopped {
+                    RtdlNodeStateEnum::Canceled
+                } else {
+                    RtdlNodeStateEnum::Succeeded
+                } as u32
+            );
+            assert_eq!(runtime.is_cancelled("plan").await, stopped);
+            if stopped {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&detail).unwrap()["effect"],
+                    "stop"
+                );
+            } else {
+                assert!(detail.is_empty());
+            }
+            assert!(rx.try_recv().is_ok());
+        }
+        server.abort();
+    }
+
     async fn check(
         runtime: &SentinelRuntime,
-        plan_id: &str,
         call: &CapabilityCall,
         identity: &SentinelIdentity,
-        timing: TriggerTiming,
     ) -> Result<EnforcementResult, serde_json::Error> {
         runtime
-            .check(
-                &NodeEventContext {
-                    plan_id: plan_id.into(),
-                    node_index: 0,
-                    node_kind: 2,
-                    op_id: "test".into(),
-                    description: "check hook execution".into(),
-                },
-                call,
-                identity,
-                timing,
-                &PlanRuntime::default(),
-                "executor",
-            )
+            .hooks(&node("plan"), identity, &PlanRuntime::default(), "executor")
+            .on_arrival(call)
             .await
     }
 
@@ -437,10 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_discovery_times_out_and_plan_cancellation_stops_both_discovery_steps() {
-        let address = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let address = reserve_address();
         let requested = Arc::new(tokio::sync::Notify::new());
         let server = tokio::spawn(
             tonic::transport::Server::builder()
@@ -459,21 +696,8 @@ mod tests {
         let sentinel = SentinelRuntime::new("", atlas.clone()).unwrap();
         let identity = SentinelIdentity::default();
         let runtime = PlanRuntime::default();
-        let node = NodeEventContext {
-            plan_id: "plan".into(),
-            node_index: 0,
-            node_kind: 2,
-            op_id: "test".into(),
-            description: "cancel discovery".into(),
-        };
-        let hooks = ExecutorHooks {
-            sentinel: &sentinel,
-            runtime: &runtime,
-            provider_id: "executor",
-            identity: &identity,
-            node: &node,
-            depth: 0,
-        };
+        let node = node("plan");
+        let hooks = sentinel.hooks(&node, &identity, &runtime, "executor");
         let error = hooks.call("missing").await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
         requested.notified().await;
@@ -499,10 +723,8 @@ mod tests {
             ..node
         };
         let call = CapabilityCall {
-            call_id: "call".into(),
             provider_id: "remote".into(),
-            contract_id: "target".into(),
-            args_json: "{}".into(),
+            ..call("target")
         };
         let mut dispatch_atlas = atlas.clone();
         let dispatch =
@@ -525,18 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_rules_use_trusted_context_and_preserve_failure_feedback() {
-        let address = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
-        let atlas = AtlasClient::connect_with_retry(
-            format!("http://{address}"),
-            50,
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
+        let (atlas, server) = start_atlas().await;
         let path = std::env::temp_dir().join(format!("sentinel-{}.srdl", uuid::Uuid::new_v4()));
         assert!(SentinelRuntime::load(&path, atlas.clone()).is_err());
         std::fs::write(
@@ -563,17 +774,13 @@ mod tests {
                 user_id: user.into(),
                 roles: Vec::new(),
             };
-            let args = serde_json::json!({"permitted":permitted,"identity":{"user_id":"alice"}})
-                .to_string();
             let call = CapabilityCall {
-                call_id: "move".into(),
-                provider_id: "robot".into(),
-                contract_id: "move".into(),
-                args_json: args,
+                args_json:
+                    serde_json::json!({"permitted":permitted,"identity":{"user_id":"alice"}})
+                        .to_string(),
+                ..call("move")
             };
-            let decision = check(&runtime, "plan", &call, &identity, TriggerTiming::Before)
-                .await
-                .unwrap();
+            let decision = check(&runtime, &call, &identity).await.unwrap();
             assert_eq!(decision.effect, effect);
             let detail = feedback(&decision);
             let report = &detail["reports"][0];
@@ -586,24 +793,13 @@ mod tests {
             }
         }
         let anonymous = SentinelIdentity::default();
-        let mut call = CapabilityCall {
-            call_id: "other".into(),
-            provider_id: "robot".into(),
-            contract_id: "other".into(),
-            args_json: "{}".into(),
-        };
-        let unmatched = check(&runtime, "plan", &call, &anonymous, TriggerTiming::Before)
-            .await
-            .unwrap();
+        let mut call = call("other");
+        let unmatched = check(&runtime, &call, &anonymous).await.unwrap();
         assert_eq!(unmatched.effect, Effect::Allow);
         assert!(unmatched.reports.is_empty());
         for invalid in ["{", "[]", "null"] {
             call.args_json = invalid.into();
-            assert!(
-                check(&runtime, "plan", &call, &anonymous, TriggerTiming::Before)
-                    .await
-                    .is_err()
-            );
+            assert!(check(&runtime, &call, &anonymous).await.is_err());
         }
         std::fs::remove_file(path).unwrap();
         server.abort();
@@ -612,18 +808,7 @@ mod tests {
     #[tokio::test]
     async fn recorded_calls_execute_with_nested_policy_checks_and_bounded_recursion() {
         use robonix_atlas::{client::mcp_params, pb::Transport};
-        let address = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), address));
-        let mut atlas = AtlasClient::connect_with_retry(
-            format!("http://{address}"),
-            50,
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
+        let (mut atlas, server) = start_atlas().await;
         let capability = "robonix/system/executor/builtin/get_all_plans";
         atlas
             .register_service("executor", "robonix/system/executor", "")
@@ -669,21 +854,9 @@ mod tests {
                 "trigger guard before target; rule guard {{ require false; enforce call \"{called}\", report \"requested\"; }} {extra}"
             );
             let runtime = SentinelRuntime::new(&source, atlas.clone()).unwrap();
-            let target = CapabilityCall {
-                call_id: "target".into(),
-                provider_id: "executor".into(),
-                contract_id: "target".into(),
-                args_json: "{}".into(),
-            };
-            let result = check(
-                &runtime,
-                "plan",
-                &target,
-                &SentinelIdentity::default(),
-                TriggerTiming::Before,
-            )
-            .await
-            .unwrap();
+            let result = check(&runtime, &call("target"), &SentinelIdentity::default())
+                .await
+                .unwrap();
             assert_eq!(result.messages, ["requested"]);
             assert_eq!(result.calls.len(), 1);
             let outcome = result.calls[0].result.as_ref().unwrap();

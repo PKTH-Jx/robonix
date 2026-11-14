@@ -12,11 +12,13 @@ use super::evaluator::{self, RuleResult};
 use crate::srdl::ast::{Program, TriggerTiming};
 
 /// Capability-call decision returned by SRDL enforcement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
+    #[default]
     Allow,
     Deny,
+    Stop,
 }
 
 /// An enforcement failure, separate from an input or requirement evaluation failure.
@@ -44,7 +46,7 @@ pub struct RuleReport {
 pub struct EnforcementResult {
     /// Identifies a committed exclusion admission for an eventual completion notification.
     pub admission_id: Option<u64>,
-    /// Before checks may deny admission; after checks always allow and report their results.
+    /// Admission or cancellation decision accumulated across all matching rules.
     pub effect: Effect,
     /// Messages accumulated by report hooks in execution order.
     pub messages: Vec<String>,
@@ -82,26 +84,31 @@ impl Enforcer {
         Self { rules }
     }
 
-    /// Consume source-ordered results; only violated requirements run their bound hooks.
-    /// Evaluation errors deny before admission without invoking hooks; calls remain queued.
+    /// Retain violations across while checks so enforcement runs once until recovery.
     pub(super) fn enforce(
         &self,
         results: impl IntoIterator<Item = (usize, Result<RuleResult, evaluator::Error>)>,
         timing: TriggerTiming,
         builder: &mut EnforcementBuilder,
+        violated: &mut std::collections::BTreeSet<usize>,
     ) {
         for (index, evaluation) in results {
             let rule = &self.rules[index];
             let mut enforcement = None;
             match &evaluation {
                 Ok(result) if !result.passed() => {
-                    for hook in &rule.hooks {
-                        hook.execute(builder);
+                    // Stop ends monitoring, so all hooks can share the same recovery gate.
+                    if timing != TriggerTiming::While || violated.insert(index) {
+                        for hook in &rule.hooks {
+                            hook.execute(builder);
+                        }
+                        enforcement = Some(Ok(builder.effect()));
                     }
-                    enforcement = Some(Ok(builder.effect()));
                 }
-                Err(_) if timing == TriggerTiming::Before => builder.deny(),
-                _ => {}
+                Err(_) => builder.fail(timing),
+                Ok(_) => {
+                    violated.remove(&index);
+                }
             }
             builder.reports.push(RuleReport {
                 timing,

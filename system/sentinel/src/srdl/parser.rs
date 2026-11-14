@@ -291,6 +291,8 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Require
         | TokenKind::Before
         | TokenKind::After
+        | TokenKind::While
+        | TokenKind::Interval
         | TokenKind::Enforce
         | TokenKind::From
         | TokenKind::Select
@@ -298,6 +300,7 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         | TokenKind::Always
         | TokenKind::Allow
         | TokenKind::Deny
+        | TokenKind::Stop
         | TokenKind::Call
         | TokenKind::Report => Ok((rest, Identifier(token.text().to_owned()))),
         _ => Err(Err::Error(expected(&input, "a select field name"))),
@@ -328,16 +331,40 @@ fn trigger_clause(input: Tokens<'_>) -> IResult<'_, TriggerClause> {
     let timing = match input.tok.first().map(|token| token.kind) {
         Some(TokenKind::Before) => TriggerTiming::Before,
         Some(TokenKind::After) => TriggerTiming::After,
-        _ => return Err(Err::Error(expected(&input, "'before' or 'after'"))),
+        Some(TokenKind::While) => TriggerTiming::While,
+        _ => {
+            return Err(Err::Error(expected(
+                &input,
+                "'before', 'after', or 'while'",
+            )));
+        }
     };
     let input = input.take_from(1);
     let (input, capabilities) = one_or_list(input, trigger_target)?;
+    let (input, interval) =
+        if input.tok.first().map(|token| token.kind) == Some(TokenKind::Interval) {
+            if timing != TriggerTiming::While {
+                return Err(Err::Error(expected(
+                    &input,
+                    "interval only on a while trigger",
+                )));
+            }
+            let start = input.take_from(1);
+            let (rest, interval) = number_literal(start.clone())?;
+            if interval <= 0.0 {
+                return Err(Err::Error(expected(&start, "a positive interval factor")));
+            }
+            (rest, interval)
+        } else {
+            (input, 5.0)
+        };
     Ok((
         input,
         TriggerClause {
             rules,
             timing,
             capabilities,
+            interval,
         },
     ))
 }
@@ -425,6 +452,7 @@ fn enforce_hook(input: Tokens<'_>) -> IResult<'_, EnforceBehavior> {
     match input.tok.first().map(|t| t.kind) {
         Some(TokenKind::Allow) => Ok((input.take_from(1), EnforceBehavior::Allow)),
         Some(TokenKind::Deny) => Ok((input.take_from(1), EnforceBehavior::Deny)),
+        Some(TokenKind::Stop) => Ok((input.take_from(1), EnforceBehavior::Stop)),
         Some(TokenKind::Call) => {
             let (rest, capability) = string_literal(input.take_from(1))?;
             Ok((rest, EnforceBehavior::Call(capability)))
@@ -435,7 +463,7 @@ fn enforce_hook(input: Tokens<'_>) -> IResult<'_, EnforceBehavior> {
         }
         _ => Err(Err::Error(expected(
             &input,
-            "'allow', 'deny', 'call', or 'report'",
+            "'allow', 'deny', 'stop', 'call', or 'report'",
         ))),
     }
 }
@@ -477,8 +505,11 @@ fn identifier(input: Tokens) -> IResult<Identifier> {
         | TokenKind::Always
         | TokenKind::Before
         | TokenKind::After
+        | TokenKind::While
+        | TokenKind::Interval
         | TokenKind::Allow
         | TokenKind::Deny
+        | TokenKind::Stop
         | TokenKind::Call
         | TokenKind::Report => Ok((rest, Identifier(token.text().to_string()))),
         _ => Err(Err::Error(expected(&input, "an identifier"))),

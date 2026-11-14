@@ -1,31 +1,39 @@
 //! Runtime trigger matching of SRDL rules.
 
-use std::collections::BTreeSet;
-
 use crate::srdl::ast::*;
 
 /// Selects immutable rule indices for one capability invocation.
 pub struct TriggerMatcher;
 
 impl TriggerMatcher {
-    pub fn match_indices(program: &Program, capability: &str, timing: TriggerTiming) -> Vec<usize> {
-        let matched: BTreeSet<_> = program
-            .triggers
-            .iter()
-            .filter(|trigger| {
-                trigger.timing == timing
-                    && trigger.capabilities.iter().any(|target| match target {
-                        TriggerTarget::Always => true,
-                        TriggerTarget::Capability(name) => name == capability,
-                    })
+    pub(super) fn matches(
+        trigger: &TriggerClause,
+        capability: &str,
+        timing: TriggerTiming,
+    ) -> bool {
+        trigger.timing == timing
+            && trigger.capabilities.iter().any(|target| match target {
+                TriggerTarget::Always => true,
+                TriggerTarget::Capability(name) => name == capability,
             })
-            .flat_map(|trigger| trigger.rules.iter().map(|name| name.0.as_str()))
-            .collect();
+    }
+
+    /// Return the indices of all rules triggered by a capability at a given timing, in declaration order.
+    pub fn match_indices(program: &Program, capability: &str, timing: TriggerTiming) -> Vec<usize> {
         program
             .rules
             .iter()
             .enumerate()
-            .filter_map(|(index, rule)| matched.contains(rule.name.0.as_str()).then_some(index))
+            .filter_map(|(index, rule)| {
+                program
+                    .triggers
+                    .iter()
+                    .any(|trigger| {
+                        Self::matches(trigger, capability, timing)
+                            && trigger.rules.contains(&rule.name)
+                    })
+                    .then_some(index)
+            })
             .collect()
     }
 }
@@ -36,22 +44,23 @@ mod tests {
     use crate::srdl::parse;
 
     #[test]
-    fn matches_once_in_order_and_keeps_calls_independent() {
+    fn matches_in_source_order_and_keeps_calls_independent() {
         let program = parse(
             r#"
-            trigger [alternatives, exact] before ["robot/move", "robot/turn", "robot/move"];
-            trigger alternatives before ["robot/stop", "robot/move"];
-            rule exact { require true; enforce deny; }
-            rule unrelated { require true; enforce deny; }
+            trigger [alternatives, exact] before ["robot/move", "robot/turn"];
+            trigger alternatives before "robot/stop";
+            rule exact { require true; enforce allow; }
+            rule unrelated { require true; enforce allow; }
             trigger unrelated before "robot/move/other";
-            rule alternatives { require true; enforce deny; }
-            rule unconditional { require true; enforce deny; }
-            rule unused { require true; enforce deny; }
+            rule alternatives { require true; enforce allow; }
+            rule unconditional { require true; enforce allow; }
+            rule unused { require true; enforce allow; }
             trigger unconditional before always;
             trigger [unused, alternatives] after ["robot/move", "robot/stop"];
         "#,
         )
         .unwrap();
+        crate::interpreter::type_checker::TypeChecker::check(&program).unwrap();
         for (capability, expected) in [
             ("robot/move", vec![0, 2, 3]),
             ("robot/stop", vec![2, 3]),
