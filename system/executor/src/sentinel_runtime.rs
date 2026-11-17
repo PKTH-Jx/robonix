@@ -757,7 +757,7 @@ mod tests {
             context string user = identity.user_id;
             context boolean permitted = arguments.permitted;
             require user = "alice"; require permitted;
-            enforce deny, report "blocked";
+            enforce [deny, report "blocked"];
         }"#,
         )
         .unwrap();
@@ -831,7 +831,7 @@ mod tests {
             (
                 capability,
                 format!(
-                    "trigger stop before \"{capability}\"; rule stop {{ require false; enforce deny, report \"nested denial\"; }}"
+                    "trigger stop before \"{capability}\"; rule stop {{ require false; enforce [deny, report \"nested denial\"]; }}"
                 ),
                 Some("nested denial"),
             ),
@@ -851,7 +851,7 @@ mod tests {
             ),
         ] {
             let source = format!(
-                "trigger guard before target; rule guard {{ require false; enforce call \"{called}\", report \"requested\"; }} {extra}"
+                "trigger guard before target; rule guard {{ require false; enforce [call \"{called}\", report \"requested\"]; }} {extra}"
             );
             let runtime = SentinelRuntime::new(&source, atlas.clone()).unwrap();
             let result = check(&runtime, &call("target"), &SentinelIdentity::default())

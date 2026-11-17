@@ -369,12 +369,12 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
             context string user = identity.user_id;
             input from "sensor/value" select number x = reading, boolean ready = ready;
             require user = "alice" && ready && x > 0;
-            enforce deny, report "unused";
+            enforce [deny, report "unused"];
         }
         rule violation {
             input from "sensor/value" select number x = reading;
             require x < 0;
-            enforce deny, report "blocked";
+            enforce [deny, report "blocked"];
         }
         rule ignored {
             context string missing = unknown.field;
@@ -426,7 +426,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         r#"trigger failure before always;
         rule failure {
         input from "sensor/missing" select number x;
-        require x > 0; enforce allow, report "unused";
+        require x > 0; enforce [allow, report "unused"];
     }"#,
     );
     let result = failed
@@ -642,7 +642,7 @@ async fn pool_checks_events_independently_with_fresh_inputs() {
         }
         rule contextual {
             context boolean ready = arguments.ready;
-            require ready; enforce allow, report "not ready";
+            require ready; enforce [allow, report "not ready"];
         }
     "#;
     let interpreter = fixture.interpreter(source);
@@ -735,7 +735,7 @@ async fn admission_conflicts_during_hooks_preserve_completed_call_feedback() {
     let fixture = AtlasFixture::new().await;
     let interpreter = fixture.interpreter(
         r#"exclude mutual A B; trigger guard before A;
-        rule guard { require false; enforce call "robot/stop", report "stop requested"; }"#,
+        rule guard { require false; enforce [call "robot/stop", report "stop requested"]; }"#,
     );
     let runtime = BlockingHook::default();
     let context = check_context("p", "a", "A", &Value::Null);

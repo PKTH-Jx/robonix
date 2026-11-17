@@ -1,6 +1,6 @@
 use super::ast::{
-    BinaryOperator as B, EnforceBehavior, EnforceClause, Expression as E, Identifier, InputField,
-    InputType, Literal, Rule, SelectStep, TriggerTarget, TriggerTiming, UnaryOperator as U,
+    BinaryOperator as B, EnforceBehavior, Expression as E, Identifier, InputField, InputType,
+    Literal, Rule, SelectStep, TriggerTarget, TriggerTiming, UnaryOperator as U,
 };
 use super::{Error, ErrorKind, parse};
 
@@ -509,7 +509,7 @@ fn parses_while_intervals_and_stop_and_rejects_invalid_intervals() {
         r#"
         trigger r while "robot/move";
         trigger [r] while ["robot/move", "robot/turn"] interval 2.5;
-        rule r { require false; enforce stop, report "unsafe"; }
+        rule r { require false; enforce [stop, report "unsafe"]; }
     "#,
     )
     .unwrap();
@@ -612,7 +612,7 @@ fn parses_ordered_enforcement_hooks() {
         ),
         (r#"report """#, vec![EnforceBehavior::Report("".into())]),
         (
-            r#"deny, report "等待\n\"用户\"\u0041", allow, call "robot/stop", report "done""#,
+            r#"[deny, report "等待\n\"用户\"\u0041", allow, call "robot/stop", report "done"]"#,
             vec![
                 EnforceBehavior::Deny,
                 EnforceBehavior::Report("等待\n\"用户\"A".into()),
@@ -622,12 +622,17 @@ fn parses_ordered_enforcement_hooks() {
             ],
         ),
     ] {
-        assert_eq!(
-            rule(&format!("require false; enforce {source};"))
-                .unwrap()
-                .enforce,
-            EnforceClause { hooks }
-        );
+        for declaration in std::iter::once(source.to_owned())
+            .chain((!source.starts_with('[')).then(|| format!("[{source}]")))
+        {
+            assert_eq!(
+                rule(&format!("require false; enforce {declaration};"))
+                    .unwrap()
+                    .enforce
+                    .hooks,
+                hooks,
+            );
+        }
     }
 }
 
@@ -636,6 +641,16 @@ fn rejects_invalid_enforcement_behaviors_and_reports() {
     for clause in [
         "enforce;",
         "enforce pend;",
+        "enforce [];",
+        "enforce allow, deny;",
+        r#"enforce deny, report "reason";"#,
+        "enforce [allow,];",
+        "enforce [,allow];",
+        "enforce [allow,,deny];",
+        "enforce [[allow]];",
+        "enforce [allow;",
+        "enforce [allow] deny;",
+        "enforce [allow], deny;",
         "enforce ,allow;",
         "enforce allow,;",
         "enforce allow,,deny;",
@@ -839,7 +854,7 @@ fn distinguishes_duplicate_and_missing_clauses() {
 
 #[test]
 fn retains_report_and_argument_failures() {
-    let source = "rule r { require true; enforce deny, report 1; }";
+    let source = "rule r { require true; enforce [deny, report 1]; }";
     let error = parse(source).unwrap_err();
     assert_eq!(
         error.kind,
@@ -849,7 +864,7 @@ fn retains_report_and_argument_failures() {
         }
     );
     assert_eq!(error.span.start, source.find('1').unwrap());
-    let source = r#"rule r { require true; enforce deny, report "\uD800"; }"#;
+    let source = r#"rule r { require true; enforce [deny, report "\uD800"]; }"#;
     let error = parse(source).unwrap_err();
     assert_eq!(error.kind, ErrorKind::InvalidString);
     assert_eq!(&source[error.span], r#""\uD800""#);

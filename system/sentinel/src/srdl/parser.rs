@@ -432,19 +432,9 @@ fn condition_expression(input: Tokens<'_>) -> IResult<'_, Expression> {
     expression(input, 0, 0)
 }
 
-// Grammar: enforce HOOK [, HOOK ...]; capability IDs and reports are quoted strings.
 fn enforce_clause(input: Tokens<'_>) -> IResult<'_, EnforceClause> {
-    let (mut input, _) = match_token(TokenKind::Enforce)(input)?;
-    let mut hooks = Vec::new();
-    loop {
-        let (rest, hook) = enforce_hook(input)?;
-        hooks.push(hook);
-        input = rest;
-        if input.tok.first().map(|token| token.kind) != Some(TokenKind::Comma) {
-            break;
-        }
-        input = input.take_from(1);
-    }
+    let (input, _) = match_token(TokenKind::Enforce)(input)?;
+    let (input, hooks) = one_or_list(input, enforce_hook)?;
     Ok((input, EnforceClause { hooks }))
 }
 

@@ -41,7 +41,7 @@ impl HookRuntime for Runtime {
 #[tokio::test]
 async fn stop_precedes_corrective_calls_and_survives_allow() {
     let program =
-        parse(r#"rule r { require false; enforce call "release", stop, allow; }"#).unwrap();
+        parse(r#"rule r { require false; enforce [call "release", stop, allow]; }"#).unwrap();
     let runtime = Runtime {
         require_stop: true,
         ..Default::default()
@@ -74,7 +74,7 @@ async fn stop_precedes_corrective_calls_and_survives_allow() {
 #[tokio::test]
 async fn while_hooks_run_once_until_all_requirements_recover() {
     let program =
-        parse(r#"rule r { require false; enforce report "unsafe", call "correct"; }"#).unwrap();
+        parse(r#"rule r { require false; enforce [report "unsafe", call "correct"]; }"#).unwrap();
     let enforcer = Enforcer::new(&program);
     let runtime = Runtime::default();
     let mut violated = Default::default();
@@ -114,9 +114,9 @@ async fn enforce(
 async fn hooks_accumulate_feedback_and_never_reverse_denial() {
     let program = parse(
         r#"
-        rule first { require false; enforce allow, deny, report "blocked",
-            call "robot/stop", report "stopped", allow, call "robot/release"; }
-        rule last { require false; enforce allow, report "observed"; }
+        rule first { require false; enforce [allow, deny, report "blocked",
+            call "robot/stop", report "stopped", allow, call "robot/release"]; }
+        rule last { require false; enforce [allow, report "observed"]; }
     "#,
     )
     .unwrap();
@@ -164,7 +164,7 @@ async fn hooks_accumulate_feedback_and_never_reverse_denial() {
 #[tokio::test]
 async fn passed_requirements_and_evaluation_failures_do_not_invoke_hooks() {
     let program =
-        parse(r#"rule r { require false; enforce call "robot/stop", report "violation"; }"#)
+        parse(r#"rule r { require false; enforce [call "robot/stop", report "violation"]; }"#)
             .unwrap();
     let enforcer = Enforcer::new(&program);
     let runtime = Runtime::default();
@@ -200,7 +200,7 @@ async fn passed_requirements_and_evaluation_failures_do_not_invoke_hooks() {
 #[tokio::test]
 async fn hook_failures_apply_timing_effects_and_preserve_reports() {
     let program =
-        parse(r#"rule r { require false; enforce call "robot/stop", report "unsafe", call "robot/reset", allow; }"#)
+        parse(r#"rule r { require false; enforce [call "robot/stop", report "unsafe", call "robot/reset", allow]; }"#)
             .unwrap();
     let enforcer = Enforcer::new(&program);
     let runtime = Runtime {

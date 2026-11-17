@@ -130,7 +130,7 @@ pathlib.Path(sys.argv[2]).write_text(f'''trigger require_admin_user before "robo
 rule require_admin_user {{
     context string user = identity.user_id;
     require user = {json.dumps(admin_id)};
-    enforce deny, report "Only the configured user may list the test workspace";
+    enforce [deny, report "Only the configured user may list the test workspace"];
 }}
 ''')
 PYRULE
@@ -682,12 +682,12 @@ trigger [write_after, additional_write_check] after "robonix/system/executor/bui
 rule write_before {
     context boolean permitted = arguments.permitted;
     require permitted;
-    enforce deny, report "Write was not permitted";
+    enforce [deny, report "Write was not permitted"];
 }
 rule write_after {
     context boolean accepted = arguments.accepted;
     require accepted;
-    enforce allow, report "Write postcondition was not satisfied";
+    enforce [allow, report "Write postcondition was not satisfied"];
 }
 rule additional_write_check {
     require true;
@@ -763,24 +763,24 @@ trigger call_after after "robonix/system/executor/builtin/write_file";
 rule deny_write {
     context boolean permitted = arguments.permitted;
     require permitted;
-    enforce deny, report "write denied";
+    enforce [deny, report "write denied"];
 }
 rule call_before {
     require false;
-    enforce call "robonix/system/executor/builtin/get_all_plans", report "before call";
+    enforce [call "robonix/system/executor/builtin/get_all_plans", report "before call"];
 }
 rule fail_hook {
     context boolean fail = arguments.fail_hook;
     require !fail;
-    enforce call "missing/capability", report "failed call";
+    enforce [call "missing/capability", report "failed call"];
 }
 rule allow_write {
     require false;
-    enforce allow, report "allow retains denial";
+    enforce [allow, report "allow retains denial"];
 }
 rule call_after {
     require false;
-    enforce call "robonix/system/executor/builtin/get_all_plans", report "after call";
+    enforce [call "robonix/system/executor/builtin/get_all_plans", report "after call"];
 }
 RULES
 ROBONIX_WORKSPACE="$WORK" "$EXECUTOR_BIN" \

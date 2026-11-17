@@ -26,13 +26,15 @@ timing also prevent loading, including duplicates within lists and overlaps with
 Unmatched rules skip predicate processing;
 before calls still pass exclusion admission.
 
-An enforce clause is a nonempty comma-separated list, for example
-`enforce deny, report "blocked", call "robot/stop", allow;`. Hooks run in the
+An enforce clause accepts one hook or a nonempty bracketed list, for example
+`enforce deny;`, `enforce [deny];`, or
+`enforce [deny, report "blocked", call "robot/stop", allow];`. Multiple hooks require brackets.
+Empty lists and trailing commas are rejected. Hooks run in the
 listed order; later `allow` hooks preserve denial. `report "TEXT"` can appear
 alone or multiple times and appends each message to the result's ordered
 `messages` list. Rule reports retain evaluation and enforcement details.
 
-`enforce call "robot/stop", report "Stop requested";` records a capability call
+`enforce [call "robot/stop", report "Stop requested"];` records a capability call
 with empty arguments. Hooks update the builder synchronously; the embedding
 runtime executes recorded calls in declaration order before the check finishes,
 including when another hook has denied admission. Execution failures deny before

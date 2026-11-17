@@ -379,7 +379,7 @@ mod tests {
                     r#"
                 trigger guard {timing} "{contract}";
                 rule guard {{ context boolean ready = arguments.ready;
-                    require ready; enforce {hook}, report "unsafe"; }}
+                    require ready; enforce [{hook}, report "unsafe"]; }}
             "#
                 ),
                 atlas.clone(),

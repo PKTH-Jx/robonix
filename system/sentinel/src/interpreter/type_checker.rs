@@ -505,7 +505,7 @@ mod tests {
             "trigger r after A; rule r { require true; enforce deny; }",
             "trigger r before A; trigger r after B; rule r { require true; enforce deny; }",
             "rule r { require true; enforce deny; } trigger [r] after always;",
-            "trigger r after A; rule r { require true; enforce allow, report \"bad timing\", deny; }",
+            "trigger r after A; rule r { require true; enforce [allow, report \"bad timing\", deny]; }",
         ] {
             let error = TypeChecker::check(&parse(source).unwrap()).unwrap_err();
             assert_eq!(error.rule, "r");
@@ -521,7 +521,7 @@ mod tests {
         for behavior in [
             "allow",
             r#"call "robot/stop""#,
-            r#"report "observed", call "robot/stop", allow"#,
+            r#"[report "observed", call "robot/stop", allow]"#,
         ] {
             TypeChecker::check(&parse(&format!(
                 "trigger r before A; trigger r after B; rule r {{ require false; enforce {behavior}; }}"
