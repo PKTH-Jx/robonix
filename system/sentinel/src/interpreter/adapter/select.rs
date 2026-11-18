@@ -93,7 +93,7 @@ mod tests {
         .remove(0)
         .inputs
         .remove(0)
-        .fields
+        .selects
         .remove(0)
         .select
     }

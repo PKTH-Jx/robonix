@@ -102,11 +102,11 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
             Some(TokenKind::Input) => {
                 let declaration = input.clone();
                 let (rest, clause) = input_clause(input)?;
-                for field in &clause.fields {
-                    if !input_names.insert(field.name.0.clone()) {
+                for field in clause.fields() {
+                    if !input_names.insert(field.name().0.clone()) {
                         return Err(Err::Error(at(
                             &declaration,
-                            ErrorKind::DuplicateInput(field.name.0.clone()),
+                            ErrorKind::DuplicateInput(field.name().0.clone()),
                         )));
                     }
                 }
@@ -189,49 +189,114 @@ fn context_clause(input: Tokens<'_>) -> IResult<'_, ContextClause> {
     ))
 }
 
-// One acquisition owns a nonempty list of TYPE NAME [= PATH] [maxage NUMBER] fields.
-// Commas separate fields; a comma inside a filter is not valid select syntax.
 fn input_clause(input: Tokens<'_>) -> IResult<'_, InputClause> {
-    let (input, (_, _, capability, _)) = (
-        match_token(TokenKind::Input),
-        match_token(TokenKind::From),
+    let (input, _) = match_token(TokenKind::Input)(input)?;
+    let (input, _) = match_token(TokenKind::From)(input)?;
+    let listed = input.tok.first().map(|t| t.kind) == Some(TokenKind::LBracket);
+    let (mut input, capabilities) = one_or_list(input, string_literal)?;
+    let source = if listed {
+        InputSource::List(capabilities)
+    } else {
+        InputSource::Single(capabilities.into_iter().next().unwrap())
+    };
+    let mut selects = Vec::new();
+    let mut yields = Vec::new();
+    loop {
+        match input.tok.first().map(|t| t.kind) {
+            Some(TokenKind::Select) => {
+                input = input.take_from(1);
+                let (rest, selected) = one_or_list(input, input_field)?;
+                selects.extend(selected);
+                input = rest;
+            }
+            Some(TokenKind::Yield) => {
+                let (rest, clause) = yield_clause(input.take_from(1))?;
+                yields.push(clause);
+                input = rest;
+            }
+            _ => return Err(Err::Error(expected(&input, "select or yield"))),
+        }
+        if input.tok.first().map(|t| t.kind) != Some(TokenKind::Comma) {
+            break;
+        }
+        input = input.take_from(1);
+    }
+    Ok((
+        input,
+        InputClause {
+            source,
+            selects,
+            yields,
+        },
+    ))
+}
+
+fn yield_clause(input: Tokens<'_>) -> IResult<'_, YieldClause> {
+    let (input, fields) = one_or_list(input, yield_field)?;
+    let (input, _) = match_token(TokenKind::Using)(input)?;
+    let (input, strategies) = one_or_list(input, strategy_call)?;
+    Ok((input, YieldClause { fields, strategies }))
+}
+
+fn yield_field(input: Tokens<'_>) -> IResult<'_, YieldField> {
+    let (input, (data_type, name, _, description)) = (
+        input_type,
+        identifier,
+        match_token(TokenKind::Eq),
         string_literal,
-        match_token(TokenKind::Select),
     )
         .parse(input)?;
-    let (input, fields) =
-        separated_list1(match_token(TokenKind::Comma), cut(input_field)).parse(input)?;
-    Ok((input, InputClause { capability, fields }))
+    let (input, maxage) = maxage(input)?;
+    Ok((
+        input,
+        YieldField {
+            data_type,
+            name,
+            maxage,
+            description,
+        },
+    ))
+}
+
+fn strategy_call(input: Tokens<'_>) -> IResult<'_, StrategyCall> {
+    let (input, name) = identifier(input)?;
+    let (input, _) = match_token(TokenKind::LParen)(input)?;
+    let (input, arguments) =
+        nom::multi::separated_list0(match_token(TokenKind::Comma), string_literal).parse(input)?;
+    let (input, _) = match_token(TokenKind::RParen)(input)?;
+    Ok((input, StrategyCall { name, arguments }))
 }
 
 // Omitting '= PATH' selects the root response, including scalar-valued interfaces.
-fn input_field(input: Tokens<'_>) -> IResult<'_, InputField> {
+fn input_field(input: Tokens<'_>) -> IResult<'_, SelectField> {
     let (input, (data_type, name)) = (input_type, identifier).parse(input)?;
     let (input, select) = if input.tok.first().map(|t| t.kind) == Some(TokenKind::Eq) {
         select_path(input.take_from(1))?
     } else {
         (input, Vec::new())
     };
-    let (input, maxage) = if input.tok.first().map(|token| token.kind) == Some(TokenKind::Maxage) {
-        // Once maxage appears, require a positive finite value in seconds without backtracking.
-        let time = input.take_from(1);
-        let (input, maxage) = number_literal(time.clone())?;
-        if maxage <= 0.0 {
-            return Err(Err::Error(at(&time, ErrorKind::InvalidMaxage)));
-        }
-        (input, Some(maxage))
-    } else {
-        (input, None)
-    };
+    let (input, maxage) = maxage(input)?;
     Ok((
         input,
-        InputField {
+        SelectField {
             data_type,
             name,
             select,
             maxage,
         },
     ))
+}
+
+fn maxage(input: Tokens<'_>) -> IResult<'_, Option<f64>> {
+    if input.tok.first().map(|token| token.kind) != Some(TokenKind::Maxage) {
+        return Ok((input, None));
+    }
+    let time = input.take_from(1);
+    let (input, value) = number_literal(time.clone())?;
+    if value <= 0.0 {
+        return Err(Err::Error(at(&time, ErrorKind::InvalidMaxage)));
+    }
+    Ok((input, Some(value)))
 }
 
 fn input_type(input: Tokens<'_>) -> IResult<'_, InputType> {
@@ -251,7 +316,14 @@ fn input_type(input: Tokens<'_>) -> IResult<'_, InputType> {
 
 // Start with a field, then append .field and [field = literal] operations in order.
 fn select_path(input: Tokens<'_>) -> IResult<'_, Vec<SelectStep>> {
-    let (mut input, field) = select_field(input)?;
+    let (mut input, field) = if input.tok.first().is_some_and(|token| {
+        token.kind == TokenKind::NumberLiteral && token.text().bytes().all(|b| b.is_ascii_digit())
+    }) {
+        let field = Identifier(input.tok[0].text().to_owned());
+        (input.take_from(1), field)
+    } else {
+        select_field(input)?
+    };
     let mut steps = vec![SelectStep::Field(field)];
     loop {
         match input.tok.first().map(|t| t.kind) {
@@ -279,7 +351,9 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
     };
     let rest = input.take_from(1);
     match token.kind {
-        TokenKind::Identifier
+        TokenKind::Yield
+        | TokenKind::Using
+        | TokenKind::Identifier
         | TokenKind::True
         | TokenKind::False
         | TokenKind::Rule

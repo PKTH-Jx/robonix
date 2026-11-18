@@ -44,18 +44,76 @@ pub struct Identifier(
     pub String,
 );
 
-/// One capability acquisition shared by a group of selected fields.
+/// Capability observations shared by selections and independent yield pipelines.
 #[derive(Debug)]
 pub struct InputClause {
-    /// The source capability contract ID resolved by the input Adapter.
-    pub capability: String,
-    /// Fields extracted from one response and sharing its acquisition time.
-    pub fields: Vec<InputField>,
+    /// Capability contracts and their JSON wrapping resolved by the input Adapter.
+    pub source: InputSource,
+    /// Deterministic selections from the acquired source JSON.
+    pub selects: Vec<SelectField>,
+    /// Independently executed pipelines producing named inputs.
+    pub yields: Vec<YieldClause>,
 }
 
-/// One named value extracted from a shared capability response.
+/// Capability acquisition shape, preserving list wrapping for a single source.
 #[derive(Debug)]
-pub struct InputField {
+pub enum InputSource {
+    /// Return this capability's JSON directly.
+    Single(String),
+    /// Wrap capability results under numbered object keys.
+    List(Vec<String>),
+}
+
+impl InputSource {
+    pub fn capabilities(&self) -> &[String] {
+        match self {
+            Self::Single(capability) => std::slice::from_ref(capability),
+            Self::List(capabilities) => capabilities,
+        }
+    }
+}
+
+impl std::fmt::Display for InputSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(capability) => f.write_str(capability),
+            Self::List(capabilities) => write!(f, "{capabilities:?}"),
+        }
+    }
+}
+
+impl InputClause {
+    pub fn fields(&self) -> impl Iterator<Item = InputFieldRef<'_>> {
+        self.selects.iter().map(InputFieldRef::Select).chain(
+            self.yields
+                .iter()
+                .flat_map(|clause| &clause.fields)
+                .map(InputFieldRef::Yield),
+        )
+    }
+}
+
+/// Required output bindings and their ordered processing pipeline.
+#[derive(Debug)]
+pub struct YieldClause {
+    /// Fields read by name from the final strategy output.
+    pub fields: Vec<YieldField>,
+    /// Nonempty sequence of configured strategies.
+    pub strategies: Vec<StrategyCall>,
+}
+
+/// A strategy name and its positional string configuration.
+#[derive(Debug)]
+pub struct StrategyCall {
+    /// Registry name identifying the shared strategy implementation.
+    pub name: Identifier,
+    /// Strings interpolated using explicitly imported context bindings.
+    pub arguments: Vec<String>,
+}
+
+/// One named value selected from the acquired source JSON.
+#[derive(Debug)]
+pub struct SelectField {
     /// The expected basic type of the selected response value.
     pub data_type: InputType,
     /// The name referenced by expressions in this rule.
@@ -64,6 +122,51 @@ pub struct InputField {
     pub select: Vec<SelectStep>,
     /// Maximum elapsed time from acquisition to evaluation, in seconds; None never expires.
     pub maxage: Option<f64>,
+}
+
+/// One named observation produced by a strategy pipeline.
+#[derive(Debug)]
+pub struct YieldField {
+    /// Basic type required from the final pipeline output.
+    pub data_type: InputType,
+    /// Output key and binding name used by rule expressions.
+    pub name: Identifier,
+    /// Semantic observation requested from the pipeline.
+    pub description: String,
+    /// Maximum age from acquisition, in seconds; None never expires.
+    pub maxage: Option<f64>,
+}
+
+/// Borrowed declaration metadata used when scheduling and validating inputs.
+#[derive(Debug, Clone, Copy)]
+pub enum InputFieldRef<'a> {
+    /// Deterministic response selection.
+    Select(&'a SelectField),
+    /// Named strategy output.
+    Yield(&'a YieldField),
+}
+
+impl<'a> InputFieldRef<'a> {
+    pub fn name(self) -> &'a Identifier {
+        match self {
+            Self::Select(field) => &field.name,
+            Self::Yield(field) => &field.name,
+        }
+    }
+
+    pub fn data_type(self) -> InputType {
+        match self {
+            Self::Select(field) => field.data_type,
+            Self::Yield(field) => field.data_type,
+        }
+    }
+
+    pub fn maxage(self) -> Option<f64> {
+        match self {
+            Self::Select(field) => field.maxage,
+            Self::Yield(field) => field.maxage,
+        }
+    }
 }
 
 /// One typed binding to a field in the Executor's current call context.

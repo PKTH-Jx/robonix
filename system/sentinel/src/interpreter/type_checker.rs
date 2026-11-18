@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::enforcer::hooks;
+use super::{adapter::strategy::Parts, enforcer::hooks};
 
 use crate::srdl::{
     ast::*,
@@ -55,6 +55,8 @@ pub enum TypeErrorKind {
     },
     #[error("{0}")]
     InvalidHook(String),
+    #[error("invalid strategy argument: {0}")]
+    InvalidStrategyArgument(String),
     #[error("duplicate binding '{0}'")]
     DuplicateBinding(String),
     #[error("unknown binding '{0}'")]
@@ -234,6 +236,17 @@ impl<'ast> Visitor<'ast> for TypeChecker {
         self.bindings.clear();
         self.rule.clone_from(&rule.name.0);
         self.requirement = None;
+        for input in &rule.inputs {
+            for clause in &input.yields {
+                for argument in clause.strategies.iter().flat_map(|step| &step.arguments) {
+                    Parts::parse(argument)
+                        .and_then(|parts| parts.validate(&rule.contexts))
+                        .map_err(|err| {
+                            self.error(TypeErrorKind::InvalidStrategyArgument(err.to_string()))
+                        })?;
+                }
+            }
+        }
         walk_rule(self, rule)
     }
 
@@ -246,7 +259,11 @@ impl<'ast> Visitor<'ast> for TypeChecker {
         Ok(())
     }
 
-    fn visit_input_field(&mut self, input: &InputField) -> Result<(), TypeError> {
+    fn visit_input_field(&mut self, input: &SelectField) -> Result<(), TypeError> {
+        self.declare(&input.name, input.data_type)
+    }
+
+    fn visit_yield_field(&mut self, input: &YieldField) -> Result<(), TypeError> {
         self.declare(&input.name, input.data_type)
     }
 
@@ -278,14 +295,50 @@ mod tests {
             &parse(&format!(
                 r#"rule typed {{
             require {expression};
-            input from "source" select number x = value maxage 1,
+            input from "source" select [number x = value maxage 1,
                 number y = value maxage 1, string label = label maxage 1,
-                boolean ready = ready maxage 1;
+                boolean ready = ready maxage 1];
             enforce deny;
         }}"#
             ))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn checks_yield_types_duplicates_and_context_placeholders() {
+        for (argument, valid) in [
+            ("{target}", true),
+            ("{{literal}} {target}", true),
+            ("{missing}", false),
+            ("{x}", false),
+            ("{target", false),
+            ("target}", false),
+            ("{}", false),
+        ] {
+            let program = parse(&format!(
+                r#"rule r {{
+                context string target = arguments.target;
+                input from "source" select [number x],
+                    yield [boolean ready = "Ready"] using [Test("{argument}")];
+                require ready && x > 0; enforce deny;
+            }}"#
+            ))
+            .unwrap();
+            assert_eq!(TypeChecker::check(&program).is_ok(), valid, "{argument}");
+        }
+        let program = parse(
+            r#"rule r {
+            context string x = arguments.target;
+            input from "source" yield [boolean x = "Ready"] using [Test()];
+            require x; enforce deny;
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            TypeChecker::check(&program).unwrap_err().kind,
+            TypeErrorKind::DuplicateBinding(_)
+        ));
     }
 
     #[test]
@@ -610,11 +663,11 @@ mod tests {
     fn rejects_duplicate_inputs_in_constructed_ast() {
         let mut program = parse(
             r#"rule duplicate {
-            input from "source" select number x = value maxage 1, string y = value maxage 1;
+            input from "source" select [number x = value maxage 1, string y = value maxage 1];
             require true; enforce deny; }"#,
         )
         .unwrap();
-        program.rules[0].inputs[0].fields[1].name = Identifier("x".into());
+        program.rules[0].inputs[0].selects[1].name = Identifier("x".into());
         assert_eq!(
             TypeChecker::check(&program).unwrap_err(),
             TypeError {

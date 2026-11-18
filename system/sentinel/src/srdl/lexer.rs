@@ -54,6 +54,10 @@ pub enum TokenKind {
     From,
     #[token("select")]
     Select,
+    #[token("yield")]
+    Yield,
+    #[token("using")]
+    Using,
     #[token("maxage")]
     Maxage,
 

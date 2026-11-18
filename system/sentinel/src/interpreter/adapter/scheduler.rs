@@ -85,7 +85,7 @@ pub(super) struct Request {
     pub consumer: String,
     /// Closing the receiver cancels this request, including in-flight transport work.
     pub reply: oneshot::Sender<Result<transport::Response, InputErrorKind>>,
-    /// Smallest maxage among selected fields sharing this response; None is unlimited.
+    /// Smallest maxage among required select and yield fields; None is unlimited.
     pub maxage: Option<Duration>,
     /// Field alias reported when this response sets the freshness deadline.
     pub input: Arc<str>,

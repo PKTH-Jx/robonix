@@ -79,9 +79,18 @@ impl SrdlInterpreter {
     /// Parse and check the entire source before any provider discovery or acquisition.
     /// Requires an active Tokio runtime to start the pool worker during construction.
     pub fn load(source: &str, client: AtlasClient) -> Result<Self, LoadError> {
+        Self::load_with_strategies(source, client, adapter::strategy::Strategies::default())
+    }
+
+    /// Load rules with explicitly supplied JSON strategy implementations.
+    pub fn load_with_strategies(
+        source: &str,
+        client: AtlasClient,
+        strategies: adapter::strategy::Strategies,
+    ) -> Result<Self, LoadError> {
         let program = Arc::new(srdl::parse(source)?);
         TypeChecker::check(&program)?;
-        let adapter = InputAdapter::new(client);
+        let adapter = InputAdapter::new(client).with_strategies(strategies);
         Ok(Self {
             exclusions: ExclusionChecker::new(&program.excludes),
             enforcer: Enforcer::new(&program),

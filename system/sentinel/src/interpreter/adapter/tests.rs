@@ -76,8 +76,8 @@ impl AtlasFixture {
         let names = rule
             .inputs
             .iter()
-            .flat_map(|input| &input.fields)
-            .map(|field| field.name.0.as_str())
+            .flat_map(|input| input.fields())
+            .map(|field| field.name().0.as_str())
             .collect();
         let inputs = self
             .adapter
@@ -85,6 +85,7 @@ impl AtlasFixture {
                 [(rule, &names)],
                 "sentinel-test",
                 Instant::now() + Duration::from_secs(5),
+                Arc::new(Value::Null),
             )
             .pop()
             .unwrap();
@@ -367,7 +368,7 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
         trigger ignored before "robot/stop";
         rule passing {
             context string user = identity.user_id;
-            input from "sensor/value" select number x = reading, boolean ready = ready;
+            input from "sensor/value" select [number x = reading, boolean ready = ready];
             require user = "alice" && ready && x > 0;
             enforce [deny, report "unused"];
         }
@@ -504,7 +505,7 @@ async fn acquires_typed_field_groups_once_and_cleans_channels() {
     ] {
         let program = parse(&format!(
             r#"rule r {{
-                input from "sensor/{source}" select {fields};
+                input from "sensor/{source}" select [{fields}];
                 require true; enforce deny; }}"#
         ))
         .unwrap();
@@ -516,7 +517,7 @@ async fn acquires_typed_field_groups_once_and_cleans_channels() {
         assert_eq!(acquired[0].fields.len(), expected.len());
         for (selected, (name, expected, maxage)) in acquired[0].fields.iter().zip(expected) {
             assert_eq!(
-                (selected.field.name.0.as_str(), selected.field.maxage),
+                (selected.field.name().0.as_str(), selected.field.maxage()),
                 (name, Some(maxage))
             );
             assert_eq!(selected.value, expected);
@@ -527,8 +528,8 @@ async fn acquires_typed_field_groups_once_and_cleans_channels() {
     }
     let program = parse(
         r#"rule r {
-            input from "sensor/value" select number velocity = reading maxage 1,
-                boolean ready = missing maxage 2;
+            input from "sensor/value" select [number velocity = reading maxage 1,
+                boolean ready = missing maxage 2];
             require true; enforce deny; }"#,
     )
     .unwrap();
@@ -989,13 +990,13 @@ async fn prepare_inputs<'a>(
             for selected in &acquired.fields {
                 let age = selected
                     .field
-                    .maxage
+                    .maxage()
                     .and_then(|age| Duration::try_from_secs_f64(age).ok());
                 deadline.send_modify(|deadline| {
                     deadline.record(
                         acquired.acquired_at,
                         age,
-                        Arc::from(selected.field.name.0.as_str()),
+                        Arc::from(selected.field.name().0.as_str()),
                     );
                 });
             }
@@ -1021,14 +1022,17 @@ fn batch(
     acquired_at: Instant,
 ) -> AcquiredInput<'_> {
     let input = &rule.inputs[index];
-    assert_eq!(input.fields.len(), values.len());
+    assert_eq!(input.selects.len(), values.len());
     AcquiredInput {
         input,
         fields: input
-            .fields
+            .selects
             .iter()
             .zip(values)
-            .map(|(field, value)| SelectedField { field, value })
+            .map(|(field, value)| FieldValue {
+                field: InputFieldRef::Select(field),
+                value,
+            })
             .collect(),
         acquired_at,
     }
@@ -1298,7 +1302,7 @@ async fn rejects_stale_future_and_invalid_input_metadata() {
         Err(Error::FutureTimestamp { .. })
     ));
     for maxage in [0.0, f64::NAN, f64::INFINITY, 1e308] {
-        rule.inputs[0].fields[0].maxage = Some(maxage);
+        rule.inputs[0].selects[0].maxage = Some(maxage);
         assert!(matches!(
             evaluate_inputs(0, &Value::Null, &rule, stream::pending()).await,
             Err(Error::InvalidMaxage { .. })
@@ -1328,4 +1332,379 @@ async fn overall_timeout_precedes_simultaneous_expiry_and_input_arrival() {
         prepare_inputs(0, &Value::Null, &rule, None, deadline, inputs).await,
         Err(Error::Timeout { .. })
     ));
+}
+
+/// Test transformation that asserts its input and returns configured JSON.
+struct TestStrategy {
+    /// JSON required from the preceding step.
+    expected: Value,
+    /// JSON emitted to the following step.
+    output: Value,
+    /// Rendered configuration expected for this invocation.
+    arguments: Vec<String>,
+    /// Semantic output description passed through the pipeline.
+    description: &'static str,
+}
+
+impl strategy::Strategy for TestStrategy {
+    fn process<'a>(
+        &'a self,
+        input: Value,
+        arguments: &'a [String],
+        fields: &'a [crate::srdl::ast::YieldField],
+    ) -> BoxFuture<'a, anyhow::Result<Value>> {
+        Box::pin(async move {
+            anyhow::ensure!(input == self.expected, "unexpected pipeline input: {input}");
+            assert_eq!(arguments, self.arguments);
+            assert_eq!(fields[0].description, self.description);
+            Ok(self.output.clone())
+        })
+    }
+}
+
+#[tokio::test]
+async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    let mut strategies = strategy::Strategies::default();
+    strategies.register(
+        "First",
+        Arc::new(TestStrategy {
+            expected: serde_json::json!({"0":42}),
+            output: serde_json::json!({"intermediate":7}),
+            arguments: vec!["target pan {literal}".into()],
+            description: "Count",
+        }),
+    );
+    strategies.register(
+        "Second",
+        Arc::new(TestStrategy {
+            expected: serde_json::json!({"intermediate":7}),
+            output: serde_json::json!({"n":7}),
+            arguments: vec![],
+            description: "Count",
+        }),
+    );
+    strategies.register(
+        "Independent",
+        Arc::new(TestStrategy {
+            expected: serde_json::json!({"0":42}),
+            output: serde_json::json!({"ready":true}),
+            arguments: vec![],
+            description: "Ready",
+        }),
+    );
+    let interpreter = SrdlInterpreter::load_with_strategies(
+        r#"
+        rule r {
+            context string target = arguments.target;
+            input from ["sensor/scalar"] select [number raw = 0],
+                yield [number n = "Count"] using [First("target {target} {{literal}}"), Second()],
+                yield [boolean ready = "Ready"] using [Independent()];
+            require raw = 42 && n = 7 && ready; enforce deny;
+        }
+        trigger r before "test";
+    "#,
+        fixture.adapter.atlas.clone(),
+        strategies,
+    )
+    .unwrap();
+    let result = interpreter
+        .on_arrival(
+            check_context(
+                "pipeline",
+                "call",
+                "test",
+                &serde_json::json!({"arguments":{"target":"pan"}}),
+            ),
+            &(),
+        )
+        .await;
+    assert_eq!(result.effect, Effect::Allow, "{result:?}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.wait_for_cleanup().await;
+
+    for (strategy_name, expected_error) in [
+        ("Missing", "unregistered strategy"),
+        ("Wrong", "TypeMismatch"),
+    ] {
+        let mut strategies = strategy::Strategies::default();
+        strategies.register(
+            "Wrong",
+            Arc::new(TestStrategy {
+                expected: serde_json::json!(42),
+                output: serde_json::json!({"n":"wrong"}),
+                arguments: vec![],
+                description: "Count",
+            }),
+        );
+        let source = format!(
+            r#"rule r {{ input from "sensor/scalar"
+            yield [number n = "Count"] using [{strategy_name}()];
+            require n > 0; enforce deny; }} trigger r before "test";"#
+        );
+        let interpreter = SrdlInterpreter::load_with_strategies(
+            &source,
+            fixture.adapter.atlas.clone(),
+            strategies,
+        )
+        .unwrap();
+        let result = interpreter
+            .on_arrival(
+                check_context("failure", strategy_name, "test", &Value::Null),
+                &(),
+            )
+            .await;
+        assert_eq!(result.effect, Effect::Deny);
+        assert!(format!("{result:?}").contains(expected_error), "{result:?}");
+        fixture.wait_for_cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn acquires_numbered_sources_in_declaration_order() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    let program = parse(
+        r#"rule r {
+        input from ["sensor/value", "sensor/scalar"]
+            select [number reading = 0.reading, number scalar = 1];
+        require reading = scalar; enforce deny;
+    }"#,
+    )
+    .unwrap();
+    let acquired = fixture.collect(&program.rules[0]).await.unwrap();
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        acquired[0]
+            .fields
+            .iter()
+            .all(|field| field.value == InputValue::Number(42.0))
+    );
+    fixture.wait_for_cleanup().await;
+}
+
+/// Suspends processing until Adapter drops the pipeline at its deadline.
+struct SuspendedStrategy {
+    /// Signals that the strategy is waiting rather than acquiring transport data.
+    entered: Arc<tokio::sync::Notify>,
+    /// Counts processing cleanup on cancellation.
+    dropped: Arc<AtomicUsize>,
+}
+
+/// Records cancellation of an in-flight strategy invocation.
+struct ProcessingGuard {
+    /// Counter updated when processing completes or is cancelled.
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Drop for ProcessingGuard {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl strategy::Strategy for SuspendedStrategy {
+    fn process<'a>(
+        &'a self,
+        _: Value,
+        _: &'a [String],
+        _: &'a [crate::srdl::ast::YieldField],
+    ) -> BoxFuture<'a, anyhow::Result<Value>> {
+        Box::pin(async move {
+            let _guard = ProcessingGuard {
+                dropped: self.dropped.clone(),
+            };
+            self.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn deadlines_cancel_suspended_strategy_processing() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    for (maxage, expired) in [("maxage 0.1", true), ("", false)] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut strategies = strategy::Strategies::default();
+        strategies.register(
+            "Wait",
+            Arc::new(SuspendedStrategy {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+        let adapter = fixture.adapter.clone().with_strategies(strategies);
+        let program = parse(&format!(
+            r#"rule r {{
+            input from "sensor/scalar" yield [number n = "Count" {maxage}] using [Wait()];
+            require n > 0; enforce deny;
+        }}"#
+        ))
+        .unwrap();
+        let check = adapter
+            .acquire_group(
+                [&program.rules[0]],
+                "sentinel-test",
+                Arc::new(Value::Null),
+                0,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .pop()
+            .unwrap();
+        tokio::pin!(check);
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut check => panic!("check ended before strategy started: {:?}", result.err()),
+        }
+        let result = timeout(Duration::from_secs(2), check).await.unwrap();
+        assert!(if expired {
+            matches!(result, Err(Error::Expired { .. }))
+        } else {
+            matches!(result, Err(Error::Timeout { .. }))
+        });
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        fixture.wait_for_cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    let model_calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (calls, waiting) = (model_calls.clone(), entered.clone());
+    let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+        move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+            let (calls, waiting) = (calls.clone(), waiting.clone());
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(headers["authorization"], "Bearer test-api-key");
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["model"], "test-model");
+                assert_eq!(request["stream"], false);
+                let prompt: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(prompt["input"], 42);
+                assert_eq!(prompt["yield_fields"], serde_json::json!([
+                    {"name":"n", "type":"number", "description":"Observed count"}
+                ]));
+                let hint = prompt["hint"].as_str().unwrap();
+                if hint == "wait" {
+                    waiting.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                let (status, response) = match hint {
+                    "http-error" => (axum::http::StatusCode::BAD_GATEWAY,
+                        serde_json::json!({"error":"private-upstream-detail"})),
+                    hint => {
+                        let content = match hint {
+                            "invalid-json" => "not JSON",
+                            "non-object" => "[]",
+                            "missing" => "{}",
+                            "wrong-type" => r#"{"n":"42"}"#,
+                            "unknown" => r#"{"n":null}"#,
+                            _ => r#"{"n":42}"#,
+                        };
+                        (axum::http::StatusCode::OK, serde_json::json!({"choices":[{
+                            "finish_reason": if hint == "incomplete" { "length" } else { "stop" },
+                            "message": {"content":content, "refusal": if hint == "refusal" { Some("refused") } else { None }},
+                        }]}))
+                    }
+                };
+                (status, [(axum::http::header::CONTENT_TYPE, "application/json")], response.to_string())
+            }
+        }
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+    fixture.servers.push(tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    }));
+    let model = Arc::new(strategy::Summarize::new(&base, "test-model", "test-api-key").unwrap());
+    let mut strategies = strategy::Strategies::default();
+    strategies.register("Summarize", model.clone());
+    let source = r#"
+        rule r {
+            context string hint = arguments.hint;
+            input from "sensor/scalar"
+                yield number n = "Observed count" using Summarize("{hint}");
+            require n = 42; enforce deny;
+        }
+        trigger r before "test";
+    "#;
+    let interpreter =
+        SrdlInterpreter::load_with_strategies(source, fixture.adapter.atlas.clone(), strategies)
+            .unwrap();
+    for hint in [
+        "good",
+        "http-error",
+        "invalid-json",
+        "non-object",
+        "missing",
+        "wrong-type",
+        "unknown",
+        "incomplete",
+        "refusal",
+    ] {
+        let result = interpreter
+            .on_arrival(
+                check_context(
+                    "summarize",
+                    hint,
+                    "test",
+                    &serde_json::json!({"arguments":{"hint":hint}}),
+                ),
+                &(),
+            )
+            .await;
+        assert_eq!(
+            result.effect,
+            if hint == "good" {
+                Effect::Allow
+            } else {
+                Effect::Deny
+            },
+            "{hint}: {result:?}"
+        );
+        assert_eq!(
+            result.reports[0].evaluation.is_ok(),
+            hint == "good",
+            "{hint}"
+        );
+        let feedback = format!("{result:?}");
+        assert!(
+            !feedback.contains("test-api-key") && !feedback.contains("private-upstream-detail")
+        );
+    }
+    fixture.wait_for_cleanup().await;
+
+    let program = parse(source).unwrap();
+    let fields = &program.rules[0].inputs[0].yields[0].fields;
+    let before = model_calls.load(Ordering::SeqCst);
+    use strategy::Strategy;
+    assert!(
+        model
+            .process(serde_json::json!(42), &[], fields)
+            .await
+            .is_err()
+    );
+    assert_eq!(model_calls.load(Ordering::SeqCst), before);
+    let hint = vec!["wait".to_owned()];
+    timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = model.process(serde_json::json!(42), &hint, fields) => panic!("request finished before cancellation: {result:?}"),
+        }
+    }).await.unwrap();
+    let hint = vec!["good".to_owned()];
+    assert_eq!(
+        model
+            .process(serde_json::json!(42), &hint, fields)
+            .await
+            .unwrap(),
+        serde_json::json!({"n":42})
+    );
 }

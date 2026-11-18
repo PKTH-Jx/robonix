@@ -1,6 +1,6 @@
 use super::ast::{
-    BinaryOperator as B, EnforceBehavior, Expression as E, Identifier, InputField, InputType,
-    Literal, Rule, SelectStep, TriggerTarget, TriggerTiming, UnaryOperator as U,
+    BinaryOperator as B, EnforceBehavior, Expression as E, Identifier, InputType, Literal, Rule,
+    SelectField, SelectStep, TriggerTarget, TriggerTiming, UnaryOperator as U,
 };
 use super::{Error, ErrorKind, parse};
 
@@ -8,14 +8,14 @@ fn rule(body: &str) -> Result<Rule, Error> {
     Ok(parse(&format!("rule test {{ {body} }}"))?.rules.remove(0))
 }
 
-fn input(selection: &str, maxage: &str) -> Result<InputField, Error> {
+fn input(selection: &str, maxage: &str) -> Result<SelectField, Error> {
     Ok(rule(&format!(
         r#"input from "source" select number reading = {selection} maxage {maxage};
         require true; enforce deny;"#
     ))?
     .inputs
     .remove(0)
-    .fields
+    .selects
     .remove(0))
 }
 
@@ -50,9 +50,9 @@ fn parses_test_srdl() {
         assert_eq!(rule.name.0, format!("speed_not_exceed_{limit}"));
         assert_eq!(rule.inputs.len(), 1);
         let input = &rule.inputs[0];
-        assert_eq!(input.fields[0].name.0, "velocity");
-        assert_eq!(input.capability, "robonix/system/soma/get_health");
-        assert_eq!(input.fields[0].maxage, Some(0.1));
+        assert_eq!(input.selects[0].name.0, "velocity");
+        assert_eq!(input.source.to_string(), "robonix/system/soma/get_health");
+        assert_eq!(input.selects[0].maxage, Some(0.1));
         assert_eq!(
             rule.requires[0].expression,
             binary(B::Lte, name("velocity"), number(limit))
@@ -254,9 +254,12 @@ fn collects_multiple_inputs_and_requirements_in_any_order() {
     .unwrap();
     let rule = &program.rules[0];
     assert_eq!(rule.inputs.len(), 2);
-    assert_eq!(rule.inputs[0].fields[0].name, Identifier("velocity".into()));
-    assert_eq!(rule.inputs[1].fields[0].data_type, InputType::Number);
-    assert_eq!(rule.inputs[1].fields[0].maxage, Some(2.0));
+    assert_eq!(
+        rule.inputs[0].selects[0].name,
+        Identifier("velocity".into())
+    );
+    assert_eq!(rule.inputs[1].selects[0].data_type, InputType::Number);
+    assert_eq!(rule.inputs[1].selects[0].maxage, Some(2.0));
     assert_eq!(rule.requires.len(), 2);
     assert_eq!(
         rule.requires[0].expression,
@@ -285,17 +288,17 @@ fn accepts_statement_order_independently() {
 fn groups_fields_with_independent_paths_and_maxage() {
     let parsed = rule(
         r#"require velocity > 0;
-        input from "source" select number velocity = snapshot.velocity maxage 0.1,
-            string label = snapshot.label maxage 2, boolean ready maxage 3;
+        input from "source" select [number velocity = snapshot.velocity maxage 0.1,
+            string label = snapshot.label maxage 2, boolean ready maxage 3];
         enforce deny;"#,
     )
     .unwrap();
     assert_eq!(parsed.inputs.len(), 1);
     let input = &parsed.inputs[0];
-    assert_eq!(input.capability, "source");
+    assert_eq!(input.source.to_string(), "source");
     assert_eq!(
         input
-            .fields
+            .selects
             .iter()
             .map(|field| (field.name.0.as_str(), field.maxage))
             .collect::<Vec<_>>(),
@@ -306,18 +309,18 @@ fn groups_fields_with_independent_paths_and_maxage() {
         ]
     );
     assert_eq!(
-        input.fields[0].select,
+        input.selects[0].select,
         [
             SelectStep::Field(Identifier("snapshot".into())),
             SelectStep::Field(Identifier("velocity".into()))
         ]
     );
-    assert!(input.fields[2].select.is_empty());
+    assert!(input.selects[2].select.is_empty());
     for declaration in [
         r#"input from "source" select;"#,
         r#"input from "source" select number x maxage 1,;"#,
         r#"input from "source" select number x = maxage 1;"#,
-        r#"input from "source" select number x maxage 1, number y maxage;"#,
+        r#"input from "source" select [number x maxage 1, number y maxage];"#,
         r#"input from "source" select number x = value + 1 maxage 1;"#,
     ] {
         assert!(
@@ -326,7 +329,7 @@ fn groups_fields_with_independent_paths_and_maxage() {
         );
     }
     for declarations in [
-        r#"input from "source" select number x maxage 1, boolean x maxage 2;"#,
+        r#"input from "source" select [number x maxage 1, boolean x maxage 2];"#,
         r#"input from "a" select number x maxage 1; input from "b" select number x maxage 2;"#,
     ] {
         assert_eq!(
@@ -341,12 +344,12 @@ fn groups_fields_with_independent_paths_and_maxage() {
 #[test]
 fn accepts_optional_maxage_per_field() {
     let parsed = rule(
-        r#"input from "source" select number first = reading,
-            boolean bounded = ready maxage 2, string root;
+        r#"input from "source" select [number first = reading,
+            boolean bounded = ready maxage 2, string root];
         require true; enforce deny;"#,
     )
     .unwrap();
-    let fields = &parsed.inputs[0].fields;
+    let fields = &parsed.inputs[0].selects;
     assert_eq!(
         fields.iter().map(|field| field.maxage).collect::<Vec<_>>(),
         [None, Some(2.0), None]
@@ -593,7 +596,7 @@ fn contextual_keywords_remain_usable_as_names() {
         .unwrap();
         let rule = &program.rules[0];
         assert_eq!(rule.name.0, rule_name);
-        assert_eq!(rule.inputs[0].fields[0].name.0, input_name);
+        assert_eq!(rule.inputs[0].selects[0].name.0, input_name);
         assert_eq!(
             rule.requires[0].expression,
             binary(B::Gt, name(input_name), name(other))
@@ -917,8 +920,8 @@ fn parses_only_basic_input_types() {
     let program = parse(
         r#"
         rule basic {
-            input from "source" select number velocity = velocity maxage 0.1,
-                string mode = mode maxage 1, boolean ready = ready maxage 1;
+            input from "source" select [number velocity = velocity maxage 0.1,
+                string mode = mode maxage 1, boolean ready = ready maxage 1];
             require ready && mode = "active" && velocity <= 1;
             enforce deny;
         }
@@ -929,7 +932,7 @@ fn parses_only_basic_input_types() {
         program.rules[0]
             .inputs
             .iter()
-            .flat_map(|input| input.fields.iter())
+            .flat_map(|input| input.selects.iter())
             .map(|field| field.data_type)
             .collect::<Vec<_>>(),
         vec![InputType::Number, InputType::String, InputType::Boolean]
@@ -1003,7 +1006,7 @@ fn parses_context_bindings_without_acquisition_or_freshness() {
         ["identity", "context", "true"]
     );
     assert_eq!(
-        rule.inputs[0].fields[0].select,
+        rule.inputs[0].selects[0].select,
         [SelectStep::Field(Identifier("context".into()))]
     );
     for clause in [
@@ -1018,6 +1021,109 @@ fn parses_context_bindings_without_acquisition_or_freshness() {
         assert!(
             parse(&format!(
                 "rule r {{ {clause} require true; enforce deny; }}"
+            ))
+            .is_err(),
+            "{clause}"
+        );
+    }
+}
+
+#[test]
+fn parses_yield_pipelines_and_numbered_sources() {
+    let program = parse(
+        r#"rule r {
+        input from ["a", "b"] select [number x = 0.reading],
+            yield [string label = "Description" maxage 1] using [First("{target}"), Second()],
+            select [boolean ready = 1.ready],
+            yield [number n = "Count"] using [Third()];
+        context string target = arguments.target;
+        require ready && x > n; enforce deny;
+    }"#,
+    )
+    .unwrap();
+    let input = &program.rules[0].inputs[0];
+    assert_eq!(input.source.capabilities(), &["a", "b"]);
+    assert_eq!(input.fields().count(), 4);
+    assert_eq!(input.yields[0].strategies[0].arguments, ["{target}"]);
+    assert_eq!(input.yields[0].fields[0].description, "Description");
+    for clause in [
+        r#"yield [number n = "Count"]"#,
+        r#"yield [number n = "Count"] using []"#,
+        r#"yield [] using [Test()]"#,
+        r#"select [number n], yield [number n = "Count"] using [Test()]"#,
+        r#"using [Test()]"#,
+        r#"yield [number n = value] using [Test()]"#,
+    ] {
+        assert!(
+            parse(&format!(
+                r#"rule r {{ input from "a" {clause}; require true; enforce deny; }}"#
+            ))
+            .is_err(),
+            "{clause}"
+        );
+    }
+}
+
+#[test]
+fn select_accepts_one_field_or_a_nonempty_bracketed_list() {
+    for selection in [
+        "number a = first",
+        "[number a = first]",
+        "[number a = first, number b = second]",
+        "number a = first, select number b = second",
+        "number a = first, yield [number b = \"Count\"] using [Test()]",
+    ] {
+        let parsed = rule(&format!(
+            r#"input from "source" select {selection}; require true; enforce deny;"#
+        ))
+        .unwrap();
+        assert_eq!(parsed.inputs.len(), 1);
+    }
+    for selection in [
+        "number a = first, number b = second",
+        "[]",
+        "[number a = first,]",
+    ] {
+        assert!(
+            rule(&format!(
+                r#"input from "source" select {selection}; require true; enforce deny;"#
+            ))
+            .is_err(),
+            "{selection}"
+        );
+    }
+}
+
+#[test]
+fn yield_and_using_accept_single_items_or_nonempty_lists() {
+    for fields in [
+        r#"number n = "Count""#,
+        r#"[number n = "Count"]"#,
+        r#"[number n = "Count", boolean ready = "Ready"]"#,
+    ] {
+        for steps in [
+            r#"Test("hint")"#,
+            r#"[Test("hint")]"#,
+            "[First(), Second()]",
+        ] {
+            let parsed = rule(&format!(
+                r#"input from "source" yield {fields} using {steps}; require true; enforce deny;"#
+            ))
+            .unwrap();
+            assert_eq!(parsed.inputs[0].yields.len(), 1);
+        }
+    }
+    for clause in [
+        r#"yield number n = "Count", boolean ready = "Ready" using Test()"#,
+        r#"yield number n = "Count" using First(), Second()"#,
+        r#"yield [] using Test()"#,
+        r#"yield number n = "Count" using []"#,
+        r#"yield [number n = "Count",] using Test()"#,
+        r#"yield number n = "Count" using [Test(),]"#,
+    ] {
+        assert!(
+            rule(&format!(
+                r#"input from "source" {clause}; require true; enforce deny;"#
             ))
             .is_err(),
             "{clause}"

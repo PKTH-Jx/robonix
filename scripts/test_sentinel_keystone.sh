@@ -150,6 +150,7 @@ wait_for_port "$SENTINEL_ADDR" "$EXECUTOR_PID"
 cat >"$WORK/vlm.py" <<'PY'
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -181,6 +182,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }
             else:
+                if scenario == "operator":
+                    assert "Only the configured user may list the test workspace" in messages
                 reply = {
                     "content": (
                         "The test workspace was listed."
@@ -204,8 +207,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        self.wfile.write(f"data: {payload}\n\ndata: [DONE]\n\n".encode())
-        self.wfile.flush()
+        try:
+            if body.get("response_format") and scenario == "operator" and Handler.planning_round[scenario] == 1:
+                # Let Sentinel reject the node before the model finishes its JSON response.
+                prefix = json.dumps({"choices": [{"delta": {"content": content[:-1]}, "finish_reason": None}]})
+                self.wfile.write(f"data: {prefix}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(1)
+                payload = json.dumps({"choices": [{"delta": {"content": content[-1:]}, "finish_reason": "stop"}]})
+            self.wfile.write(f"data: {payload}\n\ndata: [DONE]\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, format, *args):
         print(format % args, file=sys.stderr, flush=True)

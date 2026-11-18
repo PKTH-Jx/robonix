@@ -4,6 +4,7 @@ mod context;
 mod dependencies;
 mod scheduler;
 mod select;
+pub mod strategy;
 pub(super) mod transport;
 
 pub use context::Error as ContextError;
@@ -28,7 +29,7 @@ use tokio::{
 
 use self::scheduler::{Request, Scheduler};
 use super::{evaluator::Error, logging};
-use crate::srdl::ast::{InputClause, InputField, InputType, Rule};
+use crate::srdl::ast::{InputClause, InputFieldRef, InputSource, InputType, Rule};
 
 const MAX_CONCURRENT_BINDINGS: usize = 16;
 
@@ -74,32 +75,45 @@ impl InputValue {
     }
 }
 
-/// Type-checked fields from one capability response sharing its acquisition time.
+/// Validated select and yield values acquired for one input declaration.
 #[derive(Debug)]
 pub struct AcquiredInput<'ast> {
-    /// The declaration associated with this response.
+    /// The declaration that acquired and processed these observations.
     pub input: &'ast InputClause,
-    /// Values selected independently from the same response.
-    pub fields: Vec<SelectedField<'ast>>,
-    /// Monotonic time immediately after receiving the capability response.
+    /// Values extracted from observations or produced by strategy pipelines.
+    pub fields: Vec<FieldValue<'ast>>,
+    /// Earliest local receipt time among the declaration's capability responses.
     pub acquired_at: Instant,
 }
 
-/// One selected value paired with its field-level type and freshness requirements.
+/// A validated value paired with its select or yield declaration.
 #[derive(Debug)]
-pub struct SelectedField<'ast> {
+pub struct FieldValue<'ast> {
     /// The field declaration referenced by requirement expressions.
-    pub field: &'ast InputField,
-    /// The selected input value.
+    pub field: InputFieldRef<'ast>,
+    /// The typed value supplied to rule evaluation.
     pub value: InputValue,
 }
 
-impl<'ast> SelectedField<'ast> {
-    fn select(response: &Value, field: &'ast InputField) -> Result<Self, InputErrorKind> {
-        let value = select::select(response, &field.select).map_err(InputErrorKind::Selection)?;
-        let value = InputValue::from_json(value, field.data_type).map_err(|actual| {
+impl<'ast> FieldValue<'ast> {
+    fn from_json(response: &Value, field: InputFieldRef<'ast>) -> Result<Self, InputErrorKind> {
+        let value = match field {
+            InputFieldRef::Select(field) => {
+                select::select(response, &field.select).map_err(InputErrorKind::Selection)?
+            }
+            InputFieldRef::Yield(field) => response
+                .as_object()
+                .and_then(|object| object.get(&field.name.0))
+                .ok_or_else(|| {
+                    InputErrorKind::Strategy(anyhow::anyhow!(
+                        "missing yield field '{}'",
+                        field.name.0
+                    ))
+                })?,
+        };
+        let value = InputValue::from_json(value, field.data_type()).map_err(|actual| {
             InputErrorKind::TypeMismatch {
-                expected: field.data_type,
+                expected: field.data_type(),
                 actual,
             }
         })?;
@@ -115,7 +129,7 @@ pub(in crate::interpreter) struct Prepared {
     pub(in crate::interpreter) deadline: Deadline,
 }
 
-/// A discovery, acquisition, selection or type failure associated with one rule input.
+/// An acquisition or processing failure associated with one rule input.
 #[derive(Debug, thiserror::Error)]
 #[error("rule '{rule}', input '{input}' from '{capability}': {kind}")]
 pub struct InputError {
@@ -123,9 +137,9 @@ pub struct InputError {
     pub rule: String,
     /// The failed field alias, or all aliases in a group whose acquisition failed.
     pub input: String,
-    /// The requested capability contract ID.
+    /// The source contract ID or numbered capability list.
     pub capability: String,
-    /// The discovery, acquisition, cleanup, selection or type failure.
+    /// The discovery, acquisition, cleanup, processing, selection, or type failure.
     #[source]
     pub kind: InputErrorKind,
 }
@@ -149,9 +163,11 @@ pub enum InputErrorKind {
     TypeMismatch {
         /// The basic type declared for this field.
         expected: InputType,
-        /// The JSON type of the selected response value.
+        /// The JSON type of the acquired or yielded value.
         actual: &'static str,
     },
+    #[error("strategy pipeline failed: {0}")]
+    Strategy(#[source] anyhow::Error),
     #[error("input acquisition worker stopped: {0}")]
     WorkerStopped(#[source] oneshot::error::RecvError),
 }
@@ -161,13 +177,15 @@ pub enum InputErrorKind {
 pub struct InputAdapter {
     /// Clones share the underlying Atlas connection without serializing queries.
     atlas: AtlasClient,
+    /// Strategy implementations shared by all checks using this adapter.
+    strategies: strategy::Strategies,
     /// Shared queue metadata; locks never cover discovery or transport awaits.
     scheduling: Arc<Mutex<Scheduler>>,
 }
 
-/// Selected responses for one rule attempt; dropping it cancels queued and active inputs.
+/// Input processing for one rule attempt; dropping it cancels queued and active work.
 struct Inputs<'ast> {
-    /// Receivers select fields against the immutable AST after acquisition completes.
+    /// Pending acquisitions, selections, and yield pipelines for this attempt.
     responses: FuturesUnordered<BoxFuture<'ast, Result<AcquiredInput<'ast>, InputError>>>,
     /// Adapter whose queue owns this attempt's remaining work.
     adapter: InputAdapter,
@@ -181,39 +199,75 @@ impl<'ast> Inputs<'ast> {
     async fn receive(
         rule: &'ast Rule,
         input: &'ast InputClause,
-        fields: Vec<&'ast InputField>,
-        receive: oneshot::Receiver<Result<transport::Response, InputErrorKind>>,
+        fields: Vec<InputFieldRef<'ast>>,
+        receivers: Vec<oneshot::Receiver<Result<transport::Response, InputErrorKind>>>,
+        strategies: strategy::Strategies,
+        context: Arc<Value>,
     ) -> Result<AcquiredInput<'ast>, InputError> {
         let error = |alias, kind| InputError {
             rule: rule.name.0.clone(),
             input: alias,
-            capability: input.capability.clone(),
+            capability: input.source.to_string(),
             kind,
         };
-        let response = receive
-            .await
-            .unwrap_or_else(|error| Err(InputErrorKind::WorkerStopped(error)))
-            .map_err(|kind| {
-                error(
-                    fields
-                        .iter()
-                        .map(|field| field.name.0.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    kind,
-                )
-            })?;
-        let fields = fields
-            .into_iter()
-            .map(|field| {
-                SelectedField::select(&response.value, field)
-                    .map_err(|kind| error(field.name.0.clone(), kind))
-            })
-            .collect::<Result<Vec<_>, InputError>>()?;
+        let alias = || {
+            fields
+                .iter()
+                .map(|f| f.name().0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let responses = futures::future::try_join_all(
+            receivers
+                .into_iter()
+                .map(|receive| async { receive.await.map_err(InputErrorKind::WorkerStopped)? }),
+        )
+        .await
+        .map_err(|kind| error(alias(), kind))?;
+        let acquired_at = responses.iter().map(|r| r.acquired_at).min().unwrap();
+        let value = match &input.source {
+            InputSource::Single(_) => responses.into_iter().next().unwrap().value,
+            InputSource::List(_) => Value::Object(
+                responses
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, response)| (i.to_string(), response.value))
+                    .collect(),
+            ),
+        };
+        let mut values = Vec::new();
+        for field in &input.selects {
+            if fields.iter().any(|f| f.name() == &field.name) {
+                values.push(
+                    FieldValue::from_json(&value, InputFieldRef::Select(field))
+                        .map_err(|kind| error(field.name.0.clone(), kind))?,
+                );
+            }
+        }
+        for clause in &input.yields {
+            if !clause
+                .fields
+                .iter()
+                .any(|field| fields.iter().any(|f| f.name() == &field.name))
+            {
+                continue;
+            }
+            let output = strategies
+                .run(clause, value.clone(), rule, &context)
+                .await
+                .map_err(|err| error(alias(), InputErrorKind::Strategy(err)))?;
+            for field in &clause.fields {
+                let result = FieldValue::from_json(&output, InputFieldRef::Yield(field))
+                    .map_err(|kind| error(field.name.0.clone(), kind))?;
+                if fields.iter().any(|f| f.name() == &field.name) {
+                    values.push(result);
+                }
+            }
+        }
         Ok(AcquiredInput {
             input,
-            fields,
-            acquired_at: response.acquired_at,
+            fields: values,
+            acquired_at,
         })
     }
 }
@@ -240,8 +294,15 @@ impl InputAdapter {
     pub fn new(atlas: AtlasClient) -> Self {
         Self {
             atlas,
+            strategies: strategy::Strategies::default(),
             scheduling: Arc::new(Mutex::new(Scheduler::default())),
         }
+    }
+
+    /// Configure the implementations available to yield pipelines.
+    pub fn with_strategies(mut self, strategies: strategy::Strategies) -> Self {
+        self.strategies = strategies;
+        self
     }
 
     /// Return one complete dataset per rule, with only the active conditions' bindings.
@@ -262,6 +323,7 @@ impl InputAdapter {
             selected.iter().map(|(rule, names)| (*rule, names)),
             consumer,
             deadline,
+            context.clone(),
         );
         selected
             .into_iter()
@@ -301,10 +363,10 @@ impl InputAdapter {
         for field in rule
             .inputs
             .iter()
-            .flat_map(|input| &input.fields)
-            .filter(|field| names.is_none_or(|names| names.contains(field.name.0.as_str())))
+            .flat_map(|input| input.fields())
+            .filter(|field| names.is_none_or(|names| names.contains(field.name().0.as_str())))
         {
-            if let Some(age) = field.maxage {
+            if let Some(age) = field.maxage() {
                 let valid = age > 0.0
                     && Duration::try_from_secs_f64(age)
                         .ok()
@@ -314,7 +376,7 @@ impl InputAdapter {
                 if !valid {
                     return Err(Error::InvalidMaxage {
                         rule: rule.name.0.clone(),
-                        input: field.name.0.clone(),
+                        input: field.name().0.clone(),
                     });
                 }
             }
@@ -338,18 +400,18 @@ impl InputAdapter {
                 rule: rule.name.0.clone(),
             })??;
             for selected in acquired.fields {
-                let name = selected.field.name.0.as_str();
+                let name = selected.field.name().0.as_str();
                 logging::log(
                     Level::Info,
                     format!(
                         "[sentinel] check_id={check_id} rule={:?} input={name:?} source={:?} value={:?} age_s={:?} maxage_s={:?}",
                         rule.name.0,
-                        acquired.input.capability,
+                        acquired.input.source,
                         logging::value(&selected.value),
                         Instant::now()
                             .checked_duration_since(acquired.acquired_at)
                             .map(|age| age.as_secs_f64()),
-                        selected.field.maxage
+                        selected.field.maxage()
                     ),
                 );
                 if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -367,12 +429,13 @@ impl InputAdapter {
         }
     }
 
-    /// Each input clause shares one response among its selected fields.
+    /// Acquire each source once per input declaration for its selections and pipelines.
     fn fetch_group<'ast, 'names>(
         &self,
         rules: impl IntoIterator<Item = (&'ast Rule, &'names BTreeSet<&'ast str>)>,
         consumer: &str,
         deadline: Instant,
+        context: Arc<Value>,
     ) -> Vec<Inputs<'ast>>
     where
         'ast: 'names,
@@ -384,9 +447,8 @@ impl InputAdapter {
             let responses = FuturesUnordered::new();
             for input in &rule.inputs {
                 let fields: Vec<_> = input
-                    .fields
-                    .iter()
-                    .filter(|field| names.contains(field.name.0.as_str()))
+                    .fields()
+                    .filter(|field| names.contains(field.name().0.as_str()))
                     .collect();
                 if fields.is_empty() {
                     continue;
@@ -395,20 +457,36 @@ impl InputAdapter {
                     .iter()
                     .filter_map(|field| {
                         Some((
-                            Duration::try_from_secs_f64(field.maxage?).ok()?,
-                            field.name.0.as_str(),
+                            Duration::try_from_secs_f64(field.maxage()?).ok()?,
+                            field.name().0.as_str(),
                         ))
                     })
                     .min();
-                let (reply, receive) = oneshot::channel();
-                requests.push(Request {
-                    capability: input.capability.clone(),
-                    consumer: consumer.to_owned(),
-                    reply,
-                    maxage: bounded.map(|(age, _)| age),
-                    input: Arc::from(bounded.map_or(fields[0].name.0.as_str(), |(_, name)| name)),
-                });
-                responses.push(Inputs::receive(rule, input, fields, receive).boxed());
+                let mut receivers = Vec::new();
+                for capability in input.source.capabilities() {
+                    let (reply, receive) = oneshot::channel();
+                    receivers.push(receive);
+                    requests.push(Request {
+                        capability: capability.clone(),
+                        consumer: consumer.to_owned(),
+                        reply,
+                        maxage: bounded.map(|(age, _)| age),
+                        input: Arc::from(
+                            bounded.map_or(fields[0].name().0.as_str(), |(_, name)| name),
+                        ),
+                    });
+                }
+                responses.push(
+                    Inputs::receive(
+                        rule,
+                        input,
+                        fields,
+                        receivers,
+                        self.strategies.clone(),
+                        context.clone(),
+                    )
+                    .boxed(),
+                );
             }
             let (id, deadline) = scheduling.insert(requests, deadline);
             streams.push(Inputs {

@@ -20,8 +20,12 @@ pub trait Visitor<'ast> {
         walk_input(self, input)
     }
 
-    fn visit_input_field(&mut self, field: &'ast InputField) -> Result<(), Self::Error> {
+    fn visit_input_field(&mut self, field: &'ast SelectField) -> Result<(), Self::Error> {
         walk_input_field(self, field)
+    }
+
+    fn visit_yield_field(&mut self, field: &'ast YieldField) -> Result<(), Self::Error> {
+        self.visit_identifier(&field.name)
     }
 
     fn visit_context(&mut self, context: &'ast ContextClause) -> Result<(), Self::Error> {
@@ -120,15 +124,20 @@ pub fn walk_input<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
     input: &'ast InputClause,
 ) -> Result<(), V::Error> {
-    for field in &input.fields {
+    for field in &input.selects {
         visitor.visit_input_field(field)?;
+    }
+    for clause in &input.yields {
+        for field in &clause.fields {
+            visitor.visit_yield_field(field)?;
+        }
     }
     Ok(())
 }
 
 pub fn walk_input_field<'ast, V: Visitor<'ast> + ?Sized>(
     visitor: &mut V,
-    field: &'ast InputField,
+    field: &'ast SelectField,
 ) -> Result<(), V::Error> {
     visitor.visit_identifier(&field.name)?;
     for step in &field.select {
@@ -239,8 +248,8 @@ mod tests {
                 require !ready && f(reading + 1, target.value);
                 enforce deny;
                 context string user = identity.user_id;
-                input from "source" select number reading = items[id = "sensor"].value maxage 1,
-                    boolean ready maxage 2;
+                input from "source" select [number reading = items[id = "sensor"].value maxage 1,
+                    boolean ready maxage 2];
             }
             trigger r before always;
             exclude mutual A B;

@@ -49,7 +49,7 @@ fn register(
 fn snapshot(rule: &crate::srdl::ast::Rule, overall: Instant) -> Prepared {
     let mut deadline = Deadline::new(overall);
     let mut values = BTreeMap::new();
-    for field in rule.inputs.iter().flat_map(|input| &input.fields) {
+    for field in rule.inputs.iter().flat_map(|input| &input.selects) {
         deadline.record(
             Instant::now(),
             field.maxage.map(Duration::from_secs_f64),
