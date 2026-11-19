@@ -25,7 +25,10 @@ use robonix_scribe::Level;
 use serde_json::Value;
 
 use self::{
-    adapter::InputAdapter,
+    adapter::{
+        InputAdapter,
+        strategy::{Strategies, StrategyConfig},
+    },
     enforcer::{Effect, EnforcementBuilder, EnforcementResult, Enforcer, HookRuntime},
     evaluator::RuleEvaluator,
     exclusion::ExclusionChecker,
@@ -54,13 +57,15 @@ pub struct CheckContext<'a> {
     pub values: &'a Value,
 }
 
-/// A source or static type failure that prevents a rule set from becoming executable.
+/// A rule or strategy configuration failure that prevents executable checks.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error(transparent)]
     Parse(#[from] srdl::Error),
     #[error(transparent)]
     Type(#[from] TypeError),
+    #[error("strategy initialization failed: {0:#}")]
+    Strategy(#[from] anyhow::Error),
 }
 
 /// Interprets an immutable, statically checked SRDL program for capability-call decisions.
@@ -78,23 +83,38 @@ pub struct SrdlInterpreter {
 impl SrdlInterpreter {
     /// Parse and check the entire source before any provider discovery or acquisition.
     /// Requires an active Tokio runtime to start the pool worker during construction.
-    pub fn load(source: &str, client: AtlasClient) -> Result<Self, LoadError> {
-        Self::load_with_strategies(source, client, adapter::strategy::Strategies::default())
-    }
-
-    /// Load rules with explicitly supplied JSON strategy implementations.
-    pub fn load_with_strategies(
+    pub fn load(
         source: &str,
         client: AtlasClient,
-        strategies: adapter::strategy::Strategies,
+        strategy_config: StrategyConfig,
     ) -> Result<Self, LoadError> {
         let program = Arc::new(srdl::parse(source)?);
         TypeChecker::check(&program)?;
+        let strategies = Strategies::initialize(strategy_config)?;
+        strategies.validate(&program)?;
         let adapter = InputAdapter::new(client).with_strategies(strategies);
         Ok(Self {
             exclusions: ExclusionChecker::new(&program.excludes),
-            enforcer: Enforcer::new(&program),
             evaluator: RuleEvaluator::start(adapter, program.clone()),
+            enforcer: Enforcer::new(&program),
+            program,
+        })
+    }
+
+    /// Load SRDL with strategy implementations supplied by the embedding runtime.
+    pub fn load_with_strategies(
+        source: &str,
+        client: AtlasClient,
+        strategies: Strategies,
+    ) -> Result<Self, LoadError> {
+        let program = Arc::new(srdl::parse(source)?);
+        TypeChecker::check(&program)?;
+        strategies.validate(&program)?;
+        let adapter = InputAdapter::new(client).with_strategies(strategies);
+        Ok(Self {
+            exclusions: ExclusionChecker::new(&program.excludes),
+            evaluator: RuleEvaluator::start(adapter, program.clone()),
+            enforcer: Enforcer::new(&program),
             program,
         })
     }
@@ -207,6 +227,11 @@ impl SrdlInterpreter {
             let checks = (decision.effect != Effect::Stop).then_some(checks);
             Some((decision, checks))
         })
+    }
+
+    /// Release all admissions owned by a failed plan task, including its corrective calls.
+    pub fn release_failed_task(&self, plan_id: &str, task: tokio::task::Id) {
+        self.exclusions.finish_task(plan_id, task);
     }
 
     /// Release a completed capability's admission, then check after rules only on success.

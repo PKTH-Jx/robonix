@@ -32,7 +32,7 @@ impl std::fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Invalid rule references, declarations, or operations on the three basic binding types.
+/// Invalid rule references, declarations, or operations on scalar and optional values.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TypeErrorKind {
     #[error("duplicate rule '{0}'")]
@@ -61,6 +61,21 @@ pub enum TypeErrorKind {
     DuplicateBinding(String),
     #[error("unknown binding '{0}'")]
     UnknownBinding(String),
+    #[error("expected an option, found {0:?}")]
+    ExpectedOption(InputType),
+    #[error("'?' must be paired with a fallback '|'")]
+    UnpairedTry,
+    #[error("'|' requires a try expression on its left, found {0:?}")]
+    ExpectedTry(InputType),
+    #[error("an expression cannot combine multiple unhandled try values")]
+    MultipleTryValues,
+    #[error("match arms have incompatible types: {some:?} and {none:?}")]
+    MatchArms {
+        /// Type returned by the present-value arm.
+        some: InputType,
+        /// Type returned by the absent-value arm.
+        none: InputType,
+    },
     #[error("require must be boolean, found {0:?}")]
     NonBooleanRequire(InputType),
     #[error("unary operator {operator:?} does not accept {operand:?}")]
@@ -83,8 +98,33 @@ pub enum TypeErrorKind {
     UnsupportedExpression(&'static str),
 }
 
+/// Inferred value type, with optional absence introduced only by a '?' expression.
+#[derive(Debug, PartialEq, Eq)]
+enum ExpressionType {
+    /// A declared value type whose evaluation does not propagate optional absence.
+    Value(InputType),
+    /// An intermediate result that can propagate optional absence to a fallback.
+    Try(InputType),
+}
+
+impl ExpressionType {
+    fn data_type(&self) -> &InputType {
+        match self {
+            Self::Value(data_type) | Self::Try(data_type) => data_type,
+        }
+    }
+
+    fn combine(self, other: Self, result: InputType) -> Result<Self, TypeErrorKind> {
+        match (self, other) {
+            (Self::Try(_), Self::Try(_)) => Err(TypeErrorKind::MultipleTryValues),
+            (Self::Try(_), _) | (_, Self::Try(_)) => Ok(Self::Try(result)),
+            _ => Ok(Self::Value(result)),
+        }
+    }
+}
+
 /// Infers expression types using one shared input and context scope per rule.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TypeChecker {
     /// Input and context aliases with their declared types in the current rule.
     bindings: BTreeMap<String, InputType>,
@@ -116,25 +156,66 @@ impl TypeChecker {
     }
 
     fn infer_expression(&self, expression: &Expression) -> Result<InputType, TypeError> {
+        match self.infer(expression)? {
+            ExpressionType::Value(data_type) => Ok(data_type),
+            ExpressionType::Try(_) => Err(self.error(TypeErrorKind::UnpairedTry)),
+        }
+    }
+
+    fn infer(&self, expression: &Expression) -> Result<ExpressionType, TypeError> {
         use BinaryOperator as B;
+        use ExpressionType::{Try, Value};
         use InputType as T;
         match expression {
-            Expression::Literal(Literal::Number(_)) => Ok(T::Number),
-            Expression::Literal(Literal::String(_)) => Ok(T::String),
-            Expression::Literal(Literal::Boolean(_)) => Ok(T::Boolean),
+            Expression::Try(value) => match self.infer(value)? {
+                Value(T::Option(inner)) => Ok(Try(*inner)),
+                actual => {
+                    Err(self.error(TypeErrorKind::ExpectedOption(actual.data_type().clone())))
+                }
+            },
+            Expression::Match {
+                value,
+                binding,
+                some,
+                none,
+            } => {
+                let actual = self.infer(value)?;
+                let Value(T::Option(inner)) = actual else {
+                    return Err(
+                        self.error(TypeErrorKind::ExpectedOption(actual.data_type().clone()))
+                    );
+                };
+                let mut scoped = self.clone();
+                scoped.bindings.insert(binding.0.clone(), *inner);
+                let some = scoped.infer(some)?;
+                let none = self.infer(none)?;
+                if some.data_type() != none.data_type() {
+                    return Err(self.error(TypeErrorKind::MatchArms {
+                        some: some.data_type().clone(),
+                        none: none.data_type().clone(),
+                    }));
+                }
+                let result = some.data_type().clone();
+                some.combine(none, result).map_err(|kind| self.error(kind))
+            }
+            Expression::Literal(Literal::Number(_)) => Ok(Value(T::Number)),
+            Expression::Literal(Literal::String(_)) => Ok(Value(T::String)),
+            Expression::Literal(Literal::Boolean(_)) => Ok(Value(T::Boolean)),
             Expression::Identifier(Identifier(name)) => self
                 .bindings
                 .get(name)
-                .copied()
+                .cloned()
+                .map(Value)
                 .ok_or_else(|| self.error(TypeErrorKind::UnknownBinding(name.clone()))),
             Expression::Unary { operator, operand } => {
-                let operand_type = self.infer_expression(operand)?;
-                match (operator, operand_type) {
-                    (UnaryOperator::Negate, T::Number) => Ok(T::Number),
-                    (UnaryOperator::Not, T::Boolean) => Ok(T::Boolean),
+                let operand_type = self.infer(operand)?;
+                match (operator, operand_type.data_type()) {
+                    (UnaryOperator::Negate, T::Number) | (UnaryOperator::Not, T::Boolean) => {
+                        Ok(operand_type)
+                    }
                     _ => Err(self.error(TypeErrorKind::InvalidUnary {
                         operator: *operator,
-                        operand: operand_type,
+                        operand: operand_type.data_type().clone(),
                     })),
                 }
             }
@@ -143,29 +224,47 @@ impl TypeChecker {
                 left,
                 right,
             } => {
-                let left_type = self.infer_expression(left)?;
-                let right_type = self.infer_expression(right)?;
-                match operator {
-                    B::Add | B::Subtract | B::Multiply | B::Divide | B::Remainder
-                        if left_type == T::Number && right_type == T::Number =>
-                    {
-                        Ok(T::Number)
+                let left = self.infer(left)?;
+                let right = self.infer(right)?;
+                let left_type = left.data_type();
+                let right_type = right.data_type();
+                if *operator == B::Fallback {
+                    let Try(left_type) = left else {
+                        return Err(self.error(TypeErrorKind::ExpectedTry(left_type.clone())));
+                    };
+                    if left_type == *right_type && !matches!(left_type, T::Option(_)) {
+                        return Ok(right);
                     }
-                    B::Lt | B::Lte | B::Gt | B::Gte
-                        if left_type == T::Number && right_type == T::Number =>
-                    {
-                        Ok(T::Boolean)
-                    }
-                    B::And | B::Or if left_type == T::Boolean && right_type == T::Boolean => {
-                        Ok(T::Boolean)
-                    }
-                    B::Eq | B::Neq if left_type == right_type => Ok(T::Boolean),
-                    _ => Err(self.error(TypeErrorKind::InvalidBinary {
+                    return Err(self.error(TypeErrorKind::InvalidBinary {
                         operator: *operator,
                         left: left_type,
-                        right: right_type,
-                    })),
+                        right: right_type.clone(),
+                    }));
                 }
+                let result = match operator {
+                    B::Add | B::Subtract | B::Multiply | B::Divide | B::Remainder
+                        if *left_type == T::Number && *right_type == T::Number =>
+                    {
+                        T::Number
+                    }
+                    B::Lt | B::Lte | B::Gt | B::Gte
+                        if *left_type == T::Number && *right_type == T::Number =>
+                    {
+                        T::Boolean
+                    }
+                    B::And | B::Or if *left_type == T::Boolean && *right_type == T::Boolean => {
+                        T::Boolean
+                    }
+                    B::Eq | B::Neq if left_type == right_type => T::Boolean,
+                    _ => {
+                        return Err(self.error(TypeErrorKind::InvalidBinary {
+                            operator: *operator,
+                            left: left_type.clone(),
+                            right: right_type.clone(),
+                        }));
+                    }
+                };
+                left.combine(right, result).map_err(|kind| self.error(kind))
             }
             Expression::Field { .. } => {
                 Err(self.error(TypeErrorKind::UnsupportedExpression("field access")))
@@ -260,15 +359,15 @@ impl<'ast> Visitor<'ast> for TypeChecker {
     }
 
     fn visit_input_field(&mut self, input: &SelectField) -> Result<(), TypeError> {
-        self.declare(&input.name, input.data_type)
+        self.declare(&input.name, input.data_type.clone())
     }
 
     fn visit_yield_field(&mut self, input: &YieldField) -> Result<(), TypeError> {
-        self.declare(&input.name, input.data_type)
+        self.declare(&input.name, input.data_type.clone())
     }
 
     fn visit_context(&mut self, context: &ContextClause) -> Result<(), TypeError> {
-        self.declare(&context.name, context.data_type)
+        self.declare(&context.name, context.data_type.clone())
     }
 
     fn visit_require(&mut self, require: &RequireClause) -> Result<(), TypeError> {
@@ -676,5 +775,114 @@ mod tests {
                 kind: TypeErrorKind::DuplicateBinding("x".into()),
             }
         );
+    }
+    #[test]
+    fn checks_enum_bases_and_optional_match_scopes() {
+        let declarations = r#"
+            input from "source" select [
+                enum number { 1, 2 } n = n,
+                enum string { "A", "B" } label = label,
+                option<number> tilt = tilt,
+                option<boolean> ready = ready
+            ];
+        "#;
+        for (expression, valid) in [
+            ("n + 1 > 0 && label = \"A\"", true),
+            ("label = \"outside-enum\"", true),
+            ("tilt? < n | false", true),
+            ("ready? | false", true),
+            (
+                "true && match tilt { some(v) => v < n, none => false }",
+                true,
+            ),
+            ("match tilt { some(n) => n < 1, none => n = 2 }", true),
+            ("tilt < n", false),
+            ("n? > 0", false),
+            ("match n { some(v) => true, none => false }", false),
+            ("match tilt { some(v) => v, none => false }", false),
+            ("match tilt { some(v) => true, none => v < 1 }", false),
+            (
+                "(match tilt { some(v) => true, none => false }) && v > 0",
+                false,
+            ),
+        ] {
+            let program = parse(&format!(
+                "rule r {{ {declarations} require {expression}; enforce deny; }}"
+            ))
+            .unwrap();
+            assert_eq!(TypeChecker::check(&program).is_ok(), valid, "{expression}");
+        }
+    }
+
+    #[test]
+    fn checks_fallback_types_and_requires_paired_options() {
+        let check = |expression| {
+            let program = parse(&format!(
+                r#"rule r {{
+                    input from "source" select [
+                        option<number> a, option<number> b,
+                        option<string> label, option<boolean> ready,
+                        enum number {{ 1, 2 }} n
+                    ];
+                    require {expression}; enforce deny;
+                }}"#
+            ))
+            .unwrap();
+            TypeChecker::check(&program)
+        };
+        for expression in [
+            "a? <= 10 | false",
+            "(a? | b? | 90) <= 10",
+            "(-(a? | b?) | 90) <= 10",
+            "((a? | b?) | 90) <= 10",
+            "(a? | n) <= 10",
+            r#"(label? | "unknown") = "cup""#,
+            "ready? | false",
+            "(a? <= 10 | false) && (b? <= 1 | false)",
+            "false && a? > 0 | false",
+            "(match a { some(v) => v, none => b? } | 0) >= 0",
+        ] {
+            check(expression).unwrap_or_else(|error| panic!("{expression}: {error}"));
+        }
+        for expression in ["a? <= 10", "(a? | b?) <= 10", "true || a? > 0"] {
+            assert_eq!(
+                check(expression).unwrap_err().kind,
+                TypeErrorKind::UnpairedTry
+            );
+        }
+        for expression in ["n > 0 | false", "(a? | 90) < 10 | false"] {
+            assert_eq!(
+                check(expression).unwrap_err().kind,
+                TypeErrorKind::ExpectedTry(InputType::Boolean),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "a? + b? > 0 | false",
+            "a? = b? | false",
+            "(match ready { some(v) => a?, none => b? } | 90) > 0",
+        ] {
+            assert_eq!(
+                check(expression).unwrap_err().kind,
+                TypeErrorKind::MultipleTryValues,
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            check("((a? | b?)? | 90) < 10").unwrap_err().kind,
+            TypeErrorKind::ExpectedOption(InputType::Number)
+        );
+        for expression in [r#"(a? | "unknown") > 0"#, "a? > 0 | 0", "(a? | a) > 0"] {
+            assert!(
+                matches!(
+                    check(expression).unwrap_err().kind,
+                    TypeErrorKind::InvalidBinary {
+                        operator: BinaryOperator::Fallback,
+                        ..
+                    }
+                ),
+                "{expression}"
+            );
+        }
     }
 }

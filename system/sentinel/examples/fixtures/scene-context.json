@@ -1,0 +1,19 @@
+{
+  "result": {
+    "pose_known": true,
+    "map_id": ".live",
+    "x": 4.764814788424445,
+    "y": 1.4842536603369985,
+    "z": 0.30985092898617533,
+    "yaw": 1.1957160825300146,
+    "region_id": "",
+    "region_name": "",
+    "containing_area_ids": [],
+    "containing_area_names": [],
+    "nearby_objects": [],
+    "observed_at_unix": 1795001761.9819002,
+    "snapshot_at_unix": 1795001762.0977345,
+    "stale": false,
+    "reason": "robot pose is current but outside every registered region"
+  }
+}

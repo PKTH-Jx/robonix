@@ -1,0 +1,99 @@
+{
+  "snapshot": {
+    "ts_ns": 498605084431,
+    "power": {
+      "battery_percent": -1.0,
+      "voltage": -1.0,
+      "charging": false,
+      "remaining_s": -1
+    },
+    "components": [],
+    "bodies": [
+      {
+        "body_type": "piper_ctl",
+        "model": "piper_ctl",
+        "state": 0,
+        "message": "",
+        "components": [
+          {
+            "name": "joint1",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint1",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "joint2",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint2",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "joint3",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint3",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "joint4",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint4",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "joint5",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint5",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "joint6",
+            "kind": "joint",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/joint6",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          },
+          {
+            "name": "gripper",
+            "kind": "gripper",
+            "temperature": -1.0,
+            "error_code": 0,
+            "enabled": true,
+            "id": "body/arm/piper_ctl/gripper",
+            "parent_id": "body/arm/piper_ctl",
+            "model": ""
+          }
+        ]
+      },
+      {
+        "body_type": "ranger_chassis",
+        "model": "ranger_chassis",
+        "state": 0,
+        "message": "",
+        "components": []
+      }
+    ]
+  }
+}

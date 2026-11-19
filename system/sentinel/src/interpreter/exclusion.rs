@@ -4,7 +4,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Mutex,
+    sync::{Arc, Mutex, Weak},
 };
 
 use super::{
@@ -20,10 +20,12 @@ type CallKey = (String, String);
 struct Call {
     /// Generation required when releasing this admission.
     id: u64,
+    /// Executor joins this task if the call or a nested corrective call panics.
+    task: Option<tokio::task::Id>,
     /// Contract used in directed relation lookups.
     capability: String,
-    /// Permission has been issued and remains until explicit completion.
-    committed: bool,
+    /// A pending check holds its admission ID until it commits. Admitted calls wait for completion.
+    pending: Option<Weak<u64>>,
     /// A conflicting arrival invalidated this pending admission.
     conflict: Option<String>,
 }
@@ -73,13 +75,17 @@ impl ExclusionChecker {
         call_id: &str,
         capability: &str,
         builder: &mut EnforcementBuilder,
-    ) -> Option<u64> {
+    ) -> Option<Arc<u64>> {
         if self.relations.is_empty() {
             return None;
         }
         let key = (plan_id.to_owned(), call_id.to_owned());
         // Keep conflict detection and reservation atomic across concurrent checks.
         let mut state = self.state.lock().unwrap();
+        // A discarded arrival can never dispatch. Reclaim it before checking conflicts or capacity.
+        state
+            .calls
+            .retain(|_, call| call.pending.as_ref().is_none_or(|id| id.strong_count() > 0));
         if state.calls.contains_key(&key) {
             builder.exclusion(Err(Error::Pool(
                 "Capability call already has an exclusion admission",
@@ -91,10 +97,10 @@ impl ExclusionChecker {
         // so finishing rule evaluation first cannot let either conflicting call proceed.
         for call in state.calls.values_mut() {
             if self.excludes(&call.capability, capability)
-                || (!call.committed && self.excludes(capability, &call.capability))
+                || (call.pending.is_some() && self.excludes(capability, &call.capability))
             {
                 conflict = Some(call.capability.clone());
-                if !call.committed {
+                if call.pending.is_some() {
                     // Mark every pending conflict; its commit must fail when it resumes.
                     call.conflict = Some(capability.to_owned());
                 }
@@ -122,13 +128,14 @@ impl ExclusionChecker {
         }
         // Distinguish this reservation from later reuse of the same plan and call IDs.
         state.next_id += 1;
-        let id = state.next_id;
+        let id = Arc::new(state.next_id);
         state.calls.insert(
             key,
             Call {
-                id,
+                id: *id,
+                task: tokio::task::try_id(),
                 capability: capability.to_owned(),
-                committed: false,
+                pending: Some(Arc::downgrade(&id)),
                 conflict: None,
             },
         );
@@ -140,13 +147,13 @@ impl ExclusionChecker {
         &self,
         plan_id: &str,
         call_id: &str,
-        id: u64,
+        id: Arc<u64>,
         builder: &mut EnforcementBuilder,
     ) {
         let key = (plan_id.to_owned(), call_id.to_owned());
         let mut state = self.state.lock().unwrap();
         let call = &state.calls[&key];
-        assert_eq!(call.id, id, "commit must refer to the reserved admission");
+        assert_eq!(call.id, *id, "commit must refer to the reserved admission");
         // Another arrival may have invalidated this reservation during rule or hook execution.
         if let Some(conflicting) = call.conflict.clone() {
             super::logging::log(
@@ -162,8 +169,8 @@ impl ExclusionChecker {
             }));
         }
         if builder.effect() == Effect::Allow {
-            state.calls.get_mut(&key).unwrap().committed = true;
-            builder.exclusion(Ok(Some(id)));
+            state.calls.get_mut(&key).unwrap().pending = None;
+            builder.exclusion(Ok(Some(*id)));
         } else {
             // No permission escaped to execution, so completion will have nothing to release.
             state.calls.remove(&key);
@@ -177,10 +184,18 @@ impl ExclusionChecker {
         if state
             .calls
             .get(&key)
-            .is_some_and(|call| call.id == id && call.committed)
+            .is_some_and(|call| call.id == id && call.pending.is_none())
         {
             state.calls.remove(&key);
         }
+    }
+
+    pub(super) fn finish_task(&self, plan_id: &str, task: tokio::task::Id) {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .retain(|(plan, _), call| plan != plan_id || call.task != Some(task));
     }
 }
 
@@ -271,6 +286,38 @@ mod tests {
         assert_eq!(denied.effect, Effect::Deny);
         assert!(matches!(denied.reports[0].evaluation, Err(Error::Pool(_))));
         processor.finish("p", &(CAPACITY - 1).to_string(), last);
+        let mut builder = EnforcementBuilder::default();
+        let abandoned = processor.begin("p", "pending", "A", &mut builder).unwrap();
+        assert_eq!(arrive(&processor, "q", "extra", "A").effect, Effect::Deny);
+        drop(abandoned);
         assert_eq!(arrive(&processor, "q", "extra", "A").effect, Effect::Allow);
+    }
+
+    #[tokio::test]
+    async fn failed_task_releases_its_call_and_corrective_call() {
+        let clauses = crate::srdl::parse("exclude A X; exclude B Y; exclude C Z;").unwrap();
+        let checker = Arc::new(ExclusionChecker::new(&clauses.excludes));
+        let sibling = arrive(&checker, "plan", "sibling", "C")
+            .admission_id
+            .unwrap();
+        let failed = tokio::spawn({
+            let checker = checker.clone();
+            async move {
+                assert_eq!(arrive(&checker, "plan", "call", "A").effect, Effect::Allow);
+                assert_eq!(arrive(&checker, "plan", "hook", "B").effect, Effect::Allow);
+                panic!("call task panicked after admission");
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(failed.is_panic());
+        assert_eq!(arrive(&checker, "other", "x", "X").effect, Effect::Deny);
+        assert_eq!(arrive(&checker, "other", "y", "Y").effect, Effect::Deny);
+        checker.finish_task("plan", failed.id());
+        assert_eq!(arrive(&checker, "other", "x", "X").effect, Effect::Allow);
+        assert_eq!(arrive(&checker, "other", "y", "Y").effect, Effect::Allow);
+        assert_eq!(arrive(&checker, "other", "z", "Z").effect, Effect::Deny);
+        checker.finish("plan", "sibling", sibling);
+        assert_eq!(arrive(&checker, "other", "z", "Z").effect, Effect::Allow);
     }
 }

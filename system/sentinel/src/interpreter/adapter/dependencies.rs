@@ -5,7 +5,7 @@
 use std::{collections::BTreeSet, convert::Infallible};
 
 use crate::srdl::{
-    ast::{Identifier, Rule},
+    ast::{Expression, Identifier, Rule},
     visitor::Visitor,
 };
 
@@ -18,6 +18,24 @@ pub(super) struct References<'ast> {
 
 impl<'ast> Visitor<'ast> for References<'ast> {
     type Error = Infallible;
+    fn visit_expression(&mut self, expression: &'ast Expression) -> Result<(), Self::Error> {
+        if let Expression::Match {
+            value,
+            binding,
+            some,
+            none,
+        } = expression
+        {
+            self.visit_expression(value)?;
+            let mut scoped = References::default();
+            scoped.visit_expression(some)?;
+            scoped.names.remove(binding.0.as_str());
+            self.names.extend(scoped.names);
+            self.visit_expression(none)
+        } else {
+            crate::srdl::visitor::walk_expression(self, expression)
+        }
+    }
     fn visit_identifier(&mut self, name: &'ast Identifier) -> Result<(), Self::Error> {
         self.names.insert(&name.0);
         Ok(())

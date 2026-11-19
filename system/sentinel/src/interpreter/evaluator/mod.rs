@@ -48,7 +48,7 @@ pub(super) struct Evaluation {
 /// Predicate results for one triggered rule, in source declaration order.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuleResult {
-    /// True means the corresponding require expression holds.
+    /// True passes and false violates a requirement.
     pub requirements: Vec<bool>,
 }
 
@@ -62,7 +62,7 @@ impl RuleResult {
         self.requirements
             .iter()
             .enumerate()
-            .filter_map(|(index, value)| (!value).then_some(index + 1))
+            .filter_map(|(index, value)| (!*value).then_some(index + 1))
             .collect()
     }
 }
@@ -579,7 +579,7 @@ pub(super) fn evaluate(
         logging::log(
             Level::Info,
             format!(
-                "[sentinel] check_id={check_id} rule={:?} require={} result={result}",
+                "[sentinel] check_id={check_id} rule={:?} require={} result={result:?}",
                 rule.name.0,
                 index + 1
             ),

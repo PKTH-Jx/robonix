@@ -66,7 +66,8 @@ async fn main() -> Result<()> {
         AtlasClient::connect_with_retry(&cfg.atlas_endpoint, 10, Duration::from_secs(2))
             .await
             .context("connect to atlas")?;
-    let sentinel = SentinelRuntime::load(&cfg.sentinel_rules, atlas.clone())?;
+    let sentinel =
+        SentinelRuntime::load(&cfg.sentinel_rules, atlas.clone(), cfg.sentinel_strategies)?;
 
     atlas
         .register_service(&cfg.id, EXECUTOR_NAMESPACE, "")

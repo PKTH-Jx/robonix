@@ -422,4 +422,64 @@ mod expression {
             );
         }
     }
+
+    #[test]
+    fn fallbacks_are_lazy_and_handle_only_optional_absence() {
+        use InputValue::{Boolean, Number};
+        let mut inputs = inputs();
+        for (name, value) in [
+            ("present", InputValue::Some(Box::new(Number(7.0)))),
+            ("absent", InputValue::None(InputType::Number)),
+            (
+                "text",
+                InputValue::Some(Box::new(InputValue::String("safe".into()))),
+            ),
+            ("missing_text", InputValue::None(InputType::String)),
+            ("negative", InputValue::Some(Box::new(Boolean(false)))),
+            ("missing_bool", InputValue::None(InputType::Boolean)),
+        ] {
+            inputs.insert(name.into(), Arc::new(value));
+        }
+        for (source, expected) in [
+            ("present? | 1 / 0", Number(7.0)),
+            ("present? < 0 | 1 / 0 > 0", Boolean(false)),
+            ("absent? | present? | 90", Number(7.0)),
+            ("absent? | absent? | 90", Number(90.0)),
+            ("(absent? | absent?) | 90", Number(90.0)),
+            ("(absent? | 90) <= 10", Boolean(false)),
+            ("absent? <= 10 | true", Boolean(true)),
+            (
+                r#"missing_text? | text? | "unknown""#,
+                InputValue::String("safe".into()),
+            ),
+            ("missing_bool? | negative? | true", Boolean(false)),
+            ("true || absent? > 0 | false", Boolean(true)),
+            ("false && absent? > 0 | true", Boolean(false)),
+            ("(absent? | 1) + 2", Number(3.0)),
+            (
+                "match present { some(v) => v, none => absent? } | 90",
+                Number(7.0),
+            ),
+        ] {
+            assert_eq!(
+                evaluate(&condition(source), &inputs),
+                Ok(expected),
+                "{source}"
+            );
+        }
+        for source in ["present? / 0 | 90", "absent? | 1 / 0"] {
+            assert_eq!(
+                evaluate(&condition(source), &inputs),
+                Err(Error::DivisionByZero)
+            );
+        }
+        assert_eq!(
+            evaluate(&condition("missing + present? | 90"), &inputs),
+            Err(Error::UnknownInput("missing".into()))
+        );
+        assert_eq!(
+            evaluate_condition(&condition("absent? > 0"), &inputs),
+            Err(Error::AbsentOption)
+        );
+    }
 }

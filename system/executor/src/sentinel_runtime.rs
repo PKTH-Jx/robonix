@@ -19,6 +19,7 @@ use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_scribe::warn;
 use robonix_sentinel::interpreter::{
     CheckContext, SrdlInterpreter,
+    adapter::strategy::StrategyConfig,
     enforcer::{Effect, EnforcementResult, Error as HookError, HookRuntime},
 };
 use serde_json::{Map, Value};
@@ -65,20 +66,34 @@ pub struct SentinelRuntime {
 pub struct SentinelServiceImpl;
 
 impl SentinelRuntime {
-    /// Load a policy snapshot; later file changes do not affect active plans.
-    pub fn load(path: &Path, atlas: AtlasClient) -> Result<Self> {
-        let source = std::fs::read_to_string(path)
-            .with_context(|| format!("read Sentinel SRDL '{}'", path.display()))?;
-        Self::new(&source, atlas)
-            .with_context(|| format!("load Sentinel SRDL '{}'", path.display()))
-    }
-
-    /// Validate SRDL and start shared check queues; requires an active Tokio runtime.
+    /// Start a policy runtime with an empty strategy configuration.
+    #[cfg(test)]
     pub fn new(source: &str, atlas: AtlasClient) -> Result<Self> {
         Ok(Self {
-            interpreter: Arc::new(SrdlInterpreter::load(source, atlas.clone())?),
+            interpreter: Arc::new(SrdlInterpreter::load(
+                source,
+                atlas.clone(),
+                StrategyConfig::default(),
+            )?),
             atlas,
         })
+    }
+
+    /// Load a policy snapshot; later file changes do not affect active plans.
+    pub fn load(path: &Path, atlas: AtlasClient, strategy_config: StrategyConfig) -> Result<Self> {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("read Sentinel SRDL '{}'", path.display()))?;
+        Ok(Self {
+            interpreter: Arc::new(
+                SrdlInterpreter::load(&source, atlas.clone(), strategy_config)
+                    .with_context(|| format!("load Sentinel SRDL '{}'", path.display()))?,
+            ),
+            atlas,
+        })
+    }
+
+    pub(crate) fn release_failed_task(&self, plan_id: &str, task: tokio::task::Id) {
+        self.interpreter.release_failed_task(plan_id, task);
     }
 
     /// Bind checks and corrective calls to this node's verified identity and plan controls.
@@ -748,8 +763,9 @@ mod tests {
     #[tokio::test]
     async fn loaded_rules_use_trusted_context_and_preserve_failure_feedback() {
         let (atlas, server) = start_atlas().await;
+        assert!(SentinelRuntime::new("invalid", atlas.clone()).is_err());
         let path = std::env::temp_dir().join(format!("sentinel-{}.srdl", uuid::Uuid::new_v4()));
-        assert!(SentinelRuntime::load(&path, atlas.clone()).is_err());
+        assert!(SentinelRuntime::load(&path, atlas.clone(), StrategyConfig::default()).is_err());
         std::fs::write(
             &path,
             r#"trigger guard before "move";
@@ -761,7 +777,7 @@ mod tests {
         }"#,
         )
         .unwrap();
-        let runtime = SentinelRuntime::load(&path, atlas).unwrap();
+        let runtime = SentinelRuntime::load(&path, atlas, StrategyConfig::default()).unwrap();
         std::fs::write(&path, "changed after loading").unwrap();
         for (known, user, permitted, effect) in [
             (true, "alice", true, Effect::Allow),
@@ -871,6 +887,34 @@ mod tests {
                 }
             }
         }
+        server.abort();
+    }
+    #[tokio::test]
+    async fn feedback_reports_optional_fallback_results() {
+        let (atlas, server) = start_atlas().await;
+        let runtime = SentinelRuntime::new(
+            r#"
+            trigger guard before "target";
+            rule guard {
+                context option<enum number { 1, 2 }> observation = arguments.observation;
+                require observation? > 0 | false;
+                require match observation { some(value) => value > 0, none => true };
+                enforce deny;
+            }
+        "#,
+            atlas,
+        )
+        .unwrap();
+        let result = check(&runtime, &call("target"), &SentinelIdentity::default())
+            .await
+            .unwrap();
+        assert_eq!(result.effect, Effect::Deny);
+        let report = feedback(&result);
+        assert_eq!(
+            report["reports"][0]["requirements"],
+            serde_json::json!([false, true])
+        );
+        assert_eq!(report["reports"][0]["violations"], serde_json::json!([1]));
         server.abort();
     }
 }

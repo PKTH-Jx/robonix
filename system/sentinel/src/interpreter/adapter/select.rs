@@ -34,6 +34,7 @@ pub enum SelectErrorKind {
 pub(super) fn select<'json>(
     mut value: &'json Value,
     steps: &[SelectStep],
+    optional: bool,
 ) -> Result<&'json Value, SelectError> {
     use SelectErrorKind as K;
 
@@ -42,12 +43,18 @@ pub(super) fn select<'json>(
             step: index + 1,
             kind,
         };
+        if optional && value.is_null() {
+            return Ok(&Value::Null);
+        }
         value = match step {
-            SelectStep::Field(field) => value
-                .as_object()
-                .ok_or_else(|| error(K::ExpectedObject))?
-                .get(&field.0)
-                .ok_or_else(|| error(K::MissingField(field.0.clone())))?,
+            SelectStep::Field(field) => {
+                let object = value.as_object().ok_or_else(|| error(K::ExpectedObject))?;
+                match object.get(&field.0) {
+                    Some(value) => value,
+                    None if optional => return Ok(&Value::Null),
+                    None => return Err(error(K::MissingField(field.0.clone()))),
+                }
+            }
             SelectStep::Filter {
                 field,
                 value: expected,
@@ -63,7 +70,11 @@ pub(super) fn select<'json>(
                         Literal::Boolean(boolean) => actual.as_bool() == Some(*boolean),
                     }
                 });
-                let selected = matches.next().ok_or_else(|| error(K::NoMatch))?;
+                let selected = match matches.next() {
+                    Some(value) => value,
+                    None if optional => return Ok(&Value::Null),
+                    None => return Err(error(K::NoMatch)),
+                };
                 // Reject ambiguity rather than making the result depend on array order.
                 if matches.next().is_some() {
                     return Err(error(K::MultipleMatches));
@@ -121,7 +132,7 @@ mod tests {
             ("require[true = false].maxage", Value::Null),
         ] {
             assert_eq!(
-                select(&response, &steps(path)).unwrap(),
+                select(&response, &steps(path), false).unwrap(),
                 &expected,
                 "{path}"
             );
@@ -146,7 +157,7 @@ mod tests {
             ("items[id = 1]", 2, SelectErrorKind::MultipleMatches),
         ] {
             assert_eq!(
-                select(&response, &steps(path)).unwrap_err(),
+                select(&response, &steps(path), false).unwrap_err(),
                 SelectError { step, kind },
                 "{path}"
             );

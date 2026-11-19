@@ -172,6 +172,18 @@ pub fn walk_expression<'ast, V: Visitor<'ast> + ?Sized>(
     expression: &'ast Expression,
 ) -> Result<(), V::Error> {
     match expression {
+        Expression::Try(value) => visitor.visit_expression(value)?,
+        Expression::Match {
+            value,
+            binding,
+            some,
+            none,
+        } => {
+            visitor.visit_expression(value)?;
+            visitor.visit_identifier(binding)?;
+            visitor.visit_expression(some)?;
+            visitor.visit_expression(none)?;
+        }
         Expression::Literal(literal) => visitor.visit_literal(literal)?,
         Expression::Identifier(identifier) => visitor.visit_identifier(identifier)?,
         Expression::Field { base, field } => {

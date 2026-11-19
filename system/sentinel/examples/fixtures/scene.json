@@ -1,0 +1,187 @@
+{
+  "result": {
+    "nodes": [
+      {
+        "object_id": "scene.object.0005",
+        "label": "picture_frame",
+        "caption": "picture_frame",
+        "x": 4.319393982009541,
+        "y": 4.986381594515923,
+        "z": 1.347058459089498,
+        "confidence": 0.5054600834846497,
+        "observation_count": 17,
+        "last_seen_unix": 1795001756.9760642
+      },
+      {
+        "object_id": "scene.object.0006",
+        "label": "frame",
+        "caption": "frame",
+        "x": 4.803204538465101,
+        "y": 4.702823617716251,
+        "z": 0.9555487850030445,
+        "confidence": 0.525920033454895,
+        "observation_count": 31,
+        "last_seen_unix": 1795001756.9760642
+      },
+      {
+        "object_id": "scene.object.0009",
+        "label": "frame",
+        "caption": "frame",
+        "x": 4.466372919705398,
+        "y": 4.891746807583766,
+        "z": 1.2099064646126911,
+        "confidence": 0.5258394479751587,
+        "observation_count": 7,
+        "last_seen_unix": 1795001756.9760642
+      },
+      {
+        "object_id": "scene.object.0010",
+        "label": "frame",
+        "caption": "frame",
+        "x": 3.839791511958503,
+        "y": 5.209053728760214,
+        "z": 1.0494177575118881,
+        "confidence": 0.5201174020767212,
+        "observation_count": 11,
+        "last_seen_unix": 1795001756.9760642
+      }
+    ],
+    "edges": [
+      {
+        "source_id": "scene.object.0010",
+        "target_id": "scene.object.0006",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 1.09 m)"
+      },
+      {
+        "source_id": "scene.object.0005",
+        "target_id": "scene.object.0006",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.68 m)"
+      },
+      {
+        "source_id": "scene.object.0006",
+        "target_id": "scene.object.0009",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.46 m)"
+      },
+      {
+        "source_id": "scene.object.0010",
+        "target_id": "scene.object.0005",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.61 m)"
+      },
+      {
+        "source_id": "scene.object.0005",
+        "target_id": "scene.object.0010",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.61 m)"
+      },
+      {
+        "source_id": "scene.object.0006",
+        "target_id": "scene.object.0010",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 1.09 m)"
+      },
+      {
+        "source_id": "scene.object.0009",
+        "target_id": "scene.object.0010",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.72 m)"
+      },
+      {
+        "source_id": "scene.object.0005",
+        "target_id": "scene.object.0009",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.22 m)"
+      },
+      {
+        "source_id": "scene.object.0009",
+        "target_id": "scene.object.0006",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.46 m)"
+      },
+      {
+        "source_id": "scene.object.0006",
+        "target_id": "scene.object.0005",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.68 m)"
+      },
+      {
+        "source_id": "scene.object.0009",
+        "target_id": "scene.object.0005",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.22 m)"
+      },
+      {
+        "source_id": "scene.object.0010",
+        "target_id": "scene.object.0009",
+        "relation": "near",
+        "confidence": 0.7,
+        "reason": "geometry: within 1.5 m (centre distance 0.72 m)"
+      },
+      {
+        "source_id": "scene.object.0003",
+        "target_id": "scene.object.0005",
+        "relation": "part_of",
+        "confidence": 0.6,
+        "reason": "Box 2 outlines the visible corner/edge of the large picture frame region labeled as picture_frame"
+      },
+      {
+        "source_id": "scene.object.0006",
+        "target_id": "scene.object.0002",
+        "relation": "part_of",
+        "confidence": 0.55,
+        "reason": "Small box on the lower corner of the dark wooden frame crop marked by box 1"
+      },
+      {
+        "source_id": "scene.object.0009",
+        "target_id": "scene.object.0002",
+        "relation": "part_of",
+        "confidence": 0.55,
+        "reason": "Small box on the upper corner of the same dark wooden frame crop marked by box 1"
+      },
+      {
+        "source_id": "scene.object.0006",
+        "target_id": "scene.object.0009",
+        "relation": "same_object",
+        "confidence": 0.45,
+        "reason": "Both tiny boxes mark the same frame corner region, overlapping visually"
+      },
+      {
+        "source_id": "scene.object.0002",
+        "target_id": "scene.object.0003",
+        "relation": "same_object",
+        "confidence": 0.8,
+        "reason": "Both boxes describe the same wooden picture-frame corner/detection."
+      },
+      {
+        "source_id": "scene.object.0005",
+        "target_id": "scene.object.0006",
+        "relation": "same_object",
+        "confidence": 0.75,
+        "reason": "Both labels mark the same picture-frame corner; duplicate detections of one frame."
+      },
+      {
+        "source_id": "scene.object.0003",
+        "target_id": "scene.object.0002",
+        "relation": "contains",
+        "confidence": 0.8,
+        "reason": "The wooden frame border (2) surrounds the inner panel (1)."
+      }
+    ],
+    "annotations": [],
+    "updated_at": 1795001762.0536778
+  }
+}

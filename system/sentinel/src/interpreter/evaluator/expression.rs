@@ -1,4 +1,4 @@
-//! Pure expression evaluation over already acquired basic input values.
+//! Pure expression evaluation over already acquired scalar and optional inputs.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -8,6 +8,10 @@ use crate::srdl::ast::{BinaryOperator, Expression, InputType, Literal, UnaryOper
 /// Failures in expression calculation, distinct from a false requirement result.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error("optional value is absent")]
+    AbsentOption,
+    #[error("expected an option, found {0:?}")]
+    ExpectedOption(InputType),
     #[error("input '{0}' is unavailable")]
     UnknownInput(String),
     #[error("expected boolean, found {0:?}")]
@@ -54,6 +58,25 @@ pub fn evaluate(
     inputs: &BTreeMap<String, Arc<InputValue>>,
 ) -> Result<InputValue, Error> {
     match expression {
+        Expression::Try(value) => match evaluate(value, inputs)? {
+            InputValue::Some(inner) => Ok(*inner),
+            InputValue::None(_) => Err(Error::AbsentOption),
+            value => Err(Error::ExpectedOption(value.data_type())),
+        },
+        Expression::Match {
+            value,
+            binding,
+            some,
+            none,
+        } => match evaluate(value, inputs)? {
+            InputValue::Some(inner) => {
+                let mut scoped = inputs.clone();
+                scoped.insert(binding.0.clone(), Arc::new(*inner));
+                evaluate(some, &scoped)
+            }
+            InputValue::None(_) => evaluate(none, inputs),
+            value => Err(Error::ExpectedOption(value.data_type())),
+        },
         Expression::Literal(Literal::Number(value)) => number(*value),
         Expression::Literal(Literal::Boolean(value)) => Ok(InputValue::Boolean(*value)),
         Expression::Literal(Literal::String(value)) => Ok(InputValue::String(value.clone())),
@@ -82,6 +105,12 @@ pub fn evaluate(
             left,
             right,
         } => {
+            if *operator == BinaryOperator::Fallback {
+                return match evaluate(left, inputs) {
+                    Err(Error::AbsentOption) => evaluate(right, inputs),
+                    result => result,
+                };
+            }
             let left = evaluate(left, inputs)?;
             if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
                 let left = boolean(left)?;

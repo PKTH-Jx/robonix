@@ -20,6 +20,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tempfile = "3"
 robonix-scribe.workspace = true
 uuid.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }

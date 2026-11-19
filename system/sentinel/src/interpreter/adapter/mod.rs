@@ -29,11 +29,11 @@ use tokio::{
 
 use self::scheduler::{Request, Scheduler};
 use super::{evaluator::Error, logging};
-use crate::srdl::ast::{InputClause, InputFieldRef, InputSource, InputType, Rule};
+use crate::srdl::ast::{InputClause, InputFieldRef, InputSource, InputType, Literal, Rule};
 
 const MAX_CONCURRENT_BINDINGS: usize = 16;
 
-/// A basic SRDL value shared by acquired inputs and expression results.
+/// A typed SRDL value shared by acquired inputs and expression results.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputValue {
     /// A boolean.
@@ -42,12 +42,20 @@ pub enum InputValue {
     Number(f64),
     /// A string.
     String(String),
+    /// An available optional observation, containing its scalar value.
+    Some(Box<InputValue>),
+    /// An absent observation with the declared contained type.
+    None(InputType),
 }
 
 impl InputValue {
-    /// Decode a basic value without coercion; errors identify the actual JSON type.
+    /// Decode a scalar or optional value without coercion.
     pub(super) fn from_json(value: &Value, expected: InputType) -> Result<Self, &'static str> {
         let selected = match (expected, value) {
+            (InputType::Option(inner), Value::Null) => Some(Self::None(*inner)),
+            (InputType::Option(inner), value) => {
+                Some(Self::Some(Box::new(Self::from_json(value, *inner)?)))
+            }
             (InputType::Boolean, Value::Bool(boolean)) => Some(Self::Boolean(*boolean)),
             (InputType::Number, Value::Number(number)) => number
                 .as_f64()
@@ -71,6 +79,23 @@ impl InputValue {
             Self::Boolean(_) => InputType::Boolean,
             Self::Number(_) => InputType::Number,
             Self::String(_) => InputType::String,
+            Self::Some(value) => InputType::Option(Box::new(value.data_type())),
+            Self::None(inner) => InputType::Option(Box::new(inner.clone())),
+        }
+    }
+
+    pub(super) fn matches_enum(&self, allowed: &[Literal]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        match self {
+            Self::Some(value) => value.matches_enum(allowed),
+            Self::None(_) => true,
+            Self::Number(value) => allowed.contains(&Literal::Number(*value)),
+            Self::String(value) => allowed
+                .iter()
+                .any(|member| matches!(member, Literal::String(s) if s == value)),
+            Self::Boolean(_) => false,
         }
     }
 }
@@ -98,9 +123,12 @@ pub struct FieldValue<'ast> {
 impl<'ast> FieldValue<'ast> {
     fn from_json(response: &Value, field: InputFieldRef<'ast>) -> Result<Self, InputErrorKind> {
         let value = match field {
-            InputFieldRef::Select(field) => {
-                select::select(response, &field.select).map_err(InputErrorKind::Selection)?
-            }
+            InputFieldRef::Select(field) => select::select(
+                response,
+                &field.select,
+                matches!(field.data_type, InputType::Option(_)),
+            )
+            .map_err(InputErrorKind::Selection)?,
             InputFieldRef::Yield(field) => response
                 .as_object()
                 .and_then(|object| object.get(&field.name.0))
@@ -117,6 +145,9 @@ impl<'ast> FieldValue<'ast> {
                 actual,
             }
         })?;
+        if !value.matches_enum(field.allowed_values()) {
+            return Err(InputErrorKind::InvalidEnum);
+        }
         Ok(Self { field, value })
     }
 }
@@ -159,6 +190,8 @@ pub enum InputErrorKind {
     Acquisition(#[from] transport::Error),
     #[error(transparent)]
     Selection(#[from] select::SelectError),
+    #[error("input value is not an allowed enum member")]
+    InvalidEnum,
     #[error("input requires {expected:?}, found {actual}")]
     TypeMismatch {
         /// The basic type declared for this field.

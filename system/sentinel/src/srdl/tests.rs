@@ -152,6 +152,52 @@ fn preserves_precedence_and_left_associativity() {
 }
 
 #[test]
+fn parses_fallbacks_with_lowest_precedence_and_right_associativity() {
+    let unwrap = |value| E::Try(Box::new(name(value)));
+    assert_eq!(
+        condition("a? <= 10 | b? <= 20 | false").unwrap(),
+        binary(
+            B::Fallback,
+            binary(B::Lte, unwrap("a"), number("10")),
+            binary(
+                B::Fallback,
+                binary(B::Lte, unwrap("b"), number("20")),
+                E::Literal(Literal::Boolean(false))
+            )
+        )
+    );
+    assert_eq!(
+        condition("ready || a? < 10 | false").unwrap(),
+        binary(
+            B::Fallback,
+            binary(
+                B::Or,
+                name("ready"),
+                binary(B::Lt, unwrap("a"), number("10"))
+            ),
+            E::Literal(Literal::Boolean(false))
+        )
+    );
+    assert_eq!(
+        condition("(a?|0) + 1").unwrap(),
+        binary(
+            B::Add,
+            binary(B::Fallback, unwrap("a"), number("0")),
+            number("1")
+        )
+    );
+    for source in ["a? |", "| false", "a? ||| false"] {
+        assert!(condition(source).is_err(), "{source}");
+    }
+    assert!(matches!(
+        condition(&format!("{}false", "a? | ".repeat(130)))
+            .unwrap_err()
+            .kind,
+        ErrorKind::ExpressionTooDeep(_)
+    ));
+}
+
+#[test]
 fn parses_calls_fields_and_literals() {
     assert_eq!(
         condition(r#"clean(scene.target, "盘子\n\u0041", 2.5e-3, true, false, ready())"#).unwrap(),
@@ -390,6 +436,7 @@ fn parses_literal_array_filters() {
 fn rejects_invalid_input_declarations() {
     for declaration in [
         r#"input soma;"#,
+        r#"input from "source" select try<number> v;"#,
         r#"input from "source" select number v = value within 1;"#,
         r#"input from "source" select number v = value max_age 1;"#,
         r#"input from "source" select number v = value maxage 100ms;"#,
@@ -585,6 +632,8 @@ fn contextual_keywords_remain_usable_as_names() {
     for (rule_name, input_name, other) in [
         ("always", "capability", "always"),
         ("report", "allow", "deny"),
+        ("option", "some", "none"),
+        ("enum", "match", "option"),
     ] {
         let program = parse(&format!(
             r#"rule {rule_name} {{
@@ -827,7 +876,7 @@ fn reports_eof_and_unicode_locations() {
             found: "end of input".into(),
         }
     );
-    let error = parse("rule r { require \"温度\" ? 1; enforce deny; }").unwrap_err();
+    let error = parse("rule r { require \"温度\" @ 1; enforce deny; }").unwrap_err();
     assert_eq!(error.kind, ErrorKind::InvalidToken);
     assert_eq!(error.span, 26..27);
     assert_eq!((error.line, error.column), (1, 23));
@@ -933,7 +982,7 @@ fn parses_only_basic_input_types() {
             .inputs
             .iter()
             .flat_map(|input| input.selects.iter())
-            .map(|field| field.data_type)
+            .map(|field| field.data_type.clone())
             .collect::<Vec<_>>(),
         vec![InputType::Number, InputType::String, InputType::Boolean]
     );
@@ -960,7 +1009,7 @@ fn parses_only_basic_input_types() {
         assert_eq!(
             error.kind,
             ErrorKind::Expected {
-                expected: "'number', 'string', or 'boolean'".into(),
+                expected: "number, string, boolean, option<T>, or enum number/string".into(),
                 found: format!("{data_type:?}"),
             }
         );
@@ -984,7 +1033,7 @@ fn parses_context_bindings_without_acquisition_or_freshness() {
     assert_eq!(
         rule.contexts
             .iter()
-            .map(|context| context.data_type)
+            .map(|context| context.data_type.clone())
             .collect::<Vec<_>>(),
         [InputType::String, InputType::Boolean, InputType::Number]
     );
@@ -1127,6 +1176,103 @@ fn yield_and_using_accept_single_items_or_nonempty_lists() {
             ))
             .is_err(),
             "{clause}"
+        );
+    }
+}
+
+#[test]
+fn parses_optional_enums_and_option_expressions() {
+    let parsed = rule(
+        r#"
+        input from "source" select [
+            option<enum string { "A", "B" }> label = label,
+            enum number { -1, 0, 2.5 } level = level,
+            option<boolean> ready = ready
+        ], yield option<number> tilt = "Tilt" using Test();
+        require match label { some(value) => value = "A", none => false, };
+        require tilt? < 10 | false;
+        require match ready { none => true, some(value) => value };
+        enforce deny;
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.inputs[0].selects[0].data_type,
+        InputType::Option(Box::new(InputType::String))
+    );
+    assert_eq!(
+        parsed.inputs[0].selects[0].allowed_values,
+        [Literal::String("A".into()), Literal::String("B".into())]
+    );
+    assert!(matches!(
+        parsed.requires[1].expression,
+        E::Binary {
+            operator: B::Fallback,
+            ..
+        }
+    ));
+    for data_type in [
+        "enum string {}",
+        "enum number { 1, 1.0 }",
+        r#"enum string { "A", "A" }"#,
+        r#"enum number { 1, "2" }"#,
+        "enum boolean { true }",
+        "option<number",
+        "option<>",
+        "Option<number>",
+    ] {
+        assert!(
+            rule(&format!(
+                r#"input from "source" select {data_type} x; require true; enforce deny;"#
+            ))
+            .is_err(),
+            "{data_type}"
+        );
+    }
+    for expression in [
+        "match x { some(v) => true }",
+        "match x { none => true, none => false }",
+        "match x { some(v) => true, some(w) => false }",
+        "match x { Some(v) => true, None => false }",
+        "match x { Some(v) => true, none => false }",
+        "match x { some(v) => true, None => false }",
+    ] {
+        assert!(condition(expression).is_err(), "{expression}");
+    }
+}
+
+#[test]
+fn bounds_postfix_option_expression_depth() {
+    let mut nested = "value".to_owned();
+    for _ in 0..12 {
+        nested = format!("({nested}){}", "?".repeat(12));
+    }
+    assert!(matches!(
+        condition(&nested).unwrap_err().kind,
+        ErrorKind::ExpressionTooDeep(_)
+    ));
+    for suffix in ["?".repeat(256), ".field".repeat(200), "()".repeat(200)] {
+        assert!(matches!(
+            condition(&format!("value{suffix}")).unwrap_err().kind,
+            ErrorKind::ExpressionTooDeep(_)
+        ));
+    }
+}
+
+#[test]
+fn rejects_nested_option_declarations() {
+    for declaration in [
+        r#"input from "source" select option<option<number>> value = reading;"#,
+        r#"input from "source" yield option<option<enum string { "A", "B" }>> value = "State" using Test();"#,
+        "context option<option<boolean>> ready = arguments.ready;",
+        r#"input from "source" select option<option<option<string>>> value = label;"#,
+    ] {
+        let source = format!("rule r {{ {declaration} require true; enforce deny; }}");
+        let error = parse(&source).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NestedOption, "{declaration}");
+        assert_eq!(
+            error.span.start,
+            source.find("option<option").unwrap() + "option<".len()
         );
     }
 }

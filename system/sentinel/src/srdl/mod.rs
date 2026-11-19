@@ -41,6 +41,8 @@ pub enum ErrorKind {
     InvalidNumber,
     #[error("invalid string escape or Unicode sequence")]
     InvalidString,
+    #[error("nested option types are not supported")]
+    NestedOption,
     #[error("maxage must be greater than zero in the default time unit (seconds)")]
     InvalidMaxage,
     #[error("comparisons cannot be chained; combine them with &&")]

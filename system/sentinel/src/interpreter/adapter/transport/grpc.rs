@@ -15,6 +15,26 @@ const SOMA: &str = "robonix/system/soma/get_health";
 const VITALS: &str = "robonix/system/vitals/get";
 const SCENE: &str = "robonix/system/scene/get_robot_context";
 
+fn finite_number<T: Copy + Into<f64> + serde::Serialize, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !(*value).into().is_finite() {
+        return Err(serde::ser::Error::custom("non-finite gRPC observation"));
+    }
+    value.serialize(serializer)
+}
+
+fn finite_slice<T: Copy + Into<f64> + serde::Serialize, S: serde::Serializer>(
+    values: &[T],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if values.iter().any(|v| !(*v).into().is_finite()) {
+        return Err(serde::ser::Error::custom("non-finite gRPC observation"));
+    }
+    serde::Serialize::serialize(values, serializer)
+}
+
 /// Identify contracts with compiled request, response and client types in this module.
 pub(super) fn supports(capability: &str) -> bool {
     matches!(capability, SOMA | VITALS | SCENE)
@@ -114,6 +134,22 @@ mod tests {
     struct Snapshots {
         /// Switches Scene from a successful response to an explicit RPC failure.
         fail_scene: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn non_finite_observations_cannot_become_optional_absence() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let scalar = pb::soma::Scalar {
+                value,
+                ..Default::default()
+            };
+            assert!(decode(tonic::Response::new(scalar), |_| {}).is_err());
+            let scene = pb::semantic_map::GetRobotContextResponse {
+                x: value,
+                ..Default::default()
+            };
+            assert!(decode(tonic::Response::new(scene), |_| {}).is_err());
+        }
     }
 
     #[tonic::async_trait]

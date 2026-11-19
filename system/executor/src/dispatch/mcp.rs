@@ -91,7 +91,7 @@ async fn connect_mcp(endpoint: &str) -> anyhow::Result<McpClient> {
         let program = parts.next().unwrap_or("python3");
         let args: Vec<&str> = parts.collect();
         let mut command = tokio::process::Command::new(program);
-        command.args(&args);
+        command.env_remove("SENTINEL_SUMMARIZE_API_KEY").args(&args);
         let transport = rmcp::transport::TokioChildProcess::new(command)
             .map_err(|e| anyhow::anyhow!("MCP stdio spawn failed: {e}"))?;
         return ().serve(transport).await.map_err(|e| anyhow::anyhow!("MCP init failed: {e}"));

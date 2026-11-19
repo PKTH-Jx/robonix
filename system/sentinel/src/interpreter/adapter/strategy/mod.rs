@@ -2,18 +2,44 @@
 
 mod summarize;
 
-pub use summarize::Summarize;
+pub use summarize::{Summarize, SummarizeConfig};
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::InputValue;
-use crate::srdl::ast::{ContextClause, Rule, YieldClause, YieldField};
+use crate::srdl::ast::{ContextClause, Program, Rule, YieldClause, YieldField};
+
+/// Explicitly enabled strategies and their initialization settings.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategyConfig {
+    /// Model configuration; omission leaves Summarize unavailable to rules.
+    #[serde(rename = "Summarize")]
+    pub summarize: Option<SummarizeConfig>,
+}
+
+impl std::fmt::Debug for StrategyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrategyConfig")
+            .field(
+                "Summarize",
+                &self.summarize.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
+}
 
 /// A shared JSON transformation receiving configuration for each invocation.
 pub trait Strategy: Send + Sync {
+    /// Check positional arguments before the rule can acquire any observations.
+    fn validate_arguments(&self, _arguments: &[String]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn process<'a>(
         &'a self,
         input: Value,
@@ -30,6 +56,47 @@ pub struct Strategies {
 }
 
 impl Strategies {
+    pub(crate) fn initialize(config: StrategyConfig) -> anyhow::Result<Self> {
+        let mut strategies = Self::default();
+        if let Some(config) = config.summarize {
+            strategies.register(
+                "Summarize",
+                Arc::new(Summarize::new(
+                    &config.api_base,
+                    &config.model,
+                    &config.api_key,
+                )?),
+            );
+        }
+        Ok(strategies)
+    }
+
+    /// Validate that all strategies referenced in the program are configured and correct.
+    pub(crate) fn validate(&self, program: &Program) -> anyhow::Result<()> {
+        use anyhow::Context;
+        for rule in &program.rules {
+            for step in rule
+                .inputs
+                .iter()
+                .flat_map(|input| &input.yields)
+                .flat_map(|clause| &clause.strategies)
+            {
+                let strategy = self.strategies.get(&step.name.0).with_context(|| {
+                    format!(
+                        "rule '{}': strategy '{}' is not configured",
+                        rule.name.0, step.name.0
+                    )
+                })?;
+                strategy
+                    .validate_arguments(&step.arguments)
+                    .with_context(|| {
+                        format!("rule '{}': strategy '{}'", rule.name.0, step.name.0)
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Register a strategy implementation for use in SRDL.
     pub fn register(&mut self, name: impl Into<String>, strategy: Arc<dyn Strategy>) {
         self.strategies.insert(name.into(), strategy);
@@ -145,22 +212,28 @@ impl<'a> Parts<'a> {
         })
     }
 
+    fn render_value(value: &InputValue) -> anyhow::Result<String> {
+        match value {
+            InputValue::String(text) => Ok(text.clone()),
+            InputValue::Number(number) => Ok(number.to_string()),
+            InputValue::Boolean(boolean) => Ok(boolean.to_string()),
+            InputValue::Some(inner) => Self::render_value(inner),
+            InputValue::None(_) => anyhow::bail!("cannot interpolate an absent context value"),
+        }
+    }
+
     /// Substitute values once so braces within context data remain literal.
     fn render(&self, context: &BTreeMap<String, Arc<InputValue>>) -> anyhow::Result<String> {
         let mut output = String::new();
         for part in &self.parts {
             match part {
                 Part::Text(text) => output.push_str(text),
-                Part::Binding(name) => match context.get(*name) {
-                    Some(value) => match value.as_ref() {
-                        InputValue::String(text) => output.push_str(text),
-                        InputValue::Number(number) => output.push_str(&number.to_string()),
-                        InputValue::Boolean(boolean) => output.push_str(&boolean.to_string()),
-                    },
-                    None => {
-                        anyhow::bail!("strategy argument references unimported context '{name}'")
-                    }
-                },
+                Part::Binding(name) => {
+                    let value = context.get(*name).ok_or_else(|| {
+                        anyhow::anyhow!("strategy argument references unimported context '{name}'")
+                    })?;
+                    output.push_str(&Self::render_value(value)?);
+                }
             }
         }
         Ok(output)

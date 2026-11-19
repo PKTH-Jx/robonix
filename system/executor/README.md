@@ -20,6 +20,7 @@ cargo build -p robonix-executor
 | `--sentinel-listen` | `ROBONIX_SENTINEL_LISTEN` | Loopback-only Sentinel management gRPC; port defaults to Executor's port plus one |
 | `--sentinel-rules` | `ROBONIX_SENTINEL_RULES` | Sentinel SRDL source; defaults to `$ROBONIX_DATA_DIR/sentinel-rules.srdl` |
 | `--sentinel-rules-seed` | `ROBONIX_SENTINEL_RULES_SEED` | Optional policy copied only when the active rule file is absent |
+| `--summarize-api-key` | `SENTINEL_SUMMARIZE_API_KEY` | Credential for an enabled Sentinel Summarize strategy |
 | `--require-keystone` | `ROBONIX_EXECUTOR_REQUIRE_KEYSTONE` | Require a live Keystone session for execution and plan control |
 | `--id` | `ROBONIX_EXECUTOR_PROVIDER_ID` | Provider id `executor` |
 | `--config` | `ROBONIX_CONFIG_PATH` | Optional YAML with a subset of the same settings |
@@ -27,7 +28,7 @@ cargo build -p robonix-executor
 
 Connection settings use CLI > flag environment variable > manifest > YAML >
 default. `ROBONIX_ATLAS` is an additional fallback before YAML. Manifest
-verification settings override YAML verification settings.
+verification and `sentinel_strategies` settings override their YAML settings.
 
 Logging uses Scribe: `system.executor.log` (via `--config-json`) overrides
 `SCRIBE_FILE_LEVEL` (default `info`); `SCRIBE_CONSOLE_LEVEL` defaults to `warn`.
@@ -40,54 +41,41 @@ those entry points accept anonymous requests without contacting Keystone and
 leave any forwarded credential uninterpreted. `list_active_plans` remains a
 read-only unauthenticated query in either mode.
 
-Every `do` call runs the SRDL interpreter before dispatch. Rules are loaded
-and type-checked at startup; missing or invalid files stop startup. An empty
-file allows calls by default. The Sentinel pool worker starts during policy
-loading, before Executor accepts requests. Denials and check failures stop dispatch;
-node events carry the structured feedback in `operator_detail`.
+Executor loads and type-checks the SRDL file at startup. An empty file allows
+all calls. A missing or invalid file prevents startup. For rule syntax and an
+example, see the [Sentinel README](../sentinel/README.md).
 
-SRDL `before` triggers check admission. After successful synchronous or asynchronous
-execution, `after` triggers match independently and acquire fresh inputs. Their
-violations and check errors appear in feedback without changing execution success,
-dependent work, or optional result verification. Failed or cancelled calls skip
-after checks. Arrival, execution, and completion use Sentinel's lifecycle entry
-points and share its input and evaluation queues. Sentinel retains no evaluator state between checks.
+Configure strategies in the deployment manifest:
 
-SRDL `while` triggers check throughout synchronous and asynchronous execution:
-`trigger safety while "robot/move" interval 5;`. The optional positive factor
-defaults to 5 and multiplies the invocation's average acquisition and evaluation
-time to set each rule's start-to-start interval. Checks never overlap for one
-invocation. Sentinel owns the interval schedule and yields check results to Executor.
-`report` and `call` run once per violated rule until recovery.
-`stop` is valid only for while rules; a violation using it, an unavailable check,
-or a failed corrective call cancels the whole plan so Pilot can replan. Executor
-uses its existing plan-cancellation path: later commands are skipped, active async
-calls receive `/cancel`, and running command process groups are terminated.
-Synchronous calls already in progress may return naturally. Node feedback records
-the rule and `effect: stop`; the checked node finishes as `CANCELED`. Corrective
-calls inherit the plan's cancellation.
+```yaml
+system:
+  executor:
+    sentinel_strategies:
+      Summarize:
+        api_base: ${SENTINEL_SUMMARIZE_BASE_URL}
+        model: ${SENTINEL_SUMMARIZE_MODEL}
+        api_key: ${SENTINEL_SUMMARIZE_API_KEY}
+```
 
-Sentinel hooks build an admission decision, ordered report messages, and deferred
-capability calls. `SentinelRuntime` executes `call` requests through the same
-builtin/MCP dispatch and async status/cancel handling as plan calls. Calls use
-empty arguments and require exactly one matching MCP provider. Nested calls
-inherit the verified identity and undergo before and after Sentinel checks;
-nesting is limited to eight calls. `SentinelRuntime` provides shared policy state
-and creates hook contexts for arrival, execution, and completion checks. The
-interpreter remains internal to the integration. A hook call failure denies before admission
-and appears in after feedback. Node feedback includes `messages` and `calls`
-with each recorded call's success or error. Report hook text appears only in
-`messages`; per-rule feedback contains evaluation and enforcement details.
-Cancellation interrupts evaluation
-and discovery. Initial hook capability discovery has a 250 ms deadline. Started
-calls use Executor's normal cancellation handling before checking ends.
+`api_base` includes the version prefix, for example `https://api.openai.com/v1`.
+`rbnx` expands the variables and passes the key in Executor's environment. For a
+direct launch, `--summarize-api-key` takes precedence over the environment
+variable and the configured key. Direct YAML takes resolved values. An empty
+manifest mapping disables strategies configured in YAML.
 
-Sentinel enforces `exclude` declarations across plans, including calls without rules.
-Executor calls `on_complete` whenever call handling returns, including failure and
-cancellation. Completion explicitly releases admission before running after checks.
-Exclusions follow Executor's call lifecycle;
-a transport error or cancellation result does not confirm that a remote action stopped.
-Admission state is process-local; restart recovery is not implemented.
+A `before` rule can deny dispatch. A `while` rule runs throughout the call.
+Its `interval` factor (default 5) multiplies the rule's average check time.
+A `stop`, an unavailable while check, or a failed while hook cancels the plan.
+An `after` rule runs only on success and reports violations in node feedback.
+
+The `call` hook takes empty arguments and requires one matching MCP provider.
+Nested corrective calls inherit the plan identity and checks, up to eight
+levels. Node feedback in `operator_detail` includes rule results, report messages
+and corrective call outcomes.
+
+Exclusions apply across plans until Executor finishes handling the call. If a
+call task panics, Executor releases its exclusions and cancels its plan. A
+before rule can use measured speed to require standstill before manipulation.
 
 `robonix/system/sentinel/list_rules` and `replace_rules` are retained for
 SRDL rule reading and dynamic loading. Their handlers are not yet implemented.

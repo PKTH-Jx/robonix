@@ -1,68 +1,44 @@
 # Sentinel
 
-Sentinel evaluates SRDL safety rules around capability calls. Executor uses it to
-check conditions, reject calls, report violations, and stop plans during execution.
+Sentinel checks SRDL safety rules around Executor capability calls. A `before`
+rule can deny dispatch, a `while` rule can stop the running plan, and an `after`
+rule can report a violation after a successful call. An `exclude` declaration
+covers Executor-managed calls. Before rules can also check the robot's observed state.
 
-```text
-rule speed_limit {
-    input from "robonix/system/soma/get_health"
-        select number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value
-            maxage 0.1;
-    require velocity <= 10;
-    enforce [deny, report "Slow down the robot"];
-}
+Set `system.executor.sentinel_rules` to the SRDL file. Executor loads it at
+startup. To use `Summarize`, configure its endpoint, model, and dedicated API
+key under `system.executor.sentinel_strategies`. See the
+[Executor configuration example](../executor/README.md#keystone-and-sentinel).
 
-trigger speed_limit before "robonix/primitive/chassis/move";
-```
+## Writing a rule
 
-Triggers run `before` dispatch, `after` successful completion, or `while` a call is
-executing. `deny` is valid before dispatch; `stop` is valid during execution and
-cancels the containing plan. After checks report failures without changing the
-completed call's result. Input and evaluation errors stop plans during while checks.
-
-`exclude "A" "B";` prevents B from starting while A is admitted. Add `mutual` to
-exclude both directions. See [test.srdl](test.srdl) for another policy example.
-
-## Inputs and strategies
-
-`select` extracts structured fields. `yield ... using ...` runs a JSON-processing
-pipeline to produce declared inputs:
+Use `select` to read a field directly from capability JSON. Use `yield` with
+`Summarize` when the rule needs to interpret an observation. For a call with a
+`target_id` argument, these clauses require the target container to be covered.
 
 ```text
 context string target_id = arguments.target_id;
 input from "robonix/system/scene/get_scene_graph"
-    yield string contents = "Contents: liquid, nonliquid, or unknown."
-        using Summarize("Interpret object {target_id}.");
+    yield option<enum string { "covered", "uncovered" }> closure = "Cover state"
+        using Summarize("Describe the opening of container {target_id}.");
+require closure? = "covered" | false;
+enforce deny;
 ```
 
-Strategies must be registered by the embedding runtime. Construct
-`Summarize::new(api_base, model, api_key)`, register it as `"Summarize"` in
-`Strategies`, and pass the registry to `SrdlInterpreter::load_with_strategies`.
-The API base includes its version prefix, such as `/v1`. Each strategy receives
-JSON, rendered string arguments, and the requested yield fields, then returns JSON.
-The final output is checked against the declared names and types.
+The enum lists the allowed answers. Sentinel asks the model to return `null`
+when the evidence is insufficient. If it does, `| false` makes the requirement fail.
+Use `match closure { some(state) => state = "covered", none => false }` to write
+both cases explicitly. See the [wheel-speed policy](test.srdl) for a complete
+rule with a trigger and structured inputs.
 
-`select`, `yield`, `using`, and `enforce` accept one item or a nonempty bracketed
-list. Multiple items require brackets. Bindings share the rule's scope and must
-have unique names. Strategy arguments interpolate imported context as `{name}`;
-use `{{` and `}}` for literal braces.
+Use HTTPS for a remote model endpoint unless the network is trusted. With MCP
+stdio, Executor runs the command registered by the provider under its own
+account, so only trusted providers should register stdio endpoints.
 
-`from "cap"` returns capability JSON directly. `from ["cap"]` wraps it under `"0"`;
-multiple sources use `"0"`, `"1"`, etc., accessed as `0.field`. Each pipeline starts
-from the acquired JSON. Checks acquire fresh inputs; `maxage` measures elapsed
-time from response receipt, including processing time. Tracking across checks is
-not implemented.
+## Tests
 
-## Embedding and tests
-
-Construct `SrdlInterpreter` inside Tokio. Call `on_arrival` before dispatch,
-`on_execution` to monitor execution, and `on_complete` for every outcome to release
-admission and run applicable after checks. On cancellation, drain monitoring for
-cleanup. The embedding runtime implements `HookRuntime` for corrective capability
-calls and plan cancellation. See [the interpreter API](src/interpreter/mod.rs).
-
-Run from the repository root:
-
-```sh
-cargo test -p robonix-sentinel
-```
+Run `cargo test -p robonix-sentinel` from the repository root. To try a model
+case, set `SENTINEL_SUMMARIZE_API_KEY` and `SENTINEL_SUMMARIZE_MODEL`, then run
+`cargo run -p robonix-sentinel --example test -- container_explicit`.
+Set `SENTINEL_SUMMARIZE_BASE_URL` for a compatible endpoint. The
+[fixture notes](examples/fixtures/README.md) describe the recorded cases.

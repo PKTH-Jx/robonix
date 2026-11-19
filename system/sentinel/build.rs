@@ -46,6 +46,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut config = tonic_prost_build::Config::new();
     config.protoc_executable(protoc);
+    // JSON has no non-finite numbers. Serde's default would turn them into
+    // null, which an optional SRDL field interprets as a missing observation.
+    let responses = services
+        .iter()
+        .filter_map(|(pkg, name)| resolver.srv_spec(pkg, name))
+        .map(|service| &service.response);
+    for message in resolver.ordered_specs().into_iter().chain(responses) {
+        for field in &message.fields {
+            if matches!(&field.type_ref, msg_parser::MsgTypeRef::Primitive(name)
+                if matches!(name.as_str(), "float32" | "float64"))
+            {
+                let function = if field.is_array {
+                    "finite_slice"
+                } else {
+                    "finite_number"
+                };
+                config.field_attribute(
+                    format!(
+                        ".{}.{}.{}",
+                        proto_gen::proto_package_name(&message.package),
+                        message.name,
+                        field.name
+                    ),
+                    format!(r#"#[serde(serialize_with = "super::super::{function}")]"#),
+                );
+            }
+        }
+    }
     tonic_prost_build::configure()
         .type_attribute(".", "#[derive(serde::Serialize)]")
         .compile_with_config(config, &files, &[out])?;

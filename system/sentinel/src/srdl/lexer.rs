@@ -49,6 +49,21 @@ pub enum TokenKind {
     #[token("enforce")]
     Enforce,
 
+    #[token("enum")]
+    Enum,
+    #[token("option")]
+    Option,
+    #[token("match")]
+    Match,
+    #[token("some")]
+    Some,
+    #[token("none")]
+    None,
+    #[token("?")]
+    Question,
+    #[token("=>")]
+    Arrow,
+
     // Input syntax
     #[token("from")]
     From,
@@ -104,6 +119,8 @@ pub enum TokenKind {
     And,
     #[token("||")]
     Or,
+    #[token("|")]
+    Fallback,
     #[token("+")]
     Plus,
     #[token("-")]

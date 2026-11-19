@@ -1,0 +1,347 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "body_id": "mujoco_ranger_piper_01",
+    "seq": 1051,
+    "source_ts_ns": 1795001761860004864,
+    "soma_ts_ns": 1795001761860004864,
+    "ttl_ms": 2000,
+    "components": [
+      {
+        "id": "body",
+        "parent_id": "",
+        "kind": 1,
+        "name": "mujoco_ranger_piper_01",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 4,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl",
+        "parent_id": "body",
+        "kind": 2,
+        "name": "piper_ctl",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 4,
+        "present": true,
+        "online": true,
+        "detail": "age_sec=0.521"
+      },
+      {
+        "id": "body/arm/piper_ctl/joint1",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint1",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/joint2",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint2",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/joint3",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint3",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/joint4",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint4",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/joint5",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint5",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/joint6",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 4,
+        "name": "joint6",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": ""
+      },
+      {
+        "id": "body/arm/piper_ctl/gripper",
+        "parent_id": "body/arm/piper_ctl",
+        "kind": 6,
+        "name": "gripper",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 4,
+        "present": true,
+        "online": true,
+        "detail": "holding_or_partially_closed"
+      },
+      {
+        "id": "body/chassis/ranger_chassis",
+        "parent_id": "body",
+        "kind": 5,
+        "name": "ranger_chassis",
+        "frame_id": "",
+        "model": "",
+        "serial": "",
+        "health": 0,
+        "operational_state": 3,
+        "present": true,
+        "online": true,
+        "detail": "age_sec=0.524"
+      }
+    ],
+    "actuators": [
+      {
+        "component_id": "body/arm/piper_ctl/joint1",
+        "joint_name": "joint1",
+        "position": {
+          "value": -3.560056997992469e-07,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/joint2",
+        "joint_name": "joint2",
+        "position": {
+          "value": 0.8199999220076577,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/joint3",
+        "joint_name": "joint3",
+        "position": {
+          "value": -2.1999999946047692,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/joint4",
+        "joint_name": "joint4",
+        "position": {
+          "value": 1.1319666313221992e-06,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/joint5",
+        "joint_name": "joint5",
+        "position": {
+          "value": 1.1000001126823011,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/joint6",
+        "joint_name": "joint6",
+        "position": {
+          "value": 4.252474121033818e-09,
+          "unit": "rad",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      },
+      {
+        "component_id": "body/arm/piper_ctl/gripper",
+        "joint_name": "gripper",
+        "position": {
+          "value": 6.124471621021246e-08,
+          "unit": "m",
+          "quality": 0
+        },
+        "velocity": null,
+        "effort": null,
+        "current": null,
+        "voltage": null,
+        "motor_temp": null,
+        "driver_temp": null,
+        "torque_enabled": true,
+        "brake_engaged": false,
+        "communication_ok": true,
+        "vendor_mode": 0,
+        "vendor_error_code": 0,
+        "status_flags": 0
+      }
+    ],
+    "power_sources": [],
+    "safety": null,
+    "safety_endpoints": [],
+    "faults": [],
+    "metrics": [
+      {
+        "component_id": "body/arm/piper_ctl/gripper",
+        "name": "likely_holding",
+        "value": {
+          "value": 1.0,
+          "unit": "bool",
+          "quality": 0
+        },
+        "source_key": "soma_runtime_state"
+      },
+      {
+        "component_id": "body/chassis/ranger_chassis",
+        "name": "linear_speed",
+        "value": {
+          "value": 9.606333582196003e-05,
+          "unit": "m/s",
+          "quality": 0
+        },
+        "source_key": "soma_runtime_state"
+      },
+      {
+        "component_id": "body/chassis/ranger_chassis",
+        "name": "angular_speed",
+        "value": {
+          "value": 0.00032940967958786983,
+          "unit": "rad/s",
+          "quality": 0
+        },
+        "source_key": "soma_runtime_state"
+      },
+      {
+        "component_id": "body/chassis/ranger_chassis",
+        "name": "moving",
+        "value": {
+          "value": 0.0,
+          "unit": "bool",
+          "quality": 0
+        },
+        "source_key": "soma_runtime_state"
+      }
+    ]
+  }
+}

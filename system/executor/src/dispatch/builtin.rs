@@ -404,6 +404,7 @@ async fn run_command(args: &str, runtime: &PlanRuntime, plan_id: &str) -> anyhow
     use std::process::Stdio;
     let mut command = tokio::process::Command::new("bash");
     command
+        .env_remove("SENTINEL_SUMMARIZE_API_KEY")
         .arg("-c")
         .arg(&a.command)
         .stdin(Stdio::null())

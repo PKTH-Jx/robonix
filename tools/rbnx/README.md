@@ -25,6 +25,9 @@ cargo install --force --path tools/rbnx --bin rbnx
 
 ## Subcommands
 
+`rbnx boot` passes a configured Summarize API key to Executor in
+`SENTINEL_SUMMARIZE_API_KEY`. Pilot uses its own VLM credential.
+
 | Command | What it does |
 | --- | --- |
 | `rbnx build [-f MANIFEST \| -p PKG \| -g NAME]` | Build a deploy or a single package (incl. ROS workspaces) |

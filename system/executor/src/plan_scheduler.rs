@@ -355,6 +355,7 @@ impl PlanScheduler {
                         }
                         Some(Ok(Completion::Verified(index, failed))) => { self.execution[index].final_failed = Some(failed || self.execution[index].immediate == Some(true)); }
                         Some(Err(error)) => {
+                            self.sentinel.release_failed_task(&self.input.plan().plan_id, error.id());
                             self.error = Some(Status::internal(format!("execution task failed: {error}")));
                             self.cancel().await;
                             // A panicking task has no index; mark unresolved leaves after draining survivors.

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use robonix_sentinel::interpreter::adapter::strategy::StrategyConfig;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::Write;
@@ -31,6 +32,8 @@ pub struct ExecutorConfig {
     pub sentinel_rules: PathBuf,
     /// Optional versioned policy copied into place only when no active file exists.
     pub sentinel_rules_seed: Option<PathBuf>,
+    /// Enabled Sentinel strategies and their initialization settings.
+    pub sentinel_strategies: StrategyConfig,
     /// Whether plan execution and control require a live Keystone session.
     pub require_keystone: bool,
     /// Timing and routing rules for verifying successful capability results.
@@ -68,7 +71,7 @@ fn empty_json_object() -> serde_json::Value {
 }
 
 /// CLI and environment inputs used to configure Executor startup and logging.
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "robonix-executor",
     about = "Robonix Executor — tool-call dispatch runtime"
@@ -98,6 +101,10 @@ pub struct Args {
     /// Optional versioned seed copied to `sentinel_rules` only on first boot.
     #[arg(long, env = "ROBONIX_SENTINEL_RULES_SEED")]
     pub sentinel_rules_seed: Option<PathBuf>,
+
+    /// API key for an enabled Sentinel Summarize strategy.
+    #[arg(long, env = "SENTINEL_SUMMARIZE_API_KEY", hide_env_values = true)]
+    pub summarize_api_key: Option<String>,
 
     /// Require a live Keystone session for plan execution and plan-control requests.
     #[arg(long, env = "ROBONIX_EXECUTOR_REQUIRE_KEYSTONE")]
@@ -142,6 +149,9 @@ struct FileConfig {
     /// Optional first-boot Sentinel policy seed supplied by the YAML file.
     #[serde(default)]
     sentinel_rules_seed: Option<PathBuf>,
+    /// Strategy settings used when the manifest does not specify them.
+    #[serde(default)]
+    sentinel_strategies: Option<StrategyConfig>,
     /// Whether Executor requires Keystone sessions when no manifest value exists.
     #[serde(default)]
     require_keystone: Option<bool>,
@@ -162,6 +172,9 @@ struct ManifestConfig {
     /// Optional first-boot Sentinel policy seed from the Executor manifest block.
     #[serde(default)]
     sentinel_rules_seed: Option<PathBuf>,
+    /// Enabled strategies supplied by the Executor manifest block.
+    #[serde(default)]
+    sentinel_strategies: Option<StrategyConfig>,
     /// Whether plan execution and control require Keystone in this deployment.
     #[serde(default)]
     require_keystone: Option<bool>,
@@ -171,8 +184,8 @@ struct ManifestConfig {
 }
 
 impl ExecutorConfig {
-    /// Resolve connection settings from the existing CLI/env/YAML sources and
-    /// verification rules from the manifest block, falling back to YAML.
+    /// Resolve startup settings, preferring manifest strategy and verification
+    /// configuration over YAML settings.
     pub fn resolve(args: Args) -> Result<Self> {
         let file_cfg: FileConfig = match &args.config {
             Some(path) => load_yaml(path)?,
@@ -223,6 +236,15 @@ impl ExecutorConfig {
             .or(manifest_cfg.require_keystone)
             .or(file_cfg.require_keystone)
             .unwrap_or(false);
+        let mut sentinel_strategies = manifest_cfg
+            .sentinel_strategies
+            .or(file_cfg.sentinel_strategies)
+            .unwrap_or_default();
+        if let (Some(config), Some(key)) =
+            (&mut sentinel_strategies.summarize, args.summarize_api_key)
+        {
+            config.api_key = key;
+        }
         Ok(Self {
             atlas_endpoint: args
                 .atlas
@@ -237,6 +259,7 @@ impl ExecutorConfig {
                 .unwrap_or_else(|| DEFAULT_EXECUTOR_PROVIDER_ID.to_string()),
             sentinel_rules,
             sentinel_rules_seed,
+            sentinel_strategies,
             require_keystone,
             verification,
         })
@@ -265,33 +288,22 @@ pub(crate) fn bootstrap_sentinel_rules(path: &Path, seed: Option<&Path>) -> Resu
     let raw = std::fs::read_to_string(seed)
         .with_context(|| format!("read Sentinel rules seed '{}'", seed.display()))?;
 
-    if let Some(parent) = path
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create Sentinel rules directory '{}'", parent.display()))?;
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create Sentinel rules directory '{}'", parent.display()))?;
+    // A partial seed can itself be valid SRDL, including the empty policy.
+    let mut target = tempfile::NamedTempFile::new_in(parent)?;
+    target.write_all(raw.as_bytes())?;
+    target.as_file().sync_all()?;
+    match target.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error)
+            .with_context(|| format!("bootstrap Sentinel rules '{}'", path.display())),
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut target) => {
-            if let Err(error) = target.write_all(raw.as_bytes()) {
-                drop(target);
-                let _ = std::fs::remove_file(path);
-                return Err(error)
-                    .with_context(|| format!("bootstrap Sentinel rules '{}'", path.display()));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("bootstrap Sentinel rules '{}'", path.display()));
-        }
-    }
-    Ok(())
 }
 
 /// Normalize identifiers and reject ambiguous rules before Executor starts.
@@ -372,6 +384,7 @@ mod tests {
             id: None,
             sentinel_rules: None,
             sentinel_rules_seed: None,
+            summarize_api_key: None,
             require_keystone: None,
             config: None,
             log: None,
@@ -410,6 +423,71 @@ mod tests {
         assert_eq!(
             cfg.sentinel_rules,
             PathBuf::from("/var/lib/robonix/sentinel-rules.srdl")
+        );
+    }
+
+    #[test]
+    fn sentinel_strategies_use_manifest_over_yaml_without_logging_credentials() {
+        assert!(
+            ExecutorConfig::resolve(args(None))
+                .unwrap()
+                .sentinel_strategies
+                .summarize
+                .is_none()
+        );
+        let path =
+            std::env::temp_dir().join(format!("executor-config-{}.yaml", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"
+sentinel_strategies:
+  Summarize:
+    api_base: https://example.invalid/v1
+    model: file-model
+    api_key: test-private-key
+"#,
+        )
+        .unwrap();
+        for (manifest, model) in [
+            (None, Some("file-model")),
+            (Some(r#"{"sentinel_strategies":{}}"#), None),
+            (
+                Some(
+                    r#"{"sentinel_strategies":{"Summarize":{"api_base":"https://example.invalid/v1","model":"manifest-model","api_key":"test-private-key"}}}"#,
+                ),
+                Some("manifest-model"),
+            ),
+        ] {
+            let mut inputs = args(manifest);
+            inputs.config = Some(path.clone());
+            let config = ExecutorConfig::resolve(inputs).unwrap();
+            assert_eq!(
+                config
+                    .sentinel_strategies
+                    .summarize
+                    .as_ref()
+                    .map(|config| config.model.as_str()),
+                model
+            );
+            assert!(!format!("{config:?}").contains("test-private-key"));
+        }
+        std::fs::remove_file(path).unwrap();
+        let mut inputs = args(Some(
+            r#"{"sentinel_strategies":{"Summarize":{"api_base":"https://example.invalid","model":"model"}}}"#,
+        ));
+        inputs.summarize_api_key = Some("strategy-only".into());
+        assert_eq!(
+            ExecutorConfig::resolve(inputs)
+                .unwrap()
+                .sentinel_strategies
+                .summarize
+                .unwrap()
+                .api_key,
+            "strategy-only"
+        );
+        assert!(
+            ExecutorConfig::resolve(args(Some(r#"{"sentinel_strategies":{"Unknown":{}}}"#)))
+                .is_err()
         );
     }
 

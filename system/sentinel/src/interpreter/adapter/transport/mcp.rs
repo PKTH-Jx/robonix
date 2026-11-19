@@ -59,7 +59,7 @@ pub(super) async fn acquire(
             // Cancellation may have closed the receiver, so returning this error is insufficient.
             robonix_scribe::warn!("MCP session cleanup failed: {failure:?}");
             if let Some(Err(error)) = &result {
-                robonix_scribe::warn!("{error:#}");
+                robonix_scribe::warn!("MCP input failed before cleanup: {error}");
             }
             Some(Err(anyhow::anyhow!(
                 "MCP session cleanup failed: {failure:?}"
@@ -75,7 +75,10 @@ async fn connect(endpoint: &str) -> Result<McpClient> {
         let mut parts = command.split_whitespace();
         let program = parts.next().context("empty MCP stdio command")?;
         let mut command = tokio::process::Command::new(program);
-        command.args(parts).kill_on_drop(true);
+        command
+            .env_remove("SENTINEL_SUMMARIZE_API_KEY")
+            .args(parts)
+            .kill_on_drop(true);
         return tokio::time::timeout(
             CONTROL_TIMEOUT,
             ().serve(rmcp::transport::TokioChildProcess::new(command)?),
@@ -110,7 +113,7 @@ async fn connect(endpoint: &str) -> Result<McpClient> {
 /// Reject tool failures and ambiguous content instead of silently discarding response blocks.
 fn decode(response: CallToolResult) -> Result<Value> {
     if response.is_error == Some(true) {
-        bail!("MCP tool reported failure: {:?}", response.content);
+        bail!("MCP tool reported failure");
     }
     if let Some(value) = response.structured_content {
         return Ok(value);
@@ -331,8 +334,12 @@ mod tests {
         ] {
             assert_eq!(decode(response).unwrap(), value);
         }
+        let failure = CallToolResult::error(vec![Content::text("private provider details")]);
+        assert_eq!(
+            decode(failure).unwrap_err().to_string(),
+            "MCP tool reported failure"
+        );
         for response in [
-            CallToolResult::error(vec![Content::text("unavailable")]),
             CallToolResult::success(vec![Content::text("not JSON")]),
             CallToolResult::success(vec![]),
             CallToolResult::success(vec![Content::text("1"), Content::text("2")]),

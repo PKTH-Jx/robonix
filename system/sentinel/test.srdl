@@ -1,19 +1,23 @@
 trigger speed_not_exceed_10 before "robonix/primitive/chassis/move";
 
 rule speed_not_exceed_10 {
-    input from "robonix/system/soma/get_health" select
-        number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value
-        maxage 0.1;
+    input from "robonix/system/soma/get_health" select [
+        number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value maxage 0.1,
+        number quality = snapshot.actuators[component_id = "left_wheel"].velocity.quality maxage 0.1
+    ];
     require velocity <= 10;
+    require velocity >= -10 && quality = 0;
     enforce [deny, report "Slow down the robot"];
 }
 
 rule speed_not_exceed_20 {
     enforce deny;
     require velocity <= 20;
-    input from "robonix/system/soma/get_health" select
-        number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value
-        maxage 0.1;
+    require velocity >= -20 && quality = 0;
+    input from "robonix/system/soma/get_health" select [
+        number velocity = snapshot.actuators[component_id = "left_wheel"].velocity.value maxage 0.1,
+        number quality = snapshot.actuators[component_id = "left_wheel"].velocity.quality maxage 0.1
+    ];
 }
 
 trigger speed_not_exceed_20 before always;

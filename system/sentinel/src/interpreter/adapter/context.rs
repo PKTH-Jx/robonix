@@ -15,13 +15,15 @@ use crate::{
     srdl::ast::{ContextClause, InputType, Rule},
 };
 
-/// A field traversal or basic type failure in the supplied call context.
+/// A field traversal, type, or enum membership failure in the call context.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("field '{0}' requires an object")]
     ExpectedObject(String),
     #[error("missing field '{0}'")]
     MissingField(String),
+    #[error("context value is not an allowed enum member")]
+    InvalidEnum,
     #[error("expected {expected:?}, found {actual}")]
     TypeMismatch {
         /// The type declared by the context binding.
@@ -31,7 +33,7 @@ pub enum Error {
     },
 }
 
-/// Bind the context snapshot to the rule's context bindings, returning a map of binding names to typed values.
+/// Resolve the context bindings needed by this check.
 pub(super) fn bind(
     rule: &Rule,
     context: &Value,
@@ -51,17 +53,29 @@ pub(super) fn bind(
         .collect()
 }
 
-/// Resolve a context binding to a typed value from the call context, following the binding's path.
 fn resolve(binding: &ContextClause, mut value: &Value) -> Result<InputValue, Error> {
+    let optional = matches!(binding.data_type, InputType::Option(_));
     for field in &binding.path {
-        value = value
+        if optional && value.is_null() {
+            break;
+        }
+        let object = value
             .as_object()
-            .ok_or_else(|| Error::ExpectedObject(field.0.clone()))?
-            .get(&field.0)
-            .ok_or_else(|| Error::MissingField(field.0.clone()))?;
+            .ok_or_else(|| Error::ExpectedObject(field.0.clone()))?;
+        value = match object.get(&field.0) {
+            Some(value) => value,
+            None if optional => &Value::Null,
+            None => return Err(Error::MissingField(field.0.clone())),
+        };
     }
-    InputValue::from_json(value, binding.data_type).map_err(|actual| Error::TypeMismatch {
-        expected: binding.data_type,
-        actual,
-    })
+    let value = InputValue::from_json(value, binding.data_type.clone()).map_err(|actual| {
+        Error::TypeMismatch {
+            expected: binding.data_type.clone(),
+            actual,
+        }
+    })?;
+    if !value.matches_enum(&binding.allowed_values) {
+        return Err(Error::InvalidEnum);
+    }
+    Ok(value)
 }

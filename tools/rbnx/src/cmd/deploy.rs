@@ -491,6 +491,24 @@ sentinel_rules_seed: sentinel-rules.v1.srdl
     }
 
     #[test]
+    fn executor_manifest_key_stays_out_of_process_arguments() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            "sentinel_strategies: {Summarize: {api_key: strategy-only, model: test}}",
+        )
+        .unwrap();
+        assert_eq!(
+            take_summarize_key(Some(&mut config)).unwrap().as_deref(),
+            Some("strategy-only")
+        );
+        let args = system_cli_args("executor", Some(&config), None);
+        assert!(args.iter().all(|arg| !arg.contains("strategy-only")));
+        assert_eq!(
+            config["sentinel_strategies"]["Summarize"]["model"].as_str(),
+            Some("test")
+        );
+    }
+
+    #[test]
     fn executor_preflight_includes_explicit_sentinel_listen() {
         let cfg: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -1157,22 +1175,30 @@ fn log_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(format!("{name}.log"))
 }
 
+const SUMMARIZE_KEY_ENV: &str = "SENTINEL_SUMMARIZE_API_KEY";
+
 async fn spawn_system_binary(
     log_dir: &Path,
     session_dir: &Path,
     name: &str,
     bin: &str,
     args: &[String],
+    summarize_key: Option<&str>,
 ) -> Result<Spawned> {
     // Run the installed binary directly.  Stdout / stderr are piped
     // through Scribe (tag = binary name, e.g. "executor") so nothing
     // escapes to the terminal.  Structured logs from within the binary
     // also go through Scribe via the `log` facade auto-init.
     let mut cmd = Command::new(bin);
-    for a in args {
-        cmd.arg(a);
+    if name == "executor" {
+        if let Some(key) = summarize_key {
+            cmd.env(SUMMARIZE_KEY_ENV, key);
+        }
+    } else {
+        cmd.env_remove(SUMMARIZE_KEY_ENV);
     }
-    cmd.stdin(Stdio::null())
+    cmd.args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("SCRIBE_LOG_DIR", log_dir)
@@ -1275,6 +1301,7 @@ async fn spawn_soma_binary(
     // but pre_exec lives on the std side. We prime the std Command
     // via .as_std_mut() below.
     let mut cmd = Command::new(bin);
+    cmd.env_remove(SUMMARIZE_KEY_ENV);
     for a in args {
         cmd.arg(a);
     }
@@ -1488,7 +1515,8 @@ async fn spawn_package(
     // in-container driver further overrides this via ROBONIX_SIM_ATLAS.
     let provider_atlas = env.atlas_endpoint.replacen("0.0.0.0", "127.0.0.1", 1);
     let mut cmd = Command::new(&rbnx_bin);
-    cmd.arg("start")
+    cmd.env_remove(SUMMARIZE_KEY_ENV)
+        .arg("start")
         .arg("-p")
         .arg(pkg_path.as_os_str())
         .arg("--endpoint")
@@ -1614,6 +1642,7 @@ pub async fn execute(
     })?;
     let mut deploy: DeployManifest = serde_yaml::from_value(root)
         .with_context(|| format!("failed to decode {}", manifest_path.display()))?;
+    let summarize_key = take_summarize_key(deploy.system.get_mut("executor"))?;
     // Banner + boot header FIRST, so the logo/version and what we're booting
     // lead the output — before the (possibly slow) remote freshness check.
     output::boot_banner();
@@ -1912,7 +1941,15 @@ pub async fn execute(
                     soma_stage_writer = Some(writer);
                     sp
                 } else {
-                    spawn_system_binary(&log_dir, &session_dir, name, bin, &args).await?
+                    spawn_system_binary(
+                        &log_dir,
+                        &session_dir,
+                        name,
+                        bin,
+                        &args,
+                        summarize_key.as_deref(),
+                    )
+                    .await?
                 };
                 children.push(sp);
                 persist_state(
@@ -2594,6 +2631,20 @@ fn port_is_free(listen: &str) -> std::result::Result<(), anyhow::Error> {
         }
     }
     Ok(())
+}
+
+// Remove the credential before the manifest block becomes a process argument.
+fn take_summarize_key(executor: Option<&mut serde_yaml::Value>) -> Result<Option<String>> {
+    let key = executor
+        .and_then(|config| config.get_mut("sentinel_strategies"))
+        .and_then(|strategies| strategies.get_mut("Summarize"))
+        .and_then(|config| config.as_mapping_mut())
+        .and_then(|config| config.remove("api_key"));
+    match key {
+        Some(serde_yaml::Value::String(key)) => Ok(Some(key)),
+        None => Ok(None),
+        _ => anyhow::bail!("Summarize api_key must be a string"),
+    }
 }
 
 /// Translate supported `system:` manifest fields into CLI args for built-in binaries.

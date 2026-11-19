@@ -44,6 +44,8 @@ pub(super) fn log(level: Level, message: String) {
 // Bound strings may contain file contents, credentials, or personal paths.
 pub(super) fn value(value: &InputValue) -> &dyn std::fmt::Debug {
     match value {
+        InputValue::Some(inner) => self::value(inner),
+        InputValue::None(_) => &"none",
         InputValue::String(_) => &"<redacted>",
         value => value,
     }
@@ -68,6 +70,10 @@ mod tests {
     fn hides_string_contents_and_preserves_motion_measurements() {
         let secret = InputValue::String("test-credential-value".into());
         assert_eq!(format!("{:?}", value(&secret)), "\"<redacted>\"");
+        assert_eq!(
+            format!("{:?}", value(&InputValue::Some(Box::new(secret)))),
+            "\"<redacted>\""
+        );
         assert_eq!(
             format!("{:?}", value(&InputValue::Number(0.02))),
             "Number(0.02)"

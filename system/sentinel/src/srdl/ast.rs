@@ -114,8 +114,10 @@ pub struct StrategyCall {
 /// One named value selected from the acquired source JSON.
 #[derive(Debug)]
 pub struct SelectField {
-    /// The expected basic type of the selected response value.
+    /// Declared scalar or optional type of the selected response value.
     pub data_type: InputType,
+    /// Permitted scalar literals for an enum; empty for unconstrained types.
+    pub allowed_values: Vec<Literal>,
     /// The name referenced by expressions in this rule.
     pub name: Identifier,
     /// Response-relative traversal; an empty path selects the complete response.
@@ -127,8 +129,10 @@ pub struct SelectField {
 /// One named observation produced by a strategy pipeline.
 #[derive(Debug)]
 pub struct YieldField {
-    /// Basic type required from the final pipeline output.
+    /// Declared scalar or optional type required from the final pipeline output.
     pub data_type: InputType,
+    /// Permitted scalar literals for an enum; empty for unconstrained types.
+    pub allowed_values: Vec<Literal>,
     /// Output key and binding name used by rule expressions.
     pub name: Identifier,
     /// Semantic observation requested from the pipeline.
@@ -156,8 +160,15 @@ impl<'a> InputFieldRef<'a> {
 
     pub fn data_type(self) -> InputType {
         match self {
-            Self::Select(field) => field.data_type,
-            Self::Yield(field) => field.data_type,
+            Self::Select(field) => field.data_type.clone(),
+            Self::Yield(field) => field.data_type.clone(),
+        }
+    }
+
+    pub fn allowed_values(self) -> &'a [Literal] {
+        match self {
+            Self::Select(field) => &field.allowed_values,
+            Self::Yield(field) => &field.allowed_values,
         }
     }
 
@@ -172,16 +183,18 @@ impl<'a> InputFieldRef<'a> {
 /// One typed binding to a field in the Executor's current call context.
 #[derive(Debug)]
 pub struct ContextClause {
-    /// The basic type available to requirement expressions.
+    /// Declared type available to requirement expressions.
     pub data_type: InputType,
+    /// Permitted scalar literals for an enum; empty for unconstrained types.
+    pub allowed_values: Vec<Literal>,
     /// The alias sharing the rule's scope with input fields.
     pub name: Identifier,
     /// Nonempty field traversal within the trusted call context, without filters.
     pub path: Vec<Identifier>,
 }
 
-/// The basic value types accepted by input and context declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Scalar and optional types used by declarations and expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputType {
     /// A finite numeric value with no distinction between integers and decimals.
     Number,
@@ -189,6 +202,19 @@ pub enum InputType {
     String,
     /// A true or false value.
     Boolean,
+    /// A present value of the contained type or an unavailable observation.
+    Option(Box<InputType>),
+}
+
+impl std::fmt::Display for InputType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number => f.write_str("number"),
+            Self::String => f.write_str("string"),
+            Self::Boolean => f.write_str("boolean"),
+            Self::Option(inner) => write!(f, "option<{inner}>"),
+        }
+    }
 }
 
 /// One operation for selecting a value from a capability response.
@@ -271,6 +297,19 @@ pub enum EnforceBehavior {
 /// An unevaluated SRDL condition or operand.
 #[derive(Debug, PartialEq)]
 pub enum Expression {
+    /// Unwrap an option, propagating absence to a paired fallback.
+    Try(Box<Expression>),
+    /// Exhaustively evaluate one arm of an optional observation.
+    Match {
+        /// Expression yielding the optional observation.
+        value: Box<Expression>,
+        /// Arm-local alias for the present value.
+        binding: Identifier,
+        /// Expression evaluated when the observation is present.
+        some: Box<Expression>,
+        /// Expression evaluated when the observation is absent.
+        none: Box<Expression>,
+    },
     Literal(Literal),
     Identifier(Identifier),
     Field {
@@ -293,7 +332,8 @@ pub enum Expression {
 }
 
 /// A constant value written in a requirement expression or selection filter.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(untagged)]
 pub enum Literal {
     Boolean(bool),
     /// A finite numeric value; integer and decimal spellings share this representation.
@@ -308,9 +348,11 @@ pub enum UnaryOperator {
     Negate,
 }
 
-/// Binary operations in increasing precedence groups: logical, comparison, arithmetic.
+/// Binary operations in increasing precedence groups: fallback, logical, comparison, arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
+    /// Return the left value, evaluating the right side only on optional absence.
+    Fallback,
     Or,
     And,
     Eq,

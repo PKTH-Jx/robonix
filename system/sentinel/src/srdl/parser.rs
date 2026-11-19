@@ -170,7 +170,7 @@ fn rule(input: Tokens<'_>) -> IResult<'_, Rule> {
 
 // Context paths bind local call metadata; they do not acquire data or accept maxage.
 fn context_clause(input: Tokens<'_>) -> IResult<'_, ContextClause> {
-    let (input, (_, data_type, name, _)) = (
+    let (input, (_, (data_type, allowed_values), name, _)) = (
         match_token(TokenKind::Context),
         input_type,
         identifier,
@@ -183,6 +183,7 @@ fn context_clause(input: Tokens<'_>) -> IResult<'_, ContextClause> {
         input,
         ContextClause {
             data_type,
+            allowed_values,
             name,
             path,
         },
@@ -239,7 +240,7 @@ fn yield_clause(input: Tokens<'_>) -> IResult<'_, YieldClause> {
 }
 
 fn yield_field(input: Tokens<'_>) -> IResult<'_, YieldField> {
-    let (input, (data_type, name, _, description)) = (
+    let (input, ((data_type, allowed_values), name, _, description)) = (
         input_type,
         identifier,
         match_token(TokenKind::Eq),
@@ -251,6 +252,7 @@ fn yield_field(input: Tokens<'_>) -> IResult<'_, YieldField> {
         input,
         YieldField {
             data_type,
+            allowed_values,
             name,
             maxage,
             description,
@@ -269,7 +271,7 @@ fn strategy_call(input: Tokens<'_>) -> IResult<'_, StrategyCall> {
 
 // Omitting '= PATH' selects the root response, including scalar-valued interfaces.
 fn input_field(input: Tokens<'_>) -> IResult<'_, SelectField> {
-    let (input, (data_type, name)) = (input_type, identifier).parse(input)?;
+    let (input, ((data_type, allowed_values), name)) = (input_type, identifier).parse(input)?;
     let (input, select) = if input.tok.first().map(|t| t.kind) == Some(TokenKind::Eq) {
         select_path(input.take_from(1))?
     } else {
@@ -280,6 +282,7 @@ fn input_field(input: Tokens<'_>) -> IResult<'_, SelectField> {
         input,
         SelectField {
             data_type,
+            allowed_values,
             name,
             select,
             maxage,
@@ -299,19 +302,65 @@ fn maxage(input: Tokens<'_>) -> IResult<'_, Option<f64>> {
     Ok((input, Some(value)))
 }
 
-fn input_type(input: Tokens<'_>) -> IResult<'_, InputType> {
+fn input_type(input: Tokens<'_>) -> IResult<'_, (InputType, Vec<Literal>)> {
+    if input
+        .tok
+        .first()
+        .is_some_and(|t| t.kind == TokenKind::Option)
+    {
+        let (input, _) = match_token(TokenKind::Lt)(input.take_from(1))?;
+        if input
+            .tok
+            .first()
+            .is_some_and(|t| t.kind == TokenKind::Option)
+        {
+            return Err(Err::Failure(at(&input, ErrorKind::NestedOption)));
+        }
+        let (input, (inner, allowed)) = input_type(input)?;
+        let (input, _) = match_token(TokenKind::Gt)(input)?;
+        return Ok((input, (InputType::Option(Box::new(inner)), allowed)));
+    }
+    let enumeration = input.tok.first().is_some_and(|t| t.kind == TokenKind::Enum);
+    let input = if enumeration {
+        input.take_from(1)
+    } else {
+        input
+    };
     let data_type = match input.tok.first().map(|token| token.text()) {
         Some("number") => InputType::Number,
         Some("string") => InputType::String,
-        Some("boolean") => InputType::Boolean,
+        Some("boolean") if !enumeration => InputType::Boolean,
         _ => {
             return Err(Err::Error(expected(
                 &input,
-                "'number', 'string', or 'boolean'",
+                "number, string, boolean, option<T>, or enum number/string",
             )));
         }
     };
-    Ok((input.take_from(1), data_type))
+    let input = input.take_from(1);
+    if !enumeration {
+        return Ok((input, (data_type, Vec::new())));
+    }
+    let (input, _) = match_token(TokenKind::LBrace)(input)?;
+    let start = input.clone();
+    let (input, allowed) =
+        separated_list1(match_token(TokenKind::Comma), cut(literal)).parse(input)?;
+    for (index, value) in allowed.iter().enumerate() {
+        if !matches!(
+            (&data_type, value),
+            (InputType::Number, Literal::Number(_)) | (InputType::String, Literal::String(_))
+        ) {
+            return Err(Err::Failure(expected(
+                &start,
+                "enum literals matching the declared base type",
+            )));
+        }
+        if allowed[..index].contains(value) {
+            return Err(Err::Failure(expected(&start, "unique enum members")));
+        }
+    }
+    let (input, _) = match_token(TokenKind::RBrace)(input)?;
+    Ok((input, (data_type, allowed)))
 }
 
 // Start with a field, then append .field and [field = literal] operations in order.
@@ -350,34 +399,26 @@ fn select_field(input: Tokens<'_>) -> IResult<'_, Identifier> {
         return Err(Err::Error(expected(&input, "a select field name")));
     };
     let rest = input.take_from(1);
-    match token.kind {
-        TokenKind::Yield
-        | TokenKind::Using
-        | TokenKind::Identifier
-        | TokenKind::True
-        | TokenKind::False
-        | TokenKind::Rule
-        | TokenKind::Input
-        | TokenKind::Context
-        | TokenKind::Trigger
-        | TokenKind::Exclude
-        | TokenKind::Mutual
-        | TokenKind::Require
-        | TokenKind::Before
-        | TokenKind::After
-        | TokenKind::While
-        | TokenKind::Interval
-        | TokenKind::Enforce
-        | TokenKind::From
-        | TokenKind::Select
-        | TokenKind::Maxage
-        | TokenKind::Always
-        | TokenKind::Allow
-        | TokenKind::Deny
-        | TokenKind::Stop
-        | TokenKind::Call
-        | TokenKind::Report => Ok((rest, Identifier(token.text().to_owned()))),
-        _ => Err(Err::Error(expected(&input, "a select field name"))),
+    if is_identifier(token.kind)
+        || matches!(
+            token.kind,
+            TokenKind::Yield
+                | TokenKind::Using
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Rule
+                | TokenKind::Input
+                | TokenKind::Trigger
+                | TokenKind::Require
+                | TokenKind::Enforce
+                | TokenKind::From
+                | TokenKind::Select
+                | TokenKind::Maxage
+        )
+    {
+        Ok((rest, Identifier(token.text().to_owned())))
+    } else {
+        Err(Err::Error(expected(&input, "a select field name")))
     }
 }
 
@@ -503,7 +544,39 @@ fn condition_expression(input: Tokens<'_>) -> IResult<'_, Expression> {
     if count > 1024 {
         return Err(Err::Failure(at(&input, ErrorKind::ExpressionTooLong(1024))));
     }
-    expression(input, 0, 0)
+    let (rest, value) = expression(input.clone(), 0, 0)?;
+    // Postfix and left-associative operators can grow AST height without parser recursion.
+    let mut pending = vec![(&value, 0)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth >= MAX_EXPRESSION_DEPTH {
+            return Err(Err::Failure(at(
+                &input,
+                ErrorKind::ExpressionTooDeep(MAX_EXPRESSION_DEPTH),
+            )));
+        }
+        let depth = depth + 1;
+        match node {
+            Expression::Try(value)
+            | Expression::Unary { operand: value, .. }
+            | Expression::Field { base: value, .. } => pending.push((value, depth)),
+            Expression::Binary { left, right, .. } => {
+                pending.extend([(left.as_ref(), depth), (right.as_ref(), depth)])
+            }
+            Expression::Call { callee, arguments } => {
+                pending.push((callee, depth));
+                pending.extend(arguments.iter().map(|argument| (argument, depth)));
+            }
+            Expression::Match {
+                value, some, none, ..
+            } => pending.extend([
+                (value.as_ref(), depth),
+                (some.as_ref(), depth),
+                (none.as_ref(), depth),
+            ]),
+            Expression::Literal(_) | Expression::Identifier(_) => {}
+        }
+    }
+    Ok((rest, value))
 }
 
 fn enforce_clause(input: Tokens<'_>) -> IResult<'_, EnforceClause> {
@@ -555,27 +628,37 @@ fn match_token(kind: TokenKind) -> impl FnMut(Tokens<'_>) -> IResult<'_, Tokens<
     }
 }
 
-fn identifier(input: Tokens) -> IResult<Identifier> {
-    let Some(token) = input.tok.first() else {
-        return Err(Err::Error(expected(&input, "an identifier")));
-    };
-    let rest = input.take_from(1);
-    match token.kind {
-        // Contextual keywords remain available as binding and field names.
+// Contextual keywords remain available as binding and field names.
+fn is_identifier(kind: TokenKind) -> bool {
+    matches!(
+        kind,
         TokenKind::Identifier
-        | TokenKind::Exclude
-        | TokenKind::Mutual
-        | TokenKind::Context
-        | TokenKind::Always
-        | TokenKind::Before
-        | TokenKind::After
-        | TokenKind::While
-        | TokenKind::Interval
-        | TokenKind::Allow
-        | TokenKind::Deny
-        | TokenKind::Stop
-        | TokenKind::Call
-        | TokenKind::Report => Ok((rest, Identifier(token.text().to_string()))),
+            | TokenKind::Enum
+            | TokenKind::Option
+            | TokenKind::Some
+            | TokenKind::None
+            | TokenKind::Match
+            | TokenKind::Exclude
+            | TokenKind::Mutual
+            | TokenKind::Context
+            | TokenKind::Always
+            | TokenKind::Before
+            | TokenKind::After
+            | TokenKind::While
+            | TokenKind::Interval
+            | TokenKind::Allow
+            | TokenKind::Deny
+            | TokenKind::Stop
+            | TokenKind::Call
+            | TokenKind::Report
+    )
+}
+
+fn identifier(input: Tokens) -> IResult<Identifier> {
+    match input.tok.first() {
+        Some(token) if is_identifier(token.kind) => {
+            Ok((input.take_from(1), Identifier(token.text().to_owned())))
+        }
         _ => Err(Err::Error(expected(&input, "an identifier"))),
     }
 }
@@ -638,9 +721,13 @@ fn expression(input: Tokens<'_>, min_precedence: u8, depth: usize) -> IResult<'_
             return Err(Err::Error(at(&input, ErrorKind::ChainedComparison)));
         }
         compared |= precedence == 3;
-        // The right operand absorbs tighter operators, so a + b * c becomes a + (b * c).
-        // Excluding equal precedence makes a - b - c associate as (a - b) - c.
-        let (rest, right) = expression(input.take_from(1), precedence + 1, depth + 1)?;
+        // Fallback chains associate right; other operators associate left.
+        let right_precedence = if operator == BinaryOperator::Fallback {
+            precedence
+        } else {
+            precedence + 1
+        };
+        let (rest, right) = expression(input.take_from(1), right_precedence, depth + 1)?;
         left = Expression::Binary {
             operator,
             left: Box::new(left),
@@ -659,6 +746,25 @@ fn operand(input: Tokens<'_>, depth: usize) -> IResult<'_, Expression> {
     };
     let mut rest = input.take_from(1);
     let mut value = match token.kind {
+        // At an operator or delimiter, `match` is the binding itself.
+        TokenKind::Match
+            if rest.tok.first().is_some_and(|next| {
+                is_identifier(next.kind)
+                    || matches!(
+                        next.kind,
+                        TokenKind::LParen
+                            | TokenKind::Not
+                            | TokenKind::True
+                            | TokenKind::False
+                            | TokenKind::NumberLiteral
+                            | TokenKind::StringLiteral
+                    )
+            }) =>
+        {
+            let (input, value) = match_expression(rest, depth)?;
+            rest = input;
+            value
+        }
         TokenKind::Not | TokenKind::Minus => {
             // Level 6 excludes binary operators while allowing nested prefixes and postfixes.
             let (rest, operand) = expression(rest, 6, depth)?;
@@ -700,6 +806,10 @@ fn operand(input: Tokens<'_>, depth: usize) -> IResult<'_, Expression> {
     // this makes -soma.velocity bind as -(soma.velocity).
     loop {
         match rest.tok.first().map(|t| t.kind) {
+            Some(TokenKind::Question) => {
+                value = Expression::Try(Box::new(value));
+                rest = rest.take_from(1);
+            }
             Some(TokenKind::Dot) => {
                 let (input, field) = identifier(rest.take_from(1))?;
                 value = Expression::Field {
@@ -734,9 +844,64 @@ fn operand(input: Tokens<'_>, depth: usize) -> IResult<'_, Expression> {
     Ok((rest, value))
 }
 
-// || < && < comparisons < addition/subtraction < multiplication/division/remainder.
+fn match_expression(input: Tokens<'_>, depth: usize) -> IResult<'_, Expression> {
+    let (input, value) = expression(input, 0, depth)?;
+    let (mut input, _) = match_token(TokenKind::LBrace)(input)?;
+    let mut some = None;
+    let mut none = None;
+    for arm in 0..2 {
+        match input.tok.first().map(|t| t.kind) {
+            Some(TokenKind::Some) if some.is_none() => {
+                let (rest, (_, binding, _, _)) = (
+                    match_token(TokenKind::LParen),
+                    identifier,
+                    match_token(TokenKind::RParen),
+                    match_token(TokenKind::Arrow),
+                )
+                    .parse(input.take_from(1))?;
+                let (rest, body) = expression(rest, 0, depth)?;
+                some = Some((binding, body));
+                input = rest;
+            }
+            Some(TokenKind::None) if none.is_none() => {
+                let (rest, _) = match_token(TokenKind::Arrow)(input.take_from(1))?;
+                let (rest, body) = expression(rest, 0, depth)?;
+                none = Some(body);
+                input = rest;
+            }
+            _ => {
+                return Err(Err::Failure(expected(
+                    &input,
+                    "one some(name) arm and one none arm",
+                )));
+            }
+        }
+        if arm == 0
+            || input
+                .tok
+                .first()
+                .is_some_and(|t| t.kind == TokenKind::Comma)
+        {
+            (input, _) = match_token(TokenKind::Comma)(input)?;
+        }
+    }
+    let (input, _) = match_token(TokenKind::RBrace)(input)?;
+    let (binding, some) = some.unwrap();
+    Ok((
+        input,
+        Expression::Match {
+            value: Box::new(value),
+            binding,
+            some: Box::new(some),
+            none: Box::new(none.unwrap()),
+        },
+    ))
+}
+
+// | < || < && < comparisons < addition/subtraction < multiplication/division/remainder.
 fn binary(kind: TokenKind) -> Option<(BinaryOperator, u8)> {
     Some(match kind {
+        TokenKind::Fallback => (BinaryOperator::Fallback, 0),
         TokenKind::Or => (BinaryOperator::Or, 1),
         TokenKind::And => (BinaryOperator::And, 2),
         TokenKind::Eq => (BinaryOperator::Eq, 3),

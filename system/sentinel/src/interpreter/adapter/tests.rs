@@ -14,7 +14,7 @@ use tokio::{
 use super::*;
 use crate::{
     interpreter::{
-        CheckContext, SrdlInterpreter,
+        CheckContext, LoadError, SrdlInterpreter,
         enforcer::Effect,
         evaluator::{Error, RuleResult, expression},
     },
@@ -58,7 +58,20 @@ impl Drop for AtlasFixture {
 
 impl AtlasFixture {
     fn interpreter(&self, source: &str) -> SrdlInterpreter {
-        SrdlInterpreter::load(source, self.adapter.atlas.clone()).unwrap()
+        SrdlInterpreter::load(
+            source,
+            self.adapter.atlas.clone(),
+            strategy::StrategyConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn interpreter_with_strategies(
+        &self,
+        source: &str,
+        strategies: strategy::Strategies,
+    ) -> Result<SrdlInterpreter, LoadError> {
+        SrdlInterpreter::load_with_strategies(source, self.adapter.atlas.clone(), strategies)
     }
 
     async fn wait_for_cleanup(&self) {
@@ -467,7 +480,11 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
     }
 
     assert!(matches!(
-        SrdlInterpreter::load("invalid", fixture.adapter.atlas.clone()),
+        SrdlInterpreter::load(
+            "invalid",
+            fixture.adapter.atlas.clone(),
+            strategy::StrategyConfig::default()
+        ),
         Err(LoadError::Parse(_))
     ));
     assert!(matches!(
@@ -475,7 +492,8 @@ async fn executes_matching_rules_and_preserves_decisions_and_failures() {
             r#"trigger invalid before "never/matches";
         rule invalid { require unknown; enforce deny;
     }"#,
-            fixture.adapter.atlas.clone()
+            fixture.adapter.atlas.clone(),
+            strategy::StrategyConfig::default(),
         ),
         Err(LoadError::Type(_))
     ));
@@ -957,6 +975,33 @@ async fn cancelled_lifecycle_checks_release_inputs_and_exclusions() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn next_arrival_prunes_an_abandoned_check_before_reusing_its_call_id() {
+    let mut fixture = AtlasFixture::new().await;
+    let entered = fixture.serve_mcp().await;
+    let interpreter = fixture.interpreter(
+        r#"
+        exclude mutual A B;
+        trigger hold before A;
+        rule hold { input from "sensor/slow" select boolean ready; require ready; enforce deny; }
+    "#,
+    );
+    let mut arrival =
+        Box::pin(interpreter.on_arrival(check_context("p", "a", "A", &Value::Null), &()));
+    tokio::select! {
+        result = &mut arrival => panic!("slow arrival finished: {result:?}"),
+        result = timeout(Duration::from_secs(5), entered.notified()) => result.unwrap(),
+    }
+    drop(arrival);
+    let other = check_context("p", "a", "B", &Value::Null);
+    let decision = interpreter.on_arrival(other, &()).await;
+    assert_eq!(decision.effect, Effect::Allow);
+    interpreter
+        .on_complete(other, &(), decision.admission_id, false)
+        .await;
+    fixture.wait_for_cleanup().await;
+}
+
 async fn evaluate_inputs<'a>(
     check_id: u64,
     context: &Value,
@@ -1363,6 +1408,66 @@ impl strategy::Strategy for TestStrategy {
 }
 
 #[tokio::test]
+async fn loading_checks_rules_and_strategy_configuration_before_acquisition() {
+    let fixture = AtlasFixture::new().await;
+    let source = r#"rule r {
+        input from "sensor/scalar" yield number n = "Count" using Summarize("Interpret");
+        require n > 0; enforce deny;
+    } trigger r before "test";"#;
+    let error = SrdlInterpreter::load(
+        source,
+        fixture.adapter.atlas.clone(),
+        strategy::StrategyConfig::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(error, LoadError::Strategy(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("strategy 'Summarize' is not configured")
+    );
+    let invalid = strategy::StrategyConfig {
+        summarize: Some(strategy::SummarizeConfig {
+            api_base: "https://example.invalid/v1".into(),
+            model: String::new(),
+            api_key: "test-private-key".into(),
+        }),
+    };
+    assert!(matches!(
+        SrdlInterpreter::load(
+            "rule r { require missing; enforce deny; }",
+            fixture.adapter.atlas.clone(),
+            invalid.clone()
+        ),
+        Err(LoadError::Type(_))
+    ));
+    let error = SrdlInterpreter::load(source, fixture.adapter.atlas.clone(), invalid)
+        .err()
+        .unwrap();
+    assert!(matches!(error, LoadError::Strategy(_)));
+    assert!(error.to_string().contains("requires a model"));
+    assert!(!error.to_string().contains("test-private-key"));
+    let valid = strategy::StrategyConfig {
+        summarize: Some(strategy::SummarizeConfig {
+            api_base: "https://example.invalid/v1".into(),
+            model: "test-model".into(),
+            api_key: "test-key".into(),
+        }),
+    };
+    for args in ["", r#""a", "b""#] {
+        let invalid_call = source.replace(r#""Interpret""#, args);
+        let error =
+            SrdlInterpreter::load(&invalid_call, fixture.adapter.atlas.clone(), valid.clone())
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("exactly one hint"), "{error}");
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.channels_empty().await);
+}
+
+#[tokio::test]
 async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
     let mut fixture = AtlasFixture::new().await;
     fixture.serve_mcp().await;
@@ -1380,7 +1485,7 @@ async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
         "Second",
         Arc::new(TestStrategy {
             expected: serde_json::json!({"intermediate":7}),
-            output: serde_json::json!({"n":7}),
+            output: serde_json::json!({"n":7,"extra":true}),
             arguments: vec![],
             description: "Count",
         }),
@@ -1394,8 +1499,9 @@ async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
             description: "Ready",
         }),
     );
-    let interpreter = SrdlInterpreter::load_with_strategies(
-        r#"
+    let interpreter = fixture
+        .interpreter_with_strategies(
+            r#"
         rule r {
             context string target = arguments.target;
             input from ["sensor/scalar"] select [number raw = 0],
@@ -1405,10 +1511,9 @@ async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
         }
         trigger r before "test";
     "#,
-        fixture.adapter.atlas.clone(),
-        strategies,
-    )
-    .unwrap();
+            strategies,
+        )
+        .unwrap();
     let result = interpreter
         .on_arrival(
             check_context(
@@ -1424,41 +1529,38 @@ async fn runs_independent_yield_pipelines_with_context_and_validates_outputs() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     fixture.wait_for_cleanup().await;
 
-    for (strategy_name, expected_error) in [
-        ("Missing", "unregistered strategy"),
-        ("Wrong", "TypeMismatch"),
-    ] {
-        let mut strategies = strategy::Strategies::default();
-        strategies.register(
-            "Wrong",
-            Arc::new(TestStrategy {
-                expected: serde_json::json!(42),
-                output: serde_json::json!({"n":"wrong"}),
-                arguments: vec![],
-                description: "Count",
-            }),
-        );
-        let source = format!(
-            r#"rule r {{ input from "sensor/scalar"
-            yield [number n = "Count"] using [{strategy_name}()];
-            require n > 0; enforce deny; }} trigger r before "test";"#
-        );
-        let interpreter = SrdlInterpreter::load_with_strategies(
-            &source,
-            fixture.adapter.atlas.clone(),
-            strategies,
-        )
+    let source = r#"rule r { input from "sensor/scalar"
+        yield number n = "Count" using Wrong();
+        require n > 0; enforce deny; } trigger r before "test";"#;
+    let mut strategies = strategy::Strategies::default();
+    assert!(matches!(
+        fixture.interpreter_with_strategies(source, strategies.clone()),
+        Err(LoadError::Strategy(_))
+    ));
+    strategies.register(
+        "Wrong",
+        Arc::new(TestStrategy {
+            expected: serde_json::json!(42),
+            output: serde_json::json!({"n":"wrong"}),
+            arguments: vec![],
+            description: "Count",
+        }),
+    );
+    let interpreter = fixture
+        .interpreter_with_strategies(source, strategies)
         .unwrap();
-        let result = interpreter
-            .on_arrival(
-                check_context("failure", strategy_name, "test", &Value::Null),
-                &(),
-            )
-            .await;
-        assert_eq!(result.effect, Effect::Deny);
-        assert!(format!("{result:?}").contains(expected_error), "{result:?}");
-        fixture.wait_for_cleanup().await;
-    }
+    let result = interpreter
+        .on_arrival(check_context("failure", "wrong", "test", &Value::Null), &())
+        .await;
+    assert_eq!(result.effect, Effect::Deny);
+    assert!(matches!(
+        &result.reports[0].evaluation,
+        Err(Error::Input(InputError {
+            kind: InputErrorKind::TypeMismatch { .. },
+            ..
+        }))
+    ));
+    fixture.wait_for_cleanup().await;
 }
 
 #[tokio::test]
@@ -1588,9 +1690,12 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
                 assert_eq!(request["stream"], false);
                 let prompt: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
                 assert_eq!(prompt["input"], 42);
-                assert_eq!(prompt["yield_fields"], serde_json::json!([
-                    {"name":"n", "type":"number", "description":"Observed count"}
-                ]));
+                let mut expected = serde_json::json!({"name":"n", "type":"number", "description":"Observed count"});
+                if prompt["yield_fields"][0]["type"] == "option<number>" {
+                    expected["type"] = serde_json::json!("option<number>");
+                    expected["allowed_values"] = serde_json::json!([42.0]);
+                }
+                assert_eq!(prompt["yield_fields"], serde_json::json!([expected]));
                 let hint = prompt["hint"].as_str().unwrap();
                 if hint == "wait" {
                     waiting.notify_one();
@@ -1604,6 +1709,7 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
                             "invalid-json" => "not JSON",
                             "non-object" => "[]",
                             "missing" => "{}",
+                            "extra" => r#"{"n":42,"extra":null}"#,
                             "wrong-type" => r#"{"n":"42"}"#,
                             "unknown" => r#"{"n":null}"#,
                             _ => r#"{"n":42}"#,
@@ -1624,8 +1730,13 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
         axum::serve(listener, router).await.unwrap();
     }));
     let model = Arc::new(strategy::Summarize::new(&base, "test-model", "test-api-key").unwrap());
-    let mut strategies = strategy::Strategies::default();
-    strategies.register("Summarize", model.clone());
+    let config = strategy::StrategyConfig {
+        summarize: Some(strategy::SummarizeConfig {
+            api_base: base,
+            model: "test-model".into(),
+            api_key: "test-api-key".into(),
+        }),
+    };
     let source = r#"
         rule r {
             context string hint = arguments.hint;
@@ -1635,15 +1746,14 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
         }
         trigger r before "test";
     "#;
-    let interpreter =
-        SrdlInterpreter::load_with_strategies(source, fixture.adapter.atlas.clone(), strategies)
-            .unwrap();
+    let interpreter = SrdlInterpreter::load(source, fixture.adapter.atlas.clone(), config).unwrap();
     for hint in [
         "good",
         "http-error",
         "invalid-json",
         "non-object",
         "missing",
+        "extra",
         "wrong-type",
         "unknown",
         "incomplete",
@@ -1681,10 +1791,25 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
     }
     fixture.wait_for_cleanup().await;
 
+    use strategy::Strategy;
+    let optional_program =
+        parse(&source.replace("yield number n", "yield option<enum number { 42 }> n")).unwrap();
+    let optional_fields = &optional_program.rules[0].inputs[0].yields[0].fields;
+    let unknown = vec!["unknown".to_owned()];
+    let output = model
+        .process(serde_json::json!(42), &unknown, optional_fields)
+        .await
+        .unwrap();
+    assert_eq!(
+        FieldValue::from_json(&output, InputFieldRef::Yield(&optional_fields[0]))
+            .unwrap()
+            .value,
+        InputValue::None(InputType::Number)
+    );
+
     let program = parse(source).unwrap();
     let fields = &program.rules[0].inputs[0].yields[0].fields;
     let before = model_calls.load(Ordering::SeqCst);
-    use strategy::Strategy;
     assert!(
         model
             .process(serde_json::json!(42), &[], fields)
@@ -1707,4 +1832,135 @@ async fn summarize_calls_model_and_feeds_validated_yield_inputs() {
             .unwrap(),
         serde_json::json!({"n":42})
     );
+}
+
+#[test]
+fn validates_optional_selections_and_enum_membership() {
+    let number_none = InputValue::None(InputType::Number);
+    for (declaration, response, expected) in [
+        (
+            "option<number> n = missing",
+            serde_json::json!({}),
+            number_none.clone(),
+        ),
+        (
+            "option<number> n = value",
+            serde_json::json!({"value":null}),
+            number_none.clone(),
+        ),
+        (
+            "option<number> n = object.value",
+            serde_json::json!({"object":null}),
+            number_none.clone(),
+        ),
+        (
+            r#"option<number> n = items[id = "target"].value"#,
+            serde_json::json!({"items":[]}),
+            number_none,
+        ),
+        (
+            "enum number { 1, 2 } n = value",
+            serde_json::json!({"value":2}),
+            InputValue::Number(2.0),
+        ),
+        (
+            r#"option<enum string { "A", "B" }> n = value"#,
+            serde_json::json!({"value":"B"}),
+            InputValue::Some(Box::new(InputValue::String("B".into()))),
+        ),
+    ] {
+        let program = parse(&format!(
+            r#"rule r {{ input from "source" select {declaration}; require true; enforce deny; }}"#
+        ))
+        .unwrap();
+        let field = InputFieldRef::Select(&program.rules[0].inputs[0].selects[0]);
+        assert_eq!(
+            FieldValue::from_json(&response, field).unwrap().value,
+            expected
+        );
+    }
+    for (declaration, response) in [
+        ("option<number> n = value", serde_json::json!({"value":"2"})),
+        (
+            "option<number> n = object.value",
+            serde_json::json!({"object":3}),
+        ),
+        (
+            r#"option<number> n = items[id = "target"].value"#,
+            serde_json::json!({"items":[{"id":"target","value":1},{"id":"target","value":2}]}),
+        ),
+        (
+            "enum number { 1, 2 } n = value",
+            serde_json::json!({"value":3}),
+        ),
+        (
+            r#"option<enum string { "A", "B" }> n = value"#,
+            serde_json::json!({"value":"unknown"}),
+        ),
+    ] {
+        let program = parse(&format!(
+            r#"rule r {{ input from "source" select {declaration}; require true; enforce deny; }}"#
+        ))
+        .unwrap();
+        let field = InputFieldRef::Select(&program.rules[0].inputs[0].selects[0]);
+        assert!(
+            FieldValue::from_json(&response, field).is_err(),
+            "{declaration}: {response}"
+        );
+    }
+    let program = parse(r#"rule r { input from "source" yield option<enum number { 1, 2 }> n = "Level" using Test(); require true; enforce deny; }"#).unwrap();
+    let field = InputFieldRef::Yield(&program.rules[0].inputs[0].yields[0].fields[0]);
+    assert_eq!(
+        FieldValue::from_json(&serde_json::json!({"n":null}), field)
+            .unwrap()
+            .value,
+        InputValue::None(InputType::Number)
+    );
+    assert!(FieldValue::from_json(&serde_json::json!({}), field).is_err());
+    assert!(FieldValue::from_json(&serde_json::json!({"n":3}), field).is_err());
+}
+
+#[tokio::test]
+async fn optional_inputs_use_fallback_results_and_match_scopes_values() {
+    let mut fixture = AtlasFixture::new().await;
+    fixture.serve_mcp().await;
+    let interpreter = fixture.interpreter(
+        r#"
+        rule r {
+            context boolean healthy = arguments.healthy;
+            input from "sensor/value" select [
+                option<number> absent = missing,
+                option<enum string { "42" }> label = label,
+                enum number { 42 } number = reading
+            ];
+            require healthy;
+            require absent? > 0 | true;
+            require healthy && match label { some(text) => text = "42", none => false };
+            require match absent { some(number) => 1 / number > 0, none => true };
+            require number = 42;
+            enforce deny;
+        }
+        trigger r before "test";
+    "#,
+    );
+    for healthy in [true, false] {
+        let result = interpreter
+            .on_arrival(
+                check_context(
+                    "optional",
+                    if healthy { "good" } else { "bad" },
+                    "test",
+                    &serde_json::json!({"arguments":{"healthy":healthy}}),
+                ),
+                &(),
+            )
+            .await;
+        assert_eq!(
+            result.effect,
+            if healthy { Effect::Allow } else { Effect::Deny }
+        );
+        let rule = result.reports[0].evaluation.as_ref().unwrap();
+        assert_eq!(rule.requirements, [healthy, true, healthy, true, true]);
+    }
+    fixture.wait_for_cleanup().await;
 }
