@@ -1,0 +1,28 @@
+trigger navigation_frame before "robonix/service/navigation/navigate";
+rule navigation_frame {
+    context string frame = arguments.goal.header.frame_id;
+    require frame = "map";
+    enforce [deny, report "SRDL requires a map-frame goal"];
+}
+
+trigger navigation_boundary while "robonix/service/navigation/navigate" interval 1;
+rule navigation_boundary {
+    context number goal_x = arguments.goal.pose.position.x;
+    context number goal_y = arguments.goal.pose.position.y;
+    input from "robonix/service/map/get_pose" select [
+        boolean pose_ok = result.ok,
+        number x = result.x,
+        number y = result.y
+    ];
+    require pose_ok;
+    require (x - goal_x) * (x - goal_x) + (y - goal_y) * (y - goal_y) > 0.1225;
+    enforce [stop, report "SRDL navigation boundary reached"];
+}
+
+trigger pose_postcondition after ["robonix/service/map/get_pose", "robonix/service/navigation/navigate"];
+rule pose_postcondition {
+    input from "robonix/service/map/get_pose" select
+        option<enum string {"map", "odom"}> frame = result.frame_id;
+    require match frame { some(value) => value = "odom", none => false };
+    enforce report "SRDL after observed a map-frame pose";
+}
