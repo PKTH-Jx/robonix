@@ -1,0 +1,22 @@
+--- a/omnigibson/action_primitives/curobo.py
++++ b/omnigibson/action_primitives/curobo.py
+@@ -302,13 +302,17 @@
+                         pose=th.cat([pos, orn]).tolist(),
+                         vertices=collision_mesh.points.numpy(),
+                         faces=collision_mesh.faces.numpy(),
+-                        scale=collision_mesh.get_world_scale().numpy(),
++                        scale=th.linalg.vector_norm(collision_mesh.scaled_transform[:3, :3], dim=0).numpy(),
+                     )
+                     obstacles["mesh"].append(m)
+ 
+         world = lazy.curobo.geom.types.WorldConfig(**obstacles)
+         world = world.get_collision_check_world()
+-        self.mg[CuRoboEmbodimentSelection.DEFAULT].update_world(world)
++        # The collision checker is shared, including when DEFAULT is unavailable.
++        generators = iter(self.mg.values())
++        next(generators).update_world(world)
++        for generator in generators:
++            generator.graph_planner.reset_buffer()
+ 
+     def check_collisions(
+         self,

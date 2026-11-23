@@ -1,0 +1,24 @@
+trigger verify_before before "robonix/service/body/grasp";
+rule verify_before {
+    context string target = arguments.object;
+    require target != @TARGET@;
+    enforce [deny, report "SRDL before denied grasp"];
+}
+
+trigger verify_while while "robonix/service/body/navigate" interval 1;
+rule verify_while {
+    input from "robonix/system/scene/get_robot_context" select [
+        boolean pose_known = result.pose_known,
+        number x = result.x,
+        number y = result.y
+    ];
+    require pose_known;
+    require x >= @MIN_X@ && x <= @MAX_X@ && y >= @MIN_Y@ && y <= @MAX_Y@;
+    enforce [stop, report "SRDL while stopped navigation"];
+}
+
+trigger verify_after after ["robonix/system/scene/get_robot_context", "robonix/service/body/grasp"];
+rule verify_after {
+    require false;
+    enforce report "SRDL after reported a completed call";
+}

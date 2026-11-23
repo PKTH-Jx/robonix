@@ -1,0 +1,19 @@
+trigger navigation_boundary while "robonix/service/navigation/navigate" interval 1;
+rule navigation_boundary {
+    context number goal_x = arguments.goal.pose.position.x;
+    context number goal_y = arguments.goal.pose.position.y;
+    input from "robonix/service/map/get_pose"
+        yield option<enum string {"outside", "inside"}> boundary = "Position relative to the stop boundary"
+        using Summarize("Goal x={goal_x}, y={goal_y}. Use input.result.x and input.result.y in metres. With a known map pose, return inside when the Euclidean distance to the goal is at most 0.35 m, and outside otherwise. Return null when the pose is unavailable.");
+    require match boundary { some(state) => state = "outside", none => true };
+    enforce [stop, report "SRDL navigation boundary reached"];
+}
+
+trigger summarize_probe before "robonix/service/map/get_mode";
+rule summarize_probe {
+    input from "robonix/service/map/get_pose"
+        yield option<enum string {"map", "odom"}> frame = "Coordinate frame of the observed pose"
+        using Summarize("Read the frame of the observed pose.");
+    require match frame { some(value) => value = "map", none => false };
+    enforce deny;
+}

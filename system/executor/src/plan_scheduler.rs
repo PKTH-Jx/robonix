@@ -455,6 +455,344 @@ mod scheduling_tests {
         SentinelRuntime::new("", atlas.clone()).expect("empty SRDL policy")
     }
 
+    /// Records simulated capability calls and returns the observation selected by the test.
+    #[derive(Clone)]
+    struct CarryProvider {
+        /// Scene state returned by each new observation request.
+        observation: tokio::sync::watch::Receiver<&'static str>,
+        /// Capability names and arguments received by the provider.
+        calls: tokio::sync::mpsc::UnboundedSender<(String, serde_json::Value)>,
+    }
+
+    impl rmcp::ServerHandler for CarryProvider {
+        fn get_info(&self) -> rmcp::model::ServerInfo {
+            rmcp::model::ServerInfo::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+            use serde_json::{Value, json};
+
+            let name = request.name.into_owned();
+            let result = match name.as_str() {
+                "carry" => json!({"run_id": "carry-run"}),
+                "status" => json!({"state": "RUNNING"}),
+                "observe" => json!({"observation": *self.observation.borrow()}),
+                "cancel" | "finish" => json!({"ok": true}),
+                _ => {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        "unexpected capability",
+                        None,
+                    ));
+                }
+            };
+            self.calls
+                .send((name, Value::Object(request.arguments.unwrap_or_default())))
+                .unwrap();
+            Ok(rmcp::model::CallToolResult::structured(result))
+        }
+    }
+
+    /// Start a simulated provider and model on the same loopback listener.
+    async fn start_carry_provider(
+        registry: &AtlasRegistry,
+        provider: CarryProvider,
+        model_calls: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Router,
+            body::Bytes,
+            http::{StatusCode, header},
+            routing::post,
+        };
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpService, session::local::LocalSessionManager,
+        };
+        use robonix_atlas::pb;
+        use serde_json::{Value, json};
+
+        let mcp: StreamableHttpService<CarryProvider, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(provider.clone()),
+                Default::default(),
+                Default::default(),
+            );
+        let router = Router::new().nest_service("/mcp", mcp).route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let model_calls = model_calls.clone();
+                async move {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let input: Value =
+                        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(input["hint"], "Is red-cup still held?");
+                    let observation = input["input"]["observation"].as_str().unwrap();
+                    model_calls.send(observation.to_owned()).unwrap();
+                    let content_type = [(header::CONTENT_TYPE, "application/json")];
+                    let held = match observation {
+                        "held" => json!("held"),
+                        "occluded" => Value::Null,
+                        "dropped" => json!("dropped"),
+                        "model-error" => {
+                            return (StatusCode::BAD_GATEWAY, content_type, "{}".to_owned());
+                        }
+                        _ => panic!("unexpected observation {observation}"),
+                    };
+                    (
+                        StatusCode::OK,
+                        content_type,
+                        json!({
+                            "choices": [{
+                                "finish_reason": "stop",
+                                "message": {"content": json!({"held": held}).to_string()}
+                            }]
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        registry
+            .register("carry-test", pb::Kind::Service, "test", "", "")
+            .await
+            .unwrap();
+        let driver = "robonix.contracts.RobonixLifecycleDriver";
+        registry
+            .declare(
+                "carry-test",
+                "robonix/lifecycle/driver",
+                pb::Transport::Grpc,
+                "127.0.0.1:1",
+                pb::TransportParams {
+                    kind: Some(pb::transport_params::Kind::Grpc(pb::GrpcParams {
+                        proto_file: "robonix_contracts.proto".into(),
+                        service_name: driver.into(),
+                        method: format!("/{driver}/Driver"),
+                    })),
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        for contract in [
+            "test/carry",
+            "test/carry/status",
+            "test/carry/cancel",
+            "test/observe",
+            "test/finish",
+        ] {
+            registry
+                .declare(
+                    "carry-test",
+                    contract,
+                    pb::Transport::Mcp,
+                    &format!("{endpoint}/mcp"),
+                    pb::TransportParams {
+                        kind: Some(pb::transport_params::Kind::Mcp(pb::McpParams {
+                            input_schema_json: "{}".into(),
+                        })),
+                    },
+                    "",
+                )
+                .await
+                .unwrap();
+        }
+        for state in [
+            pb::LifecycleState::StateInactive,
+            pb::LifecycleState::StateActive,
+        ] {
+            registry
+                .set_lifecycle_state("carry-test", state, "")
+                .await
+                .unwrap();
+        }
+        (endpoint, server)
+    }
+
+    /// An allowed unknown observation keeps an async call running until SRDL detects a stop.
+    #[tokio::test]
+    async fn srdl_summarize_stops_a_running_async_call() {
+        use RtdlNodeStateEnum as State;
+        use robonix_sentinel::interpreter::adapter::strategy::{StrategyConfig, SummarizeConfig};
+        use serde_json::{Value, json};
+        use tokio::sync::{mpsc, watch};
+
+        for final_observation in ["dropped", "model-error"] {
+            let registry = Arc::new(AtlasRegistry::default());
+            let atlas_addr = reserve_address();
+            let atlas_server = tokio::spawn(serve_atlas(registry.clone(), atlas_addr));
+            let atlas = AtlasClient::connect_with_retry(
+                format!("http://{atlas_addr}"),
+                50,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+
+            let (observation, observations) = watch::channel("held");
+            let (calls, mut tool_calls) = mpsc::unbounded_channel();
+            let (model_calls, mut queries) = mpsc::unbounded_channel();
+            let (endpoint, provider_server) = start_carry_provider(
+                &registry,
+                CarryProvider {
+                    observation: observations,
+                    calls,
+                },
+                model_calls,
+            )
+            .await;
+            let policy = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(policy.path(), r#"
+                trigger hold_target while "test/carry" interval 2;
+                rule hold_target {
+                    context string target = arguments.target_id;
+                    input from "test/observe"
+                        yield option<enum string { "held", "dropped" }> held = "Whether the cup is held"
+                            using Summarize("Is {target} still held?");
+                    require match held { some(state) => state = "held", none => true };
+                    enforce stop;
+                }
+            "#).unwrap();
+            let sentinel = SentinelRuntime::load(
+                policy.path(),
+                atlas.clone(),
+                StrategyConfig {
+                    summarize: Some(SummarizeConfig {
+                        api_base: format!("{endpoint}/v1"),
+                        model: "test-model".into(),
+                        api_key: "test-only".into(),
+                    }),
+                },
+            )
+            .unwrap();
+            let service = ExecutorServiceImpl::new(
+                atlas,
+                "executor".into(),
+                sentinel,
+                false,
+                Arc::new(VerificationPolicy::new(false, Vec::new())),
+            );
+            let leaf = |name: &str, contract: &str, args: Value| RtdlNode {
+                node_kind: RTDL_DO,
+                op_id: name.into(),
+                description: name.into(),
+                call: Some(CapabilityCall {
+                    call_id: name.into(),
+                    provider_id: "carry-test".into(),
+                    contract_id: contract.into(),
+                    args_json: args.to_string(),
+                }),
+                ..Default::default()
+            };
+            let plan = Plan {
+                plan_id: "srdl-test".into(),
+                nodes: vec![
+                    RtdlNode {
+                        node_kind: RTDL_SEQUENCE,
+                        children: vec![1, 2],
+                        op_id: "sequence".into(),
+                        description: "Carry the cup and then finish".into(),
+                        ..Default::default()
+                    },
+                    leaf("carry", "test/carry", json!({"target_id": "red-cup"})),
+                    leaf("finish", "test/finish", json!({})),
+                ],
+                ..Default::default()
+            };
+
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut stream = service
+                    .execute(Request::new(plan))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(queries.recv().await.as_deref(), Some("held"));
+                while let Some((name, args)) = tool_calls.recv().await {
+                    assert_ne!(name, "cancel", "canceled while the cup was held");
+                    assert_ne!(
+                        name, "finish",
+                        "successor dispatched while carry was running"
+                    );
+                    if name == "status" {
+                        assert_eq!(args, json!({"run_id": "carry-run"}));
+                        break;
+                    }
+                }
+
+                observation.send_replace("occluded");
+                // A second evaluation proves the first null result did not stop monitoring.
+                let mut occluded = 0;
+                while occluded < 2 {
+                    let observed = queries.recv().await.expect("another while check");
+                    occluded += usize::from(observed == "occluded");
+                }
+                observation.send_replace(final_observation);
+
+                let mut target = None;
+                let mut successor_canceled = false;
+                while let Some(event) = stream.next().await {
+                    let Some(node) = event.unwrap().node_state else {
+                        continue;
+                    };
+                    if node.op_id == "carry" && node.leaf_result.is_some() {
+                        assert!(target.replace(node).is_none(), "duplicate terminal result");
+                    } else if node.op_id == "finish" && node.state == State::Canceled as u32 {
+                        successor_canceled = true;
+                    }
+                }
+                assert!(
+                    std::iter::from_fn(|| queries.try_recv().ok())
+                        .any(|observation| observation == final_observation)
+                );
+                let target = target.expect("carry terminal result");
+                assert_eq!(target.state, State::Canceled as u32);
+                assert!(successor_canceled, "the plan must skip the successor");
+                let feedback: Value = serde_json::from_str(&target.operator_detail).unwrap();
+                assert_eq!(feedback["effect"], "stop");
+                let report = &feedback["reports"][0];
+                assert_eq!(report["rule"], "hold_target");
+                assert_eq!(report["timing"], "while");
+                if final_observation == "dropped" {
+                    assert_eq!(report["violations"], json!([1]));
+                    assert!(report["evaluation_error"].is_null());
+                } else {
+                    assert_eq!(report["violations"], json!([]));
+                    assert!(
+                        report["evaluation_error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("HTTP 502")
+                    );
+                }
+
+                let mut cancel_calls = Vec::new();
+                while let Ok((name, args)) = tool_calls.try_recv() {
+                    assert_ne!(name, "finish", "the successor was dispatched");
+                    if name == "cancel" {
+                        cancel_calls.push(args);
+                    }
+                }
+                assert_eq!(cancel_calls, [json!({"run_id": "carry-run"})]);
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no terminal result for {final_observation}"));
+            provider_server.abort();
+            atlas_server.abort();
+        }
+    }
+
     /// Both RPCs preserve sequence advancement and final failures in either verification mode.
     #[tokio::test]
     async fn overlap_preserves_immediate_sequence_result() {

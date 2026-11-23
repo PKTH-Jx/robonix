@@ -30,6 +30,10 @@ robonix-sentinel = { path = "../sentinel" }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }
 
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+
 [build-dependencies]
 robonix-codegen.workspace = true
 tonic-build.workspace = true
