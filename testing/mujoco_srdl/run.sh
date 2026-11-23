@@ -5,10 +5,20 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo="$(cd -- "$here/../.." && pwd)"
 deployment="${MUJOCO_DEPLOYMENT:-$(dirname -- "$repo")/mujoco-ranger-piper}"
+summarize=
+case "${1:-}" in
+    --summarize) summarize=stub; shift ;;
+    --summarize-live) summarize=live; shift ;;
+esac
+if [[ "$summarize" == live ]]; then
+    : "${SENTINEL_SUMMARIZE_BASE_URL:?Set SENTINEL_SUMMARIZE_BASE_URL}"
+    : "${SENTINEL_SUMMARIZE_MODEL:?Set SENTINEL_SUMMARIZE_MODEL}"
+    : "${SENTINEL_SUMMARIZE_API_KEY:?Set SENTINEL_SUMMARIZE_API_KEY}"
+fi
 if (( $# == 0 )); then
     set -- 4.783 1.436 1.0472
 elif (( $# != 3 )); then
-    echo "Usage: $0 [GOAL_X GOAL_Y GOAL_YAW]" >&2
+    echo "Usage: $0 [--summarize|--summarize-live] [GOAL_X GOAL_Y GOAL_YAW]" >&2
     exit 2
 fi
 cd "$deployment"
@@ -19,15 +29,21 @@ if ss -ltn | grep -E ':(50051|50061|50062|50091)[[:space:]]'; then
     exit 1
 fi
 
-mkdir -p "$here/report"
-run="$(mktemp -d "$here/report/run.XXXXXX")"
+report_root="${SRDL_REPORT_ROOT:-$here/report}"
+mkdir -p "$report_root"
+run="$(mktemp -d "$report_root/run.XXXXXX")"
 manifest="$(mktemp --suffix=.yaml "$PWD/.srdl-test.XXXXXX")"
 boot_pid=
+model_pid=
 started_bridge=false
 cleanup() {
     if [[ -n "$boot_pid" ]]; then
         kill -TERM "$boot_pid" 2>/dev/null || true
         wait "$boot_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$model_pid" ]]; then
+        kill -TERM "$model_pid" 2>/dev/null || true
+        wait "$model_pid" 2>/dev/null || true
     fi
     rm -f -- "$manifest"
     if [[ "$started_bridge" == true ]]; then
@@ -58,13 +74,45 @@ if [[ "$ready" != true ]]; then
     exit 1
 fi
 
-python3 - "$manifest" "$here/navigation.srdl" <<'PY'
+rules="$here/navigation.srdl"
+test_args=()
+if [[ -n "$summarize" ]]; then
+    rules="$here/summarize.srdl"
+    test_args+=(--summarize)
+    if [[ "$summarize" == stub ]]; then
+        python3 "$here/summarize_model.py" "$run/model-url" >"$run/model.jsonl" 2>"$run/model.log" &
+        model_pid=$!
+        for _ in $(seq 1 50); do
+            [[ -s "$run/model-url" ]] && break
+            kill -0 "$model_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if [[ ! -s "$run/model-url" ]]; then
+            echo "Summarize test model did not start. See $run/model.log" >&2
+            exit 1
+        fi
+        export SENTINEL_SUMMARIZE_BASE_URL="$(cat "$run/model-url")"
+        export SENTINEL_SUMMARIZE_MODEL=mujoco-srdl-test
+        export SENTINEL_SUMMARIZE_API_KEY=mujoco-srdl-test
+        test_args+=(--model-trace "$run/model.jsonl")
+    fi
+fi
+
+python3 - "$manifest" "$rules" "$summarize" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 source = Path("robonix_srdl_manifest.yaml").read_text()
-updated, count = re.subn(r"(?m)^(\s+sentinel_rules: ).+$", lambda match: match[1] + sys.argv[2], source)
+replacement = sys.argv[2]
+if sys.argv[3]:
+    replacement += """
+    sentinel_strategies:
+      Summarize:
+        api_base: "${SENTINEL_SUMMARIZE_BASE_URL}"
+        model: "${SENTINEL_SUMMARIZE_MODEL}"
+        api_key: "${SENTINEL_SUMMARIZE_API_KEY}" """
+updated, count = re.subn(r"(?m)^(\s+sentinel_rules: ).+$", lambda match: match[1] + replacement, source)
 if count != 1:
     raise RuntimeError("The MuJoCo manifest must declare one sentinel_rules file")
 Path(sys.argv[1]).write_text(updated)
@@ -87,4 +135,4 @@ if [[ "$ready" != true ]]; then
 fi
 
 "$deployment/.venv-codegen/bin/python" "$here/run.py" \
-    --deployment "$deployment" --goal "$@" --output "$run/cases"
+    --deployment "$deployment" --goal "$@" --output "$run/cases" "${test_args[@]}"

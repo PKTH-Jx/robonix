@@ -113,7 +113,7 @@ def expect_feedback(nodes, rule, phase, effect, report):
     raise RuntimeError(f"Missing {phase} report: {report}")
 
 
-def run_cases(call, odom, target, record):
+def run_cases(call, odom, target, record, summarize, model_trace):
     def pose():
         _, leaf, failed = call("pose", "mapping", POSE, {})
         check(leaf.state == 2 and not failed and leaf.leaf_result.success, f"Pose result: {leaf}")
@@ -176,9 +176,41 @@ def run_cases(call, odom, target, record):
             if state.leaf_result.success and json.loads(state.leaf_result.output)["state"] in {"PENDING", "RUNNING"}:
                 call("cleanup_cancel", "nav2", NAV + "/cancel", {"run_id": ""})
 
-    record("before", before)
-    record("after", after)
-    record("while", while_case)
+    if not summarize:
+        record("before", before)
+        record("after", after)
+        record("while", while_case)
+        return
+
+    record("summarize while", while_case)
+    if model_trace is None:
+        return
+
+    def optional_result():
+        calls = [json.loads(line) for line in model_trace.read_text().splitlines()]
+        boundary = [entry for entry in calls if entry["field"] == "boundary"]
+        values = [entry["value"] for entry in boundary]
+        check(values[:2] == ["outside", None] and values[-1] == "inside",
+              f"Expected an outside result, null, and an inside result: {values}")
+        check(boundary[0]["distance"] > 0.35 >= boundary[-1]["distance"],
+              "The model did not observe the boundary crossing")
+        return f"Continued after a null model result and stopped after inside ({len(values)} samples)."
+
+    def rejected_result(name, expected_error):
+        _, leaf, failed = call(name, "mapping", "robonix/service/map/get_mode", {})
+        check(leaf.state == 3 and failed and not leaf.leaf_result.success, "Expected a denied capability")
+        detail = json.loads(leaf.operator_detail)
+        check(detail["effect"] == "deny", detail)
+        reports = [report for report in detail["reports"]
+                   if report["rule"] == "summarize_probe" and report["timing"] == "before"]
+        check(len(reports) == 1, detail)
+        error = reports[0]["evaluation_error"] or ""
+        check(expected_error in error and not reports[0]["violations"], error or detail)
+        return f"Before dispatch was denied with the expected error ({expected_error})."
+
+    record("summarize null", optional_result)
+    record("summarize invalid enum", lambda: rejected_result("invalid_enum", "not an allowed enum member"))
+    record("summarize HTTP 502", lambda: rejected_result("http_502", "HTTP 502"))
 
 
 def main():
@@ -188,6 +220,8 @@ def main():
     parser.add_argument("--executor", default="127.0.0.1:50061")
     parser.add_argument("--container", default=os.environ.get("ROBONIX_SIM_CONTAINER", "mujoco_robonix_srdl"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--summarize", action="store_true")
+    parser.add_argument("--model-trace", type=Path)
     args = parser.parse_args()
     if not all(math.isfinite(value) for value in args.goal):
         parser.error("goal components must be finite")
@@ -231,7 +265,7 @@ def main():
             return nodes, leaf, complete.any_failed
 
         with odometry(args.container, args.output) as odom:
-            run_cases(call, odom, args.goal, record)
+            run_cases(call, odom, args.goal, record, args.summarize, args.model_trace)
     (args.output / "summary.md").write_text(
         "# MuJoCo SRDL\n\n" + "\n".join(f"- **{phase} {status}** — {detail}" for phase, status, detail in results) + "\n",
     )

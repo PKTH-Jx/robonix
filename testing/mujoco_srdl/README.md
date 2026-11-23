@@ -25,6 +25,27 @@ with three arguments in the map frame.
 The goal must start at least 0.48 m from the robot so the while case has
 room to observe motion before entering the 0.35 m stop boundary.
 
+## Watch the demo in MuJoCo Viewer
+
+Log in to the robonix-vm desktop. Use a terminal in the VM or an SSH
+terminal connected to it.
+
+    bash testing/mujoco_srdl/viewer.sh
+    bash testing/mujoco_srdl/run.sh
+
+The first command opens the Viewer on the VM desktop. The second starts
+Robonix, runs the three cases and leaves the Viewer open. Watch the base
+during the while case. It approaches the goal and stops after entering the
+0.35 m boundary. The before case leaves the robot still and the after case
+reads the pose. The terminal and timeline show their rule reports.
+
+To repeat the same route, restore the initial scene before running the
+test again. The reset restarts the MuJoCo container and discards the
+current simulation state.
+
+    bash testing/mujoco_srdl/viewer.sh --reset
+    bash testing/mujoco_srdl/run.sh
+
 ## Cases
 
 | Phase | Test |
@@ -49,3 +70,63 @@ maxage, optional and enum values, and exclusions independently of MuJoCo.
 
 The Executor test exercises Summarize with a local model substitute and
 checks that a running asynchronous capability is canceled.
+
+## Summarize in MuJoCo
+
+Use the initial robot pose and run the following command.
+
+    bash testing/mujoco_srdl/run.sh --summarize
+
+The test uses the live mapping capability as the observation source and
+the local model substitute as the chat completions endpoint. Sentinel
+sends the pose, goal and allowed yield values to the endpoint. The
+substitute computes outside or inside from the returned map coordinates.
+It returns null once while the robot is still outside. The rule permits
+that single uncertain observation and continues monitoring. An inside
+classification must cancel Nav2 and the simulated base must settle.
+
+Two additional read-only plans use the same observation. The model first
+returns a value outside the allowed enum and then returns HTTP 502.
+Each plan must be denied before dispatch. The test checks the distinct
+evaluation error for each rejection.
+
+model.jsonl records the substitute's HTTP statuses, yield values and poses.
+It uses the same clock as cases/timeline.jsonl and cases/odometry.jsonl.
+
+To run the navigation case with a configured model, export
+SENTINEL_SUMMARIZE_BASE_URL, SENTINEL_SUMMARIZE_MODEL and
+SENTINEL_SUMMARIZE_API_KEY in the VM shell before running this command.
+
+    bash testing/mujoco_srdl/run.sh --summarize-live
+
+The configured endpoint receives live map poses and the goal. The injected
+null and error cases are part of the local substitute run.
+
+## Run one group or compare all three
+
+Run the group you want from the Robonix checkout.
+
+    bash testing/mujoco_srdl/suite.sh direct
+    bash testing/mujoco_srdl/suite.sh stub
+    bash testing/mujoco_srdl/suite.sh live
+
+The direct group checks before, while and after using deterministic SRDL
+rules. The stub group checks the Summarize contract with controlled model
+replies, including null, invalid enums and HTTP 502. The live group uses
+the configured model and checks the resulting cancellation against
+MuJoCo odometry. Export the three model settings described above before
+running live.
+
+To run the three groups in sequence, run the following command.
+
+    bash testing/mujoco_srdl/suite.sh all
+
+Each group starts from the same scene and uses the same navigation goal
+and 0.35 m stop boundary. Add --viewer to reset the scene with the Viewer
+before each selected group. The last scene stays open. For a headless
+run, close any existing simulation first.
+
+Use all --local to run direct and stub without configuring a model. A
+selected live group without model settings is marked skipped and the
+command exits nonzero. Every invocation prints the path to a summary.md
+with links to the selected results.
